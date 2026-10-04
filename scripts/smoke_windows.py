@@ -62,7 +62,8 @@ def main():
                 break
             time.sleep(.1)
         assert runtime and runtime["pid"] == process.pid, "Own packaged process did not start"
-        base = "http://127.0.0.1:8765"
+        # Keep the smoke client on the same host as the session cookie and launcher URL.
+        base = "http://localhost:8765"
         launch_url = urlsplit(runtime["url"])
         launch_tokens = parse_qs(launch_url.query).get("launch", [])
         assert (
