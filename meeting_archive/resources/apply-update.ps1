@@ -24,6 +24,8 @@ function Copy-Program([string]$source, [string]$destination, [string]$name) {
     Copy-Item -LiteralPath $src -Destination $dst -Force
 }
 function Start-Archive {
+    # A new independent instance must not inherit PyInstaller's worker identity.
+    $env:PYINSTALLER_RESET_ENVIRONMENT = '1'
     $arguments = '--home "' + $c.home + '"'
     if ($c.headless) { $arguments += ' --no-browser --no-tray' }
     return Start-Process -FilePath (Join-Path $target 'MeetingArchive.exe') -ArgumentList $arguments -WindowStyle Hidden -PassThru

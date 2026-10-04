@@ -89,9 +89,11 @@ def helper(expected, old_files, new_files):
     config.write_text(json.dumps({"target": str(target), "staged": str(new_program), "home": str(home),
         "pid": old_process.pid, "version": expected, "headless": True,
         "old_files": list(old_files), "new_files": list(new_files)}), encoding="utf-8")
+    environment = {**__import__("os").environ, "_PYI_ARCHIVE_FILE": str(target / "MeetingArchive.exe"),
+                   "_PYI_PARENT_PROCESS_LEVEL": "0", "_PYI_APPLICATION_HOME_DIR": str(target / "_internal")}
     result = subprocess.run(["powershell.exe", "-NoProfile", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass",
         "-File", str(root / "meeting_archive/resources/apply-update.ps1"), "-Config", str(config)],
-        creationflags=flags, timeout=100, capture_output=True, text=True)
+        creationflags=flags, timeout=100, capture_output=True, text=True, env=environment)
     receipt = json.loads((qa / "receipt.json").read_text("utf-8-sig"))
     return result, receipt
 
