@@ -1,0 +1,6 @@
+**
+!oauth_relay/
+!oauth_relay/**
+oauth_relay/__pycache__/
+oauth_relay/*.pyc
+oauth_relay/.env*

@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-labelledby="title">
+  <title id="title">Meeting Archive — архив совещаний</title>
+  <path fill="#205543" d="M24 64c0-20 16-36 36-36h42c9 0 15 3 21 10l14 17c4 5 8 7 15 7h44c20 0 36 16 36 36v98c0 20-16 36-36 36H60c-20 0-36-16-36-36Z"/>
+  <path fill="#98cbae" d="M48 70c0-10 8-18 18-18h32c5 0 8 2 11 5l15 19c6 7 12 10 23 10h43c10 0 18 8 18 18v92H48Z"/>
+  <rect x="24" y="92" width="208" height="140" rx="26" fill="#2b6d58"/>
+  <g fill="#f6f4ea">
+    <rect x="62" y="143" width="18" height="40" rx="9"/>
+    <rect x="91" y="128" width="18" height="70" rx="9"/>
+    <rect x="120" y="111" width="18" height="104" rx="9"/>
+    <rect x="149" y="128" width="18" height="70" rx="9"/>
+    <rect x="178" y="143" width="18" height="40" rx="9"/>
+  </g>
+</svg>

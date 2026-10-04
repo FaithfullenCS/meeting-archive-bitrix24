@@ -1,0 +1,25 @@
+services:
+  meeting-archive-oauth:
+    image: meeting-archive-oauth:local
+    build:
+      context: ..
+      dockerfile: oauth_relay/Dockerfile
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-python:3.12.15-slim-bookworm}
+    environment:
+      PUBLIC_HOST: ${PUBLIC_HOST:?Your verified HTTPS hostname is required}
+      ALLOWED_PORTALS: ${ALLOWED_PORTALS:?Your portal allowlist is required}
+      RELAY_BASE_PATH: ${RELAY_BASE_PATH:-/integrations/meeting-archive}
+    ports:
+      - "127.0.0.1:8787:8787"
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 64
+    mem_limit: 128m
+    cpus: 0.50
+    logging:
+      driver: none
