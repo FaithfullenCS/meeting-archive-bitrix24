@@ -92,6 +92,12 @@ def main() -> None:
     (distribution / "build-info.json").write_text(json.dumps(
         {"version": tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"],
          "python": sys.version, "source_sha256": inputs}, ensure_ascii=False, indent=2), encoding="utf-8")
+    files = {p.relative_to(distribution).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+             for p in distribution.rglob("*") if p.is_file()
+             and p.relative_to(distribution).parts[0] != "Данные" and p.name != "update-manifest.json"}
+    (distribution / "update-manifest.json").write_text(json.dumps(
+        {"version": tomllib.loads((root / "pyproject.toml").read_text("utf-8"))["project"]["version"],
+         "files": files}, ensure_ascii=False, indent=2), encoding="utf-8")
     zip_file = Path(shutil.make_archive(str(root / "dist" / "MeetingArchive-Windows-x64"),
                                        "zip", root / "dist", "MeetingArchive"))
     with zip_file.open("rb") as archive:

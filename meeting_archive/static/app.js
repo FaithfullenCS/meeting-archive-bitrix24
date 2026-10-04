@@ -357,6 +357,7 @@
     state.route = route; state.meetingId = match ? Number(match[1]) : null;
     $$(".page").forEach(page => { page.hidden = page.id !== `page-${route}`; });
     $$(".nav-item").forEach(button => { const active = button.dataset.route === (route === "detail" ? "archive" : route === "module" ? "settings" : route); button.classList.toggle("active", active); if (active) button.setAttribute("aria-current", "page"); else button.removeAttribute("aria-current"); });
+    $$(".settings-tabs [data-route]").forEach(button => { const active = button.dataset.route === route; button.classList.toggle("active", active); if (active) button.setAttribute("aria-current", "page"); else button.removeAttribute("aria-current"); });
     $("#breadcrumb").textContent = `Рабочее пространство / ${routes[route]}`;
     document.title = "Meeting Archive";
     if (previous !== route || oldMeeting !== state.meetingId) window.scrollTo({ top: 0, behavior: "instant" });
@@ -396,7 +397,7 @@
     state.bootstrap = data; state.csrf = data.csrf || state.csrf;
     updateDownloadButtons();
     const settings = data.settings || {};
-    updateSettingsForm(settings);
+    updateSettingsForm(settings); renderDesktopSettings(data);
     const isConnected = connected();
     $("#connection-dot").classList.toggle("connected", isConnected);
     const sidebar = $("#sidebar-connection"); sidebar.textContent = isConnected ? data.account_name || `Пользователь #${settings.user_id}` : "Bitrix24 не подключён";
@@ -608,7 +609,7 @@
     const active = jobs.filter(job => ["queued", "running"].includes(job.state));
     $("#nav-jobs").textContent = String(active.length); $("#nav-jobs").hidden = !active.length;
     $("#jobs-summary").textContent = active.length ? `Активных задач: ${active.length}` : "Нет активных задач";
-    $("#jobs-list").innerHTML = jobs.length ? jobs.map(job => `<article class="job-item"><div><div class="job-title">${escapeHtml(kinds[job.kind] || job.kind)} ${job.schedule_wait ? '<span class="badge waiting">Ждёт окна</span>' : badge(job.state)}</div><div class="job-meta">Задача ${job.id}${job.meeting_id ? ` · Совещание ${job.meeting_id}` : ""} · ${escapeHtml(dateString(job.created))} · Попыток: ${Number(job.attempts) || 0}</div><div class="job-message">${escapeHtml(job.message || "")}</div>${job.error ? `<div class="job-error">${escapeHtml(job.error)}</div>` : ""}${job.state === "running" ? `<progress class="job-progress" max="1" ${Number(job.progress) > 0 ? `value="${Math.min(1, Number(job.progress))}"` : ""} aria-label="Прогресс задачи ${job.id}"></progress>` : ""}</div><div class="job-actions">${job.schedule_wait ? `<button class="button primary small" data-job-now="${job.id}">Запустить сейчас</button>` : ""}${job.meeting_id ? `<button class="button quiet small" data-meeting="${job.meeting_id}">Открыть</button>` : ""}${["queued", "running"].includes(job.state) ? `<button class="button secondary small" data-job-cancel="${job.id}">Отменить</button>` : ""}${["failed", "cancelled", "canceled"].includes(job.state) ? `<button class="button secondary small" data-job-retry="${job.id}">Повторить</button>` : ""}</div></article>`).join("") : '<div class="empty-state"><h2>Очередь свободна</h2><p>Здесь появятся задачи загрузки, импорта и расшифровки.</p></div>';
+    $("#jobs-list").innerHTML = jobs.length ? jobs.map(job => `<article class="job-item" data-job-id="${job.id}"><div><div class="job-title">${escapeHtml(kinds[job.kind] || job.kind)} ${job.schedule_wait ? '<span class="badge waiting">Ждёт окна</span>' : badge(job.state)}</div><div class="job-meta">Задача ${job.id}${job.meeting_id ? ` · Совещание ${job.meeting_id}` : ""} · ${escapeHtml(dateString(job.created))} · Попыток: ${Number(job.attempts) || 0}</div><div class="job-message">${escapeHtml(job.message || "")}</div>${job.error ? `<div class="job-error">${escapeHtml(job.error)}</div>` : ""}${job.state === "running" ? `<progress class="job-progress" max="1" ${Number(job.progress) > 0 ? `value="${Math.min(1, Number(job.progress))}"` : ""} aria-label="Прогресс задачи ${job.id}"></progress>` : ""}</div><div class="job-actions">${job.schedule_wait ? `<button class="button primary small" data-job-now="${job.id}">Запустить сейчас</button>` : ""}${job.meeting_id ? `<button class="button quiet small" data-meeting="${job.meeting_id}">Открыть</button>` : ""}${["queued", "running"].includes(job.state) ? `<button class="button secondary small" data-job-cancel="${job.id}">Отменить</button>` : ""}${["failed", "cancelled", "canceled"].includes(job.state) ? `<button class="button secondary small" data-job-retry="${job.id}">Повторить</button>` : ""}</div></article>`).join("") : '<div class="empty-state"><h2>Очередь свободна</h2><p>Здесь появятся задачи загрузки, импорта и расшифровки.</p></div>';
   }
   function decorateJobIcons() {
     $$('[data-job-now]').forEach(button => decorateButton(button, 'play'));
@@ -804,7 +805,7 @@
     state.busy = true;
     try {
       const previousChatRevision = state.bootstrap?.chat_revision;
-      const data = await api("/api/bootstrap"); renderBootstrap(data);
+      const data = await api("/api/bootstrap"); renderBootstrap(data); if (data.activation) await consumeActivation(data.activation);
       if (!state.windowAnnounced) { state.windowAnnounced = true; api("/api/browser/ready", {method: "POST"}).catch(() => {}); }
       if (state.route === "archive" && participantsNeedRefresh()) await loadParticipants();
       if (state.route === "archive" && chatsNeedRefresh()) await loadChats();
@@ -1115,6 +1116,54 @@
   window.addEventListener("beforeunload", event => { if (state.settingsDirty) { event.preventDefault(); event.returnValue = ""; } });
   document.addEventListener("visibilitychange", () => { if (!document.hidden) bootstrap(); });
   decorateStaticIcons(); renderParticipants(); renderCalendar(); applyRoute();
+
+  function renderDesktopSettings(data) {
+    const u = data.updates || {};
+    const captions = {idle:"Проверка ещё не выполнена", checking:"Проверяем GitHub…", current:"Установлена последняя версия", available:"Новая версия доступна", downloading:"Скачиваем новую версию…", ready:"Обновление готово к установке", installing:"Перезапускаем приложение…", error:"Обновление не выполнено"};
+    $("#update-status").textContent = `Установлена версия ${u.installed || "—"}. ${u.waiting ? "Ожидаем завершения текущих задач. Новые задачи временно не запускаются." : captions[u.state] || ""}${u.available ? ` Версия ${u.available}, ${(Number(u.size || 0)/1024/1024).toFixed(1)} МБ.` : ""}${u.checked_at ? ` Проверено: ${new Date(u.checked_at*1000).toLocaleString("ru-RU")}.` : ""}`;
+    $("#update-error").textContent = u.error || "";
+    $("#update-progress").hidden = u.state !== "downloading"; $("#update-progress").value = u.progress || 0;
+    $("#update-check").disabled = ["checking","downloading","installing"].includes(u.state) || u.waiting;
+    $("#update-download").hidden = u.state !== "available";
+    $("#update-install").hidden = u.state !== "ready" || u.waiting;
+    $("#update-install").disabled = !u.supported;
+    $("#update-cancel").hidden = !u.waiting || u.state === "installing";
+    $("#update-release").hidden = !u.release_url; if (u.release_url) $("#update-release").href = u.release_url;
+    $("#notification-error").textContent = data.notification_error || "";
+    updateNotificationControls();
+  }
+  function updateNotificationControls() {
+    const enabled = $("#settings-form").elements.notifications_enabled.checked;
+    $("#notification-options").classList.toggle("notifications-muted", !enabled);
+    $$("#notification-options input").forEach(input => {input.disabled = !enabled;});
+    $("#notification-test").disabled = !state.bootstrap?.settings?.notifications_enabled;
+  }
+  async function consumeActivation(activation) {
+    if (!activation || activation.sequence === state.activationSequence) return;
+    state.activationSequence = activation.sequence;
+    if (activation.route === "meeting") {
+      try { await api(`/api/meeting/${activation.ids[0]}`); navigate("detail", activation.ids[0]); }
+      catch { navigate("archive"); notify("Совещание из уведомления больше недоступно."); }
+    } else if (activation.route === "jobs") {
+      navigate("jobs");
+      $$("[data-job-id]").forEach(row => row.classList.toggle("notification-highlight", activation.ids.includes(Number(row.dataset.jobId))));
+      const first = $(".notification-highlight"); if (first) first.scrollIntoView({block:"center"});
+      else if (activation.ids.length) notify("Задача отсутствует среди последних задач очереди.");
+    } else navigate(activation.route === "connection" ? "connection" : "settings");
+    await api("/api/notifications/ack", {method:"POST", data:{sequence:activation.sequence}});
+  }
+  for (const operation of ["check", "download", "install", "cancel"]) {
+    $("#update-" + operation).onclick = event => action(event.currentTarget, async () => {
+      if (operation === "install" && state.settingsDirty) throw new Error("Сначала сохраните изменения настроек.");
+      await api("/api/updates/" + operation, {method:"POST", data:{}}); await bootstrap();
+    });
+  }
+  $("#settings-form").elements.notifications_enabled.addEventListener("change", updateNotificationControls);
+  $("#notification-test").onclick = event => action(event.currentTarget, async () => {
+    const result = await api("/api/notifications/test", {method:"POST", data:{}});
+    notify(result.sent ? "Уведомление передано Windows. Если оно не появилось, проверьте настройки уведомлений Windows." : result.error || "Не удалось показать уведомление.", !result.sent);
+  });
+
   bootstrap(true);
-  setInterval(() => { if (!document.hidden) bootstrap(); }, 4000);
+  setInterval(() => { bootstrap(); }, 4000);
 })();

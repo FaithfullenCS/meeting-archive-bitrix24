@@ -27,6 +27,14 @@ def test_subtitle_rounding_carries_seconds_and_minutes():
 
 @pytest.mark.parametrize("mode", ["separate", "merged_wav"])
 def test_worker_exports_relative_sources_and_run_metadata_without_real_inference(monkeypatch, tmp_path, mode):
+    # Python 3.12.15 sets a private ACL for mkdtemp on Windows. Use this
+    # project's inherited test ACL rather than the user's temporary folder.
+    import uuid
+    def workspace_temp(suffix=None, prefix=None, dir=None):
+        folder = tmp_path / ((prefix or "") + uuid.uuid4().hex + (suffix or ""))
+        folder.mkdir()
+        return str(folder)
+    monkeypatch.setattr(entry.tempfile, "mkdtemp", workspace_temp)
     from meeting_archive.worker.core.utils import DeviceInfo
     class ASR:
         def __init__(self, *args):

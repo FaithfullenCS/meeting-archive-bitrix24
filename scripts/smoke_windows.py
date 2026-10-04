@@ -62,17 +62,11 @@ def main():
                 break
             time.sleep(.1)
         assert runtime and runtime["pid"] == process.pid, "Own packaged process did not start"
-        # Keep the smoke client on the same host as the session cookie and launcher URL.
         base = "http://localhost:8765"
-        launch_url = urlsplit(runtime["url"])
-        launch_tokens = parse_qs(launch_url.query).get("launch", [])
-        assert (
-            launch_url.scheme == "http"
-            and launch_url.netloc == "localhost:8765"
-            and launch_url.path == "/"
-            and len(launch_tokens) == 1
-            and bool(launch_tokens[0])
-        ), "Unexpected local launch URL"
+        launch = urlsplit(runtime["url"])
+        assert launch.scheme == "http" and launch.netloc == "localhost:8765" and launch.path == "/", "Unexpected local launch URL"
+        parameters = parse_qs(launch.query)
+        assert set(parameters) == {"launch"} and len(parameters["launch"]) == 1 and parameters["launch"][0]
         # runtime.json can precede lifespan startup; wait without printing the launch capability.
         while time.monotonic() < deadline:
             try:

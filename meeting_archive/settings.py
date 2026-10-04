@@ -94,6 +94,11 @@ class Settings:
     max_speakers: int = 0
     external_engine: str = ""
     autostart: bool = False
+    auto_update: bool = True
+    notifications_enabled: bool = True
+    notify_download: bool = True
+    notify_transcription: bool = True
+    notify_errors: bool = True
 
     @classmethod
     def load(cls, home: Path) -> Settings:

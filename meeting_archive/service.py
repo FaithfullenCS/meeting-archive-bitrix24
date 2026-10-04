@@ -56,6 +56,10 @@ class Service:
         self.event_loop: asyncio.AbstractEventLoop | None = None
         self.material_maintenance: set[int] = set()
         self.module_maintenance = False
+        from .updates import UpdateManager
+        from .notifications import Notifications
+        self.updates = UpdateManager(self)
+        self.notifications = Notifications(self)
 
     @property
     def archive(self):
@@ -70,7 +74,7 @@ class Service:
         self.tasks = [asyncio.create_task(self.job_loop(("fetch", "import"))),
                       asyncio.create_task(self.job_loop(("transcribe", "install"))),
                       asyncio.create_task(self.scheduler()), asyncio.create_task(self.discover_resources()),
-                      asyncio.create_task(self.refresh_identity())]
+                      asyncio.create_task(self.refresh_identity()), asyncio.create_task(self.updates.loop())]
 
     def identity_key(self):
         return f"account_name:{self.settings.portal}:{self.settings.user_id}"
@@ -152,6 +156,8 @@ class Service:
 
     async def stop(self):
         self.alive = False
+        await self.updates.stop()
+        await self.notifications.stop()
         await self.module.stop_install()
         for job_id in list(self.module.processes):
             self.module.cancel_job(job_id)
@@ -223,7 +229,7 @@ class Service:
     async def scan(self, full=False):
         self.chat_lookup_disabled = False
         full = full or bool(self.db.rows("SELECT id FROM meetings WHERE source='bitrix' AND json_type(metadata,'$.chatId') IS NULL LIMIT 1"))
-        if not self.connected() or self.scan_lock.locked():
+        if not self.connected() or self.scan_lock.locked() or self.updates.waiting:
             return
         async with self.scan_lock:
             self.catalogue.update(running=True, count=0, error="")
@@ -259,11 +265,13 @@ class Service:
                     self.db.set_state("last_full:" + self.settings.portal, end)
                 self.auth_error = ""
                 self.scan_retry_at = 0
+                self.notifications.auth_seen = False
                 self.db.set_state("scan_failures:" + self.settings.portal, "0")
             except (BitrixError, httpx.HTTPError, ValueError, OSError) as exc:
                 self.catalogue["error"] = self.vault.redact(str(exc))
                 if isinstance(exc, BitrixError) and exc.auth:
                     self.auth_error = self.catalogue["error"]
+                    await self.notifications.failed({"id": 0}, self.auth_error, True)
                 failure_key = "scan_failures:" + self.settings.portal
                 failures = int(self.db.get_state(failure_key, "0")) + 1
                 self.db.set_state(failure_key, str(failures))
@@ -273,6 +281,9 @@ class Service:
 
     async def scheduler(self):
         while self.alive:
+            if self.updates.waiting:
+                await asyncio.sleep(.5)
+                continue
             try:
                 if self.connected() and time.time() >= self.scan_retry_at:
                     previous = self.db.get_state("last_full:" + self.settings.portal)
@@ -588,6 +599,9 @@ class Service:
     async def job_loop(self, kinds: tuple[str, ...]):
         while self.alive:
             blocked = []
+            if self.updates.waiting:
+                await asyncio.sleep(QUEUE_POLL_SECONDS)
+                continue
             if not window_status(self.settings.download_schedule)["allowed"]:
                 blocked.extend(("fetch", "import"))
             if not window_status(self.settings.local_schedule)["allowed"]:
@@ -604,6 +618,7 @@ class Service:
                 await task
                 if self.db.rows("SELECT state FROM jobs WHERE id=?", (job["id"],))[0]["state"] == "running":
                     self.db.job_update(job["id"], state="done", progress=1, message="Завершено")
+                    self.notifications.completed(job)
             except asyncio.CancelledError:
                 if not self.alive:
                     self.db.job_update(job["id"], state="queued", message="Продолжим после запуска")
@@ -617,6 +632,8 @@ class Service:
                 retry = isinstance(exc, httpx.HTTPError) or (isinstance(exc, BitrixError) and exc.retryable)
                 if auth:
                     self.auth_error = message
+                if auth or not retry:
+                    await self.notifications.failed(job, message, auth)
                 self.db.job_update(job["id"], state="queued" if retry else "failed", error=message,
                     message="Повторим позже" if retry else "Требуется внимание", next_at=time.time() + min(3600, 60 * 2**min(job["attempts"], 6)))
                 if job["kind"] == "transcribe":

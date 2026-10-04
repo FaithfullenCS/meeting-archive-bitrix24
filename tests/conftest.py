@@ -14,6 +14,14 @@ from meeting_archive.db import Database
 
 
 @pytest.fixture(autouse=True)
+def isolated_update_checks(monkeypatch):
+    async def no_network(self):
+        return
+    monkeypatch.setattr("meeting_archive.updates.UpdateManager.loop", no_network)
+
+
+
+@pytest.fixture(autouse=True)
 def isolated_discovery(monkeypatch):
     # Tests must not execute Python environments on the developer's computer.
     monkeypatch.setattr("meeting_archive.resource_reuse.environment_candidates", lambda: [])

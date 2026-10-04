@@ -88,6 +88,11 @@ class SettingsPatch(BaseModel):
     max_speakers: int | None = Field(None, ge=0, le=50)
     external_engine: str | None = None
     autostart: bool | None = None
+    auto_update: bool | None = None
+    notifications_enabled: bool | None = None
+    notify_download: bool | None = None
+    notify_transcription: bool | None = None
+    notify_errors: bool | None = None
 
 
 def meeting_view(record: dict) -> dict:
@@ -168,6 +173,10 @@ def create_app(service: Service, launch_token: str | None = None, *, manage_life
         host = request.headers.get("host", "")
         if host not in {"127.0.0.1:8765", "localhost:8765", "testserver"}:
             return JSONResponse({"error": "Недопустимый адрес интерфейса"}, status_code=403)
+        if request.url.path == "/api/desktop/activate" and request.method == "POST":
+            if request.headers.get("origin") or not secrets.compare_digest(request.headers.get("x-desktop-token", ""), launch_token):
+                return JSONResponse({"error": "Недопустимый переход"}, status_code=403)
+            return await call_next(request)
         public = request.url.path in {"/", "/callback", "/oauth/callback"} or request.url.path.startswith("/static/")
         authenticated = secrets.compare_digest(request.cookies.get("meeting_session", ""), session)
         if not public and not authenticated:
@@ -214,6 +223,8 @@ def create_app(service: Service, launch_token: str | None = None, *, manage_life
                 job.update(schedule_wait=True, message=window["label"], schedule_next_at=window["next_at"])
         saved = service.vault.read()
         return {"csrf": csrf, "settings": asdict(service.settings), "connected": service.connected(),
+                "updates": service.updates.status(), "activation": service.notifications.activation,
+                "notification_error": service.notifications.error,
                 "account_name": service.db.get_state(service.identity_key()) if service.connected() else "",
                 "chat_warning": service.chat_warning, "chat_revision": service.db.get_state("chat_revision"),
                 "secret_status": {"webhook_saved": bool(saved.get("webhook")),
@@ -231,6 +242,47 @@ def create_app(service: Service, launch_token: str | None = None, *, manage_life
     async def browser_ready():
         from .browser import register_window
         return {"registered": bool(register_window())}
+
+    @app.post("/api/desktop/activate")
+    async def desktop_activate(data: dict):
+        try:
+            service.notifications.activate(str(data.get("uri", "")))
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        return {"ok": True}
+
+    @app.post("/api/notifications/ack")
+    async def notification_ack(data: dict):
+        current = service.notifications.activation
+        if current and current["sequence"] == data.get("sequence"):
+            service.notifications.activation = None
+        return {"ok": True}
+
+    @app.post("/api/notifications/test")
+    async def notification_test():
+        if not service.settings.notifications_enabled:
+            return JSONResponse({"error": "Системные уведомления выключены"}, status_code=400)
+        shown = await service.notifications.send("Meeting Archive", "Нажмите, чтобы открыть настройки.", "meetingarchive:settings")
+        return {"sent": shown, "error": service.notifications.error}
+
+    @app.get("/api/updates")
+    async def update_status():
+        return service.updates.status()
+
+    @app.post("/api/updates/{operation}")
+    async def update_operation(operation: str):
+        try:
+            if operation in {"check", "download"}:
+                service.updates.launch_check(operation == "download")
+            elif operation == "install":
+                service.updates.request_install()
+            elif operation == "cancel":
+                service.updates.cancel_install()
+            else:
+                return JSONResponse({"error": "Неизвестное действие"}, status_code=404)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        return service.updates.status()
 
     @app.get("/api/meetings")
     async def meetings(q: str = "", date_from: str = "", date_to: str = "", min_minutes: float = 0,

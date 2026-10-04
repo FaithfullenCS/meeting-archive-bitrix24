@@ -50,6 +50,8 @@ jobs:
         run: .venv/Scripts/python.exe -X utf8 scripts/build_windows.py
       - name: Smoke test packaged executable and local server
         run: .venv/Scripts/python.exe -X utf8 scripts/smoke_windows.py
+      - name: Verify program update, activation, preservation and rollback
+        run: .venv/Scripts/python.exe -X utf8 scripts/smoke_updates.py
       - uses: actions/upload-artifact@v4
         with:
           name: MeetingArchive-Windows-x64
@@ -57,7 +59,7 @@ jobs:
             dist/MeetingArchive-Windows-x64.zip
             dist/MeetingArchive-Windows-x64.zip.sha256
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 1
   release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: windows

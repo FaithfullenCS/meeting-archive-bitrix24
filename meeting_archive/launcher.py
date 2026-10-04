@@ -33,6 +33,9 @@ def self_test():
     import pystray
     from PIL import Image
     assert tkinter and pystray and Image
+    from winrt.windows.data.xml.dom import XmlDocument
+    from winrt.windows.ui.notifications import ToastNotification
+    assert XmlDocument and ToastNotification
     if sys.stdout:
         print("Meeting Archive resource/import self-test passed")
 
@@ -63,21 +66,33 @@ def main():
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument("--no-tray", action="store_true")
     parser.add_argument("--home", type=Path)
+    parser.add_argument("--activate")
     args = parser.parse_args()
     if args.self_test:
         self_test()
         return
     home = (args.home or app_home()).resolve()
+    if args.activate:
+        from .notifications import parse_activation
+        parse_activation(args.activate)
     home.mkdir(parents=True, exist_ok=True)
     kernel, mutex, existing = single_instance(home)
     runtime_file = home / "runtime.json"
     try:
         if existing:
-            if runtime_file.exists() and not args.no_browser:
+            if runtime_file.exists() and (not args.no_browser or args.activate):
                 runtime = json.loads(runtime_file.read_text("utf-8"))
                 url = runtime.get("url", "")
                 if url.startswith(("http://127.0.0.1:8765/?launch=", "http://localhost:8765/?launch=")):
-                    open_browser(url)
+                    if args.activate:
+                        from urllib.parse import parse_qs, urlsplit
+                        import httpx
+                        token = parse_qs(urlsplit(url).query)["launch"][0]
+                        response = httpx.post("http://localhost:8765/api/desktop/activate",
+                                              json={"uri": args.activate}, headers={"x-desktop-token": token}, timeout=10)
+                        response.raise_for_status()
+                    if not args.no_browser:
+                        open_browser(url)
             return
         # A repeated EXE launch only needs the mutex/runtime and our window.
         # Load the server stack after that fast path, not before activating it.
@@ -90,9 +105,18 @@ def main():
         listener.bind(("127.0.0.1", 8765))
         listener.listen(128)
         service = Service(home)
+        from .notifications import register_windows
+        try:
+            if not args.no_tray:
+                register_windows(home)
+        except OSError as exc:
+            service.notifications.error = str(exc)
+        if args.activate:
+            service.notifications.activate(args.activate)
         app = create_app(service)
         url = "http://localhost:8765/?launch=" + app.state.launch_token
-        atomic_json(runtime_file, {"url": url, "pid": os.getpid()})
+        from . import __version__
+        atomic_json(runtime_file, {"url": url, "pid": os.getpid(), "version": __version__})
         config = uvicorn.Config(app, host="127.0.0.1", port=8765, log_config=None, access_log=False, log_level="critical")
         server = uvicorn.Server(config)
         tray_icon = None
@@ -101,6 +125,7 @@ def main():
             server.should_exit = True
             if tray_icon:
                 tray_icon.stop()
+        service.updates.shutdown = exit_requested
         # A protected endpoint supports graceful headless QA; normal users exit through the tray.
         app = create_app(service, app.state.launch_token, shutdown_callback=exit_requested)
         config.app = app
