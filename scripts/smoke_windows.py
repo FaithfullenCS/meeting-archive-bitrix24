@@ -63,7 +63,15 @@ def main():
             time.sleep(.1)
         assert runtime and runtime["pid"] == process.pid, "Own packaged process did not start"
         base = "http://127.0.0.1:8765"
-        assert runtime["url"].startswith(base + "/?launch="), "Unexpected local launch URL"
+        launch_url = urlsplit(runtime["url"])
+        launch_tokens = parse_qs(launch_url.query).get("launch", [])
+        assert (
+            launch_url.scheme == "http"
+            and launch_url.netloc == "localhost:8765"
+            and launch_url.path == "/"
+            and len(launch_tokens) == 1
+            and bool(launch_tokens[0])
+        ), "Unexpected local launch URL"
         # runtime.json can precede lifespan startup; wait without printing the launch capability.
         while time.monotonic() < deadline:
             try:
