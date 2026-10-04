@@ -248,3 +248,31 @@ def test_native_shortcut_identity_in_isolated_folder(tmp_path):
                     ctypes.WinDLL("ole32").PropVariantClear(ctypes.byref(value))
         finally:
             call(store, 2, [])
+
+
+def test_windows_toast_uses_real_winrt_notifier_and_document(monkeypatch):
+    import os
+    from types import SimpleNamespace
+    if os.name != "nt":
+        pytest.skip("Windows WinRT notifier")
+    import winrt.windows.ui.notifications as native
+    from meeting_archive.notifications import APP_ID, windows_toast
+    manager = native.ToastNotificationManager
+    captured = []
+
+    def create_with_id(app_id):
+        assert app_id == APP_ID
+        # Exercise the actual pinned Python/WinRT overload without showing a banner in CI.
+        notifier = manager.create_toast_notifier_with_id(app_id)
+        assert isinstance(notifier, native.ToastNotifier)
+        return SimpleNamespace(show=captured.append)
+
+    monkeypatch.setattr(native, "ToastNotificationManager", SimpleNamespace(
+        create_toast_notifier=manager.create_toast_notifier,
+        create_toast_notifier_with_id=create_with_id))
+    assert windows_toast("Проверка & результат", "Сохранено <совещание>", "meetingarchive:jobs/1")
+    assert len(captured) == 1
+    assert isinstance(captured[0], native.ToastNotification)
+    xml = captured[0].content.get_xml()
+    assert 'activationType="protocol"' in xml and 'launch="meetingarchive:jobs/1"' in xml
+    assert "&amp;" in xml and "&lt;совещание&gt;" in xml

@@ -56,7 +56,7 @@ def windows_toast(title, message, uri):
     document = XmlDocument()
     document.load_xml(f'<toast activationType="protocol" launch="{escape(uri)}"><visual><binding template="ToastGeneric">'
                       f'<text>{escape(title)}</text><text>{escape(message)}</text></binding></visual></toast>')
-    ToastNotificationManager.create_toast_notifier(APP_ID).show(ToastNotification(document))
+    ToastNotificationManager.create_toast_notifier_with_id(APP_ID).show(ToastNotification(document))
     return True
 
 

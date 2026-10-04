@@ -34,8 +34,10 @@ def self_test():
     from PIL import Image
     assert tkinter and pystray and Image
     from winrt.windows.data.xml.dom import XmlDocument
-    from winrt.windows.ui.notifications import ToastNotification
+    from winrt.windows.ui.notifications import ToastNotification, ToastNotificationManager, ToastNotifier
+    from .notifications import APP_ID
     assert XmlDocument and ToastNotification
+    assert isinstance(ToastNotificationManager.create_toast_notifier_with_id(APP_ID), ToastNotifier)
     if sys.stdout:
         print("Meeting Archive resource/import self-test passed")
 
