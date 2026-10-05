@@ -581,6 +581,9 @@
     $("#transcribe-mode").closest("label").hidden = audio.length < 2;
     $("#transcription-files").hidden = audio.length < 2;
     $("#transcription-readiness").textContent = ready ? (audio.length ? "Выбранная модель готова." : "Скачайте запись или добавьте файл с компьютера.") : state.bootstrap?.transcription?.reason || "Выберите и установите модель в профиле расшифровки.";
+    if (state.bootstrap?.settings?.auto_local) {
+      $("#transcription-readiness").textContent += state.bootstrap.settings.paused ? " Автоматическая расшифровка на паузе." : " Новые скачанные записи обрабатываются автоматически по расписанию.";
+    }
   }
   function renderLocalRun() {
     const detail = state.detail; if (!detail) return;
@@ -588,7 +591,7 @@
     const runs = detail.runs || [];
     const selected = runs.find((run, index) => String(run.id ?? run.name ?? index) === value);
     const text = selected?.text || selected?.transcript || detail.local_text;
-    renderText("#local-text", text, detail.local_error && detail.meeting?.local === "error" ? `Последний запуск завершился с ошибкой: ${detail.local_error}. После исправления повторите расшифровку.` : "Локальной расшифровки ещё нет. Запустите обработку записи кнопкой ниже.");
+    renderText("#local-text", text, detail.local_error && detail.meeting?.local === "error" ? `Последний запуск завершился с ошибкой: ${detail.local_error}. После исправления повторите расшифровку.` : "Локальной расшифровки ещё нет. Управление записью доступно в блоке «Локальная обработка».");
   }
   function renderDetail(detail) {
     const meeting = normalizeMeeting(detail.meeting || {}); detail.meeting = meeting; state.detail = detail;
@@ -604,7 +607,7 @@
     audioSelect.innerHTML = audio.map(file => `<option value="${escapeHtml(file.name)}">${escapeHtml(file.name.replace(/^audio[\\/]/, ""))}</option>`).join("");
     if (audio.some(file => file.name === oldAudio)) audioSelect.value = oldAudio;
     audioSelect.disabled = !audio.length; renderPlayer();
-    $("#audio-download-action").hidden = Boolean(audio.length) || meeting.source === "import";
+    $("#download-audio").hidden = Boolean(audio.length) || meeting.source === "import";
     $("#download-audio").disabled = !connected();
     $("#no-audio").textContent = meeting.audio === "not_available" ? "Bitrix24 не предоставил запись. Добавьте готовый файл с компьютера." : "Аудио ещё не сохранено. Скачайте доступную запись или добавьте файл с компьютера.";
     const selectedFiles = new Set($$("#transcription-files input:checked").map(input => input.value));
@@ -612,14 +615,6 @@
     $("#transcription-files").innerHTML = audio.map(file => `<label class="check-label"><input type="checkbox" value="${escapeHtml(file.name)}" ${!previousFiles.has(file.name) || selectedFiles.has(file.name) ? "checked" : ""}>${escapeHtml(file.name.replace(/^audio[\\/]/, ""))}</label>`).join("");
     renderTranscriptionControls();
     renderText("#bitrix-text", detail.bitrix_text, meeting.source === "import" ? "Это запись с компьютера. Запустите локальную расшифровку или привяжите запись к совещанию Bitrix24." : meeting.bitrix === "short_call" ? "Звонок короче минуты. Текст Bitrix24 не предоставлен; Follow-up обрабатывает звонки от одной минуты. Можно скачать запись и расшифровать локально." : meeting.bitrix === "available" ? "Текст готов в Bitrix24. Нажмите «Скачать материалы», чтобы сохранить его в архив." : ["pending", "waiting"].includes(meeting.bitrix) ? "Bitrix24 пока не предоставил готовый текст. После его появления архив сможет его сохранить." : "Доступность текста ещё не проверена. Обновите каталог.");
-    const shortCall = meeting.bitrix === "short_call" && !textValue(detail.bitrix_text);
-    $("#short-call-actions").hidden = !shortCall;
-    $("#short-call-audio").hidden = Boolean(audio.length);
-    $("#short-call-audio").disabled = !connected();
-    $("#short-call-import").hidden = Boolean(audio.length);
-    const localButton = $("#transcribe-button");
-    setButtonLabel($("#short-call-local"), localButton.textContent, state.bootstrap?.transcription?.ready ? "play" : "settings");
-    $("#short-call-local").disabled = localButton.disabled;
     updateDownloadButtons();
     $("#bitrix-text-state").textContent = textValue(detail.bitrix_text) ? "Сохранён" : labels[meeting.bitrix] || "Нет текста";
     $("#bitrix-text-state").className = `badge ${statusClass(meeting.bitrix)}`;
@@ -957,9 +952,6 @@
   $("#refresh-catalogue").onclick = event => action(event.currentTarget, async () => { await api("/api/catalogue/refresh", { method: "POST", data: {} }); state.participantsLoaded = false; state.chatsLoaded = false; notify("Обновление каталога запущено."); await bootstrap(); });
   $("#download-selected").onclick = event => action(event.currentTarget, async () => { await api("/api/download", { method: "POST", data: { ids: [...state.selected] } }); notify(`Загрузка поставлена в очередь: ${state.selected.size} совещаний.`); state.selected.clear(); renderSelection(); await loadMeetings(); await bootstrap(); });
   $("#pause-button").onclick = event => action(event.currentTarget, async () => { if (!state.bootstrap?.settings?.auto_download && !state.bootstrap?.settings?.auto_local && !state.bootstrap?.settings?.watch_enabled) { navigate("settings"); return; } const paused = !state.bootstrap?.settings?.paused; await api("/api/settings", { method: "POST", data: { paused } }); notify(paused ? "Автоматизация приостановлена." : "Автоматизация продолжена."); await bootstrap(); });
-  $("#short-call-audio").onclick = () => $("#download-audio").click();
-  $("#short-call-import").onclick = () => $("#detail-import").click();
-  $("#short-call-local").onclick = () => $("#transcribe-button").click();
   $("#download-audio").onclick = event => action(event.currentTarget, async () => { await api("/api/download", { method: "POST", data: { ids: [state.meetingId], audio_only: true } }); notify("Аудиозапись поставлена в очередь загрузки."); await bootstrap(); await loadDetail(); });
   $("#detail-download").onclick = event => action(event.currentTarget, async () => { await api("/api/download", { method: "POST", data: { ids: [state.meetingId] } }); notify("Материалы поставлены в очередь загрузки."); await bootstrap(); await loadDetail(); });
   $("#detail-folder").onclick = event => action(event.currentTarget, () => api("/api/open-folder", { method: "POST", data: { id: state.meetingId } }));
