@@ -1,6 +1,13 @@
 "use strict";
 
 (() => {
+  // WebView2 can focus the first link on startup without keyboard navigation.
+  document.addEventListener("keydown", event => {
+    if (event.key === "Tab") document.documentElement.classList.add("keyboard-navigation");
+  }, true);
+  document.addEventListener("pointerdown", () => {
+    document.documentElement.classList.remove("keyboard-navigation");
+  }, true);
   const $ = (selector, root = document) => root.querySelector(selector);
   const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
   const state = { csrf: "", bootstrap: null, route: "archive", meetingId: null, detail: null,
