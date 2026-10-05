@@ -57,7 +57,7 @@ jobs:
       - name: Verify tray-only Windows autostart and first window activation
         run: .venv/Scripts/python.exe -X utf8 scripts/smoke_desktop.py --autostart
       - name: Verify tray-only exit before opening any window
-        run: .venv/Scripts/python.exe -X utf8 scripts/smoke_windows.py --tray
+        run: .venv/Scripts/python.exe -X utf8 scripts/smoke_windows.py --tray --home .work/tray-only-exit-home
       - name: Verify GUI readiness and rollback after failed page load
         run: .venv/Scripts/python.exe -X utf8 scripts/smoke_desktop_updates.py
       - uses: actions/upload-artifact@v4
