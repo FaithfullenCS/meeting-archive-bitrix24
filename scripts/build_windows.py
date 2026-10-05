@@ -51,6 +51,16 @@ def main() -> None:
             shutil.rmtree(destination)
         shutil.copytree(package / name, destination,
                         ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.exe"))
+    sys.path.insert(0, str(root))
+    from meeting_archive.webview_runtime import BOOTSTRAPPER_URL, verify_bootstrapper
+    import urllib.request
+    bootstrapper = staging / "resources/MicrosoftEdgeWebview2Setup.exe"
+    with urllib.request.urlopen(BOOTSTRAPPER_URL, timeout=60) as response:
+        installer = response.read(10 * 1024 * 1024 + 1)
+    if len(installer) > 10 * 1024 * 1024:
+        raise SystemExit("Unexpected WebView2 bootstrapper size")
+    bootstrapper.write_bytes(installer)
+    verify_bootstrapper(bootstrapper)
     command = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
                "--onedir", "--windowed", "--name", "MeetingArchive", "--icon", str(package / "static/favicon.ico"),
                "--paths", str(root), "--distpath", str(root / "dist"),
@@ -60,7 +70,7 @@ def main() -> None:
         command.extend(["--add-data", f"{staging / name}{os.pathsep}meeting_archive/{name}"])
     command.extend(["--add-binary", f"{uv.find_uv_bin()}{os.pathsep}meeting_archive/resources"])
     for hidden in ("pystray._win32", "uvicorn.logging", "uvicorn.loops.asyncio",
-                   "uvicorn.protocols.http.h11_impl", "uvicorn.lifespan.on"):
+                   "uvicorn.protocols.http.h11_impl", "uvicorn.lifespan.on", "webview.platforms.winforms", "webview.platforms.edgechromium"):
         command.extend(["--hidden-import", hidden])
     for heavy in ("torch", "torchaudio", "pyannote", "faster_whisper", "ctranslate2",
                   "numpy", "scipy", "librosa", "noisereduce", "soundfile", "av"):
@@ -75,7 +85,7 @@ def main() -> None:
     for relative in ("meeting_archive/resources/uv.exe", "meeting_archive/worker/entry.py",
                      "meeting_archive/static/index.html", "meeting_archive/static/app.js",
                      "meeting_archive/static/styles.css", "meeting_archive/resources/worker-cuda.lock",
-                     "meeting_archive/resources/worker-cuda126.lock"):
+                     "meeting_archive/resources/worker-cuda126.lock", "meeting_archive/resources/MicrosoftEdgeWebview2Setup.exe"):
         if not (distribution / "_internal" / relative).is_file():
             raise SystemExit(f"Packaged input missing: {relative}")
     for source in ("README.md", "skills"):

@@ -4,14 +4,15 @@ import subprocess
 import sys
 
 
-def test_open_never_runs_powershell_or_keyboard_tab_search(monkeypatch):
+def test_open_never_launches_external_browser(monkeypatch, tmp_path):
+    import webbrowser
     def forbidden(*args, **kwargs):
-        raise AssertionError("Opening the archive must never run a tab-search helper")
-
-    monkeypatch.setattr(browser.subprocess, "run", forbidden)
-    monkeypatch.setattr(browser, "controller", lambda: None)
-    monkeypatch.setattr(browser.webbrowser, "open", lambda *args, **kwargs: True)
+        raise AssertionError("The archive must not launch an external browser")
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    monkeypatch.setattr(webbrowser, "open", forbidden)
+    window = browser.configure_window(tmp_path)
     browser.open_browser("http://localhost:8765/?launch=synthetic")
+    assert window.pending_open
 
 
 def test_repeated_launch_does_not_load_server_stack_before_instance_check():

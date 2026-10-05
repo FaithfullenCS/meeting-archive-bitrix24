@@ -23,11 +23,14 @@ function Copy-Program([string]$source, [string]$destination, [string]$name) {
     New-Item -ItemType Directory -Path (Split-Path -Parent $dst) -Force | Out-Null
     Copy-Item -LiteralPath $src -Destination $dst -Force
 }
-function Start-Archive {
+function Start-Archive([bool]$verifyStartup = $false) {
     # A new independent instance must not inherit PyInstaller's worker identity.
     $env:PYINSTALLER_RESET_ENVIRONMENT = '1'
     $arguments = '--home "' + $c.home + '"'
     if ($c.headless) { $arguments += ' --no-browser --no-tray' }
+    if ($verifyStartup) { $arguments += ' --update-start' }
+    if ($c.desktop_smoke) { $arguments += ' --desktop-smoke' }
+    if ($verifyStartup -and $c.desktop_smoke_fail) { $arguments += ' --desktop-smoke-fail' }
     return Start-Process -FilePath (Join-Path $target 'MeetingArchive.exe') -ArgumentList $arguments -WindowStyle Hidden -PassThru
 }
 try {
@@ -52,15 +55,15 @@ try {
     foreach ($name in $c.old_files) {
         if ($name -notin $c.new_files) { Remove-Item -LiteralPath (Safe-File $target $name) -Force }
     }
-    $started = Start-Archive
-    $deadline = (Get-Date).AddSeconds(45)
+    $started = Start-Archive $true
+    $deadline = (Get-Date).AddSeconds($(if ($c.headless) {45} else {240}))
     $healthy = $false
     $startupError = ''
     do {
         Start-Sleep -Milliseconds 500
         try {
             $runtime = Get-Content -LiteralPath (Join-Path $c.home 'runtime.json') -Raw | ConvertFrom-Json
-            if ($runtime.pid -eq $started.Id -and $runtime.version -eq $c.version) {
+            if ($runtime.pid -eq $started.Id -and $runtime.version -eq $c.version -and ($c.headless -or $runtime.desktop_ready)) {
                 # Readiness does not need a UI cookie or a launch capability.
                 # Use IPv4 loopback directly and bypass system proxy discovery.
                 $probe = [Net.HttpWebRequest]::Create('http://127.0.0.1:8765/api/bootstrap')

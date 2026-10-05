@@ -825,7 +825,7 @@
     try {
       const previousChatRevision = state.bootstrap?.chat_revision;
       const data = await api("/api/bootstrap"); renderBootstrap(data); if (data.activation) await consumeActivation(data.activation);
-      if (!state.windowAnnounced) { api("/api/browser/ready", {method: "POST"}).then(result => { state.windowAnnounced = Boolean(result.registered); }).catch(() => {}); }
+      if (!state.windowAnnounced) { api("/api/desktop/ready", {method: "POST"}).then(result => { state.windowAnnounced = Boolean(result.ready); }).catch(() => {}); }
       if (state.route === "archive" && participantsNeedRefresh()) await loadParticipants();
       if (state.route === "archive" && chatsNeedRefresh()) await loadChats();
       if (state.route === "module" && (!state.hardware || state.hardwareProfile !== hardwareProfile())) await loadHardware();
@@ -1097,15 +1097,16 @@
   $("#oauth-form").addEventListener("submit", event => {
     event.preventDefault(); const form = event.currentTarget;
     const separate = form.elements.flow.value === "oob";
-    const authWindow = separate ? window.open("about:blank", "_blank") : null; if (authWindow) authWindow.opener = null;
+    const authWindow = separate && !window.pywebview ? window.open("about:blank", "_blank") : null; if (authWindow) authWindow.opener = null;
     action(event.submitter, async () => {
       try {
         const result = await api("/api/auth/oauth", { method: "POST", data: { portal: form.elements.portal.value.trim(), client_id: form.elements.client_id.value.trim(), client_secret: form.elements.client_secret.value, oauth_relay: form.elements.oauth_relay.value.trim(), flow: form.elements.flow.value } });
         const url = new URL(result.url); if (url.protocol !== "https:") throw new Error("Получен некорректный адрес авторизации.");
-        if (authWindow) authWindow.location.href = url.href;
+        if (window.pywebview) window.open(url.href, "_blank");
+        else if (authWindow) authWindow.location.href = url.href;
         else if (!separate) { location.assign(url.href); return; }
         const target = $("#oauth-link"); target.replaceChildren(); target.hidden = false;
-        const link = document.createElement("a"); link.href = url.href; link.target = separate ? "_blank" : "_self"; link.rel = "noreferrer"; link.textContent = "Открыть вход повторно, если браузер не открылся"; target.append(link);
+        const link = document.createElement("a"); link.href = url.href; link.target = separate || window.pywebview ? "_blank" : "_self"; link.rel = "noreferrer"; link.textContent = "Открыть вход повторно, если браузер не открылся"; target.append(link);
         state.oauthAttempt = result.flow === "oob" ? result.attempt : null; $("#oauth-code-form").hidden = !state.oauthAttempt;
         notify(state.oauthAttempt ? "Войдите в Bitrix24, скопируйте выданный код и проверьте его здесь." : "Войдите в Bitrix24 в открывшемся окне браузера. После входа состояние обновится автоматически.");
       } catch (error) { authWindow?.close(); throw error; }

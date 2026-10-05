@@ -239,10 +239,10 @@ def create_app(service: Service, launch_token: str | None = None, *, manage_life
                 "hf_verified": bool(service.db.get_state("hf_verified")), "model_test": service.db.get_state("model_test"),
                 "transcription": await asyncio.to_thread(service.transcription_status)}
 
-    @app.post("/api/browser/ready")
-    async def browser_ready():
-        from .browser import register_window
-        return {"registered": bool(register_window())}
+    @app.post("/api/desktop/ready")
+    async def desktop_ready():
+        from .browser import mark_ready
+        return {"ready": bool(mark_ready())}
 
     @app.post("/api/desktop/open")
     async def desktop_open():

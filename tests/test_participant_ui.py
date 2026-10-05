@@ -24,7 +24,7 @@ const context = vm.createContext({state, Date: {now: () => now},
   loadMeetings: async () => {state.lastListAt = now;},
   api: async route => {
     if (route === "/api/bootstrap") return structuredClone(data);
-    if (route === "/api/browser/ready") { readyCalls++; return {registered:true}; }
+    if (route === "/api/desktop/ready") { readyCalls++; return {ready:true}; }
     assert.equal(route, "/api/participants", "Polling must never fetch meeting materials");
     calls++;
     if (fail) throw new Error("temporary failure");

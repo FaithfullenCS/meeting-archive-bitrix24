@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "meeting-archive"
-version = "0.2.21"
+version = "0.2.22"
 description = "Local Bitrix24 meeting archive with optional offline transcription"
 requires-python = ">=3.12,<3.13"
 dependencies = [
   "fastapi==0.142.2", "uvicorn==0.54.0", "httpx==0.28.1",
   "pydantic==2.13.5", "python-multipart==0.0.32", "psutil==7.0.0",
   "pystray==0.19.5", "Pillow==12.3.0",
+  "pywebview==6.2.1; sys_platform == 'win32'",
   "starlette==1.7.0",
   "winrt-Windows.UI.Notifications==3.2.1; sys_platform == 'win32'",
   "winrt-Windows.Data.Xml.Dom==3.2.1; sys_platform == 'win32'",

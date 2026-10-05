@@ -38,6 +38,14 @@ def self_test():
     from .notifications import APP_ID
     assert XmlDocument and ToastNotification
     assert isinstance(ToastNotificationManager.create_toast_notifier_with_id(APP_ID), ToastNotifier)
+    import webview
+    from .webview_runtime import verify_bootstrapper
+    assert webview
+    verify_bootstrapper(package / "resources/MicrosoftEdgeWebview2Setup.exe")
+    if getattr(sys, "frozen", False):
+        from .webview_runtime import execution_level
+        assert execution_level(sys.executable) == "asInvoker"
+        assert not any((package.parent / name).exists() for name in ("torch", "torchaudio", "faster_whisper", "pyannote"))
     if sys.stdout:
         print("Meeting Archive resource/import self-test passed")
 
@@ -69,11 +77,26 @@ def main():
     parser.add_argument("--no-tray", action="store_true")
     parser.add_argument("--home", type=Path)
     parser.add_argument("--activate")
+    parser.add_argument("--desktop-smoke", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--desktop-smoke-fail", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--update-start", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.self_test:
         self_test()
         return
     home = (args.home or app_home()).resolve()
+    if args.desktop_smoke and (not args.home or not home.name.startswith("desktop-smoke-")):
+        raise ValueError("Desktop smoke requires an explicit synthetic profile")
+    if args.desktop_smoke_fail and not args.desktop_smoke:
+        raise ValueError("Desktop failure probe requires a synthetic smoke profile")
+    qa_handler = None
+    if args.desktop_smoke:
+        import logging
+        home.mkdir(parents=True, exist_ok=True)
+        logger = logging.getLogger("pywebview")
+        qa_handler = logging.FileHandler(home / "webview.log", encoding="utf-8")
+        logger.addHandler(qa_handler)
+        logger.setLevel(logging.DEBUG)
     if args.activate:
         from .notifications import parse_activation
         parse_activation(args.activate)
@@ -99,6 +122,9 @@ def main():
             return
         # A repeated EXE launch only needs the mutex/runtime and our window.
         # Load the server stack after that fast path, not before activating it.
+        if not args.no_browser:
+            from .webview_runtime import prepare_runtime
+            prepare_runtime(allow_retry=not args.update_start)
         import uvicorn
         from .app import create_app
         from .service import Service
@@ -108,11 +134,10 @@ def main():
         listener.bind(("127.0.0.1", 8765))
         listener.listen(128)
         service = Service(home)
-        from .browser import configure_window, close_browser, retire_legacy_registered_windows
-        configure_window(home)
+        from .browser import configure_window, close_browser
         from .notifications import register_windows
         try:
-            if not args.no_tray:
+            if not args.no_tray and not args.desktop_smoke:
                 register_windows(home)
         except OSError as exc:
             service.notifications.error = str(exc)
@@ -121,7 +146,18 @@ def main():
         app = create_app(service)
         url = "http://localhost:8765/?launch=" + app.state.launch_token
         from . import __version__
-        atomic_json(runtime_file, {"url": url, "pid": os.getpid(), "version": __version__})
+        runtime = {"url": url, "pid": os.getpid(), "version": __version__,
+                   "desktop_required": not args.no_browser, "desktop_ready": False}
+        atomic_json(runtime_file, runtime)
+        cleaned = threading.Event()
+        def window_ready():
+            runtime["desktop_ready"] = True
+            atomic_json(runtime_file, runtime)
+            if not cleaned.is_set():
+                cleaned.set()
+                from .webview_runtime import cleanup_legacy_profile
+                threading.Thread(target=cleanup_legacy_profile, args=(home,), daemon=True).start()
+        window = configure_window(home, on_ready=window_ready, hide_on_close=not args.no_tray) if not args.no_browser else None
         config = uvicorn.Config(app, host="127.0.0.1", port=8765, log_config=None, access_log=False, log_level="critical")
         server = uvicorn.Server(config)
         tray_icon = None
@@ -143,16 +179,13 @@ def main():
             time.sleep(.05)
         if not server.started:
             raise RuntimeError("Локальный интерфейс не запустился")
-        if not args.no_browser:
-            retire_legacy_registered_windows()
-            open_browser(url)
-        if args.no_tray:
+        if args.no_tray and args.no_browser:
             try:
                 while thread.is_alive():
                     thread.join(1)
             except KeyboardInterrupt:
                 server.should_exit = True
-        else:
+        elif not args.no_tray:
             import pystray
             from PIL import Image
             icon_image = Image.open(Path(__file__).parent / "static/favicon.ico")
@@ -177,20 +210,45 @@ def main():
             tray_icon = icon
             from .tray import bind_open_action
             bind_open_action(icon, lambda: open_browser(url))
-            try:
-                icon.run()
-            finally:
-                server.should_exit = True
+            tray_thread = threading.Thread(target=icon.run, name="MeetingArchiveTray", daemon=True)
+            tray_thread.start()
+        try:
+            if window:
+                def started():
+                    if args.desktop_smoke and not args.desktop_smoke_fail:
+                        from .desktop_smoke import exercise
+                        exercise(window, home, url, exit_requested, tray_icon)
+                window.run("http://localhost:8765/desktop-smoke-missing-page" if args.desktop_smoke_fail else url, started=started)
+            elif not args.no_tray:
+                while thread.is_alive() and not server.should_exit:
+                    thread.join(.5)
+        finally:
+            server.should_exit = True
+            if tray_icon:
+                tray_icon.stop()
         thread.join(timeout=20)
         listener.close()
     except Exception as exc:
-        notice(str(exc))
-        raise
+        if "server" in locals():
+            server.should_exit = True
+            thread.join(timeout=20)
+        if "tray_icon" in locals() and tray_icon:
+            tray_icon.stop()
+        if args.desktop_smoke:
+            atomic_json(home / "desktop-smoke.json", {"ok": False, "error": str(exc)})
+        elif args.update_start:
+            atomic_json(home / "update-startup-error.json", {"error": str(exc)})
+        else:
+            notice(str(exc))
+        raise SystemExit(1) from None  # Handled failure: no PyInstaller traceback dialog blocking rollback.
     finally:
         if not existing:
             runtime_file.unlink(missing_ok=True)
         kernel.CloseHandle.argtypes = [ctypes.c_void_p]
         kernel.CloseHandle(mutex)
+        if qa_handler:
+            logger.removeHandler(qa_handler)
+            qa_handler.close()
 
 
 if __name__ == "__main__":
