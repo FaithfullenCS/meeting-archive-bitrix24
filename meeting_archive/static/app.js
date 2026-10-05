@@ -4,7 +4,7 @@
   const $ = (selector, root = document) => root.querySelector(selector);
   const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
   const state = { csrf: "", bootstrap: null, route: "archive", meetingId: null, detail: null,
-    selected: new Set(), selectionAnchor: null, selectionList: "", items: [], total: 0, offset: 0, limit: 50, settingsReady: false,
+    selected: new Set(), expandedPeople: new Set(), selectionAnchor: null, selectionList: "", items: [], total: 0, offset: 0, limit: 50, settingsReady: false,
     settingsDirty: false, pickedPaths: [], hardware: null, lastDetailAt: 0, lastListAt: 0,
     listRequest: 0, detailRequest: 0, busy: false, toastTimer: null, oauthAttempt: null,
     authRendered: false, moduleRendered: false,
@@ -450,6 +450,22 @@
     selectAll.indeterminate = selectedCount > 0 && selectedCount < state.items.length;
     selectAll.disabled = state.items.length === 0;
   }
+  function meetingPeople(item) {
+    const people = item.participants || [];
+    if (!people.length) return '<span class="meeting-subtitle">Участники не указаны</span>';
+    const expanded = state.expandedPeople.has(item.id);
+    return `<div class="meeting-people ${expanded ? "expanded" : ""}" data-people="${item.id}"><div class="meeting-people-list" id="meeting-people-${item.id}">${people.map(person => `<span class="participant-chip" title="${escapeHtml(person.label)}"><span>${escapeHtml(person.label)}</span></span>`).join("")}</div><button type="button" class="meeting-people-toggle" data-people-toggle="${item.id}" aria-controls="meeting-people-${item.id}" aria-expanded="${expanded}" aria-label="${expanded ? "Свернуть" : "Показать всех"} участников (${people.length})" hidden>${icon("chevron-down")}</button></div>`;
+  }
+  function updatePeopleOverflow() {
+    $$(".meeting-people").forEach(group => {
+      const list = $(".meeting-people-list", group);
+      const overflow = list.scrollHeight > 35;
+      group.classList.toggle("has-overflow", overflow);
+      $(".meeting-people-toggle", group).hidden = !overflow;
+    });
+  }
+  const peopleResizeObserver = typeof ResizeObserver === "function" ? new ResizeObserver(updatePeopleOverflow) : null;
+  window.addEventListener("resize", updatePeopleOverflow);
   function selectMeeting(id, checked, shiftKey) {
     const current = state.items.findIndex(item => item.id === id);
     const anchor = state.items.findIndex(item => item.id === state.selectionAnchor);
@@ -475,7 +491,10 @@
     if (selectionList !== state.selectionList) state.selectionAnchor = null;
     state.selectionList = selectionList;
     state.items = (result.items || []).map(normalizeMeeting); state.total = Number(result.total) || 0; state.lastListAt = Date.now();
-    $("#meeting-list").innerHTML = state.items.map(item => `<tr><td class="check-cell"><input type="checkbox" data-select="${item.id}" aria-label="Выбрать ${escapeHtml(item.title)}" ${state.selected.has(item.id) ? "checked" : ""}></td><td><button class="meeting-title" data-meeting="${item.id}" title="${escapeHtml(item.title)}">${escapeHtml(item.title)}</button><span class="meeting-subtitle">${escapeHtml(item.chat_title || (item.chat_id ? `Чат ID ${item.chat_id}` : "Без чата"))}</span><span class="meeting-subtitle">${escapeHtml(dateString(item.startDate))} · ${item.source === "import" ? "Импорт" : escapeHtml(item.portal || "Bitrix24")} · ID ${item.id}</span></td><td>${escapeHtml(durationString(item.durationSeconds))}</td><td>${badge(item.audio)}</td><td>${badge(item.bitrix)}</td><td>${badge(item.local)}</td><td><button class="row-open" data-meeting="${item.id}" aria-label="Открыть ${escapeHtml(item.title)}">${icon("chevron-right")}</button></td></tr>`).join("");
+    $("#meeting-list").innerHTML = state.items.map(item => `<tr><td class="check-cell"><input type="checkbox" data-select="${item.id}" aria-label="Выбрать ${escapeHtml(item.title)}" ${state.selected.has(item.id) ? "checked" : ""}></td><td><button class="meeting-title" data-meeting="${item.id}" title="${escapeHtml(item.title)}">${escapeHtml(item.title)}</button>${meetingPeople(item)}<span class="meeting-subtitle" title="${escapeHtml(item.chat_id ? `ID беседы ${item.chat_id}` : "")}">${escapeHtml(item.chat_title || (item.chat_id ? "Название беседы недоступно" : "Без беседы"))}</span><span class="meeting-subtitle">${escapeHtml(dateString(item.startDate))}${item.source === "import" ? " · Импорт" : ""} · ID ${item.id}</span></td><td>${escapeHtml(durationString(item.durationSeconds))}</td><td>${badge(item.audio)}</td><td>${badge(item.bitrix)}</td><td>${badge(item.local)}</td><td><button class="row-open" data-meeting="${item.id}" aria-label="Открыть ${escapeHtml(item.title)}">${icon("chevron-right")}</button></td></tr>`).join("");
+    peopleResizeObserver?.disconnect();
+    $$(".meeting-people").forEach(group => peopleResizeObserver?.observe(group));
+    updatePeopleOverflow();
     const filtered = [...params.keys()].some(key => !["offset", "limit"].includes(key));
     $("#archive-empty").hidden = state.items.length > 0;
     $("#archive-empty h2").textContent = filtered ? "Нет совещаний с такими параметрами" : "Здесь будет история совещаний";
@@ -821,6 +840,16 @@
     } finally { state.busy = false; }
   }
   document.addEventListener("click", event => {
+    const peopleToggle = event.target.closest("[data-people-toggle]");
+    if (peopleToggle) {
+      const id = Number(peopleToggle.dataset.peopleToggle);
+      const expanded = !state.expandedPeople.has(id);
+      if (expanded) state.expandedPeople.add(id); else state.expandedPeople.delete(id);
+      peopleToggle.closest(".meeting-people").classList.toggle("expanded", expanded);
+      peopleToggle.setAttribute("aria-expanded", String(expanded));
+      const item = state.items.find(item => item.id === id);
+      peopleToggle.setAttribute("aria-label", `${expanded ? "Свернуть" : "Показать всех"} участников (${item?.participants?.length || 0})`);
+    }
     const withinParticipants = Boolean(event.target.closest("#participants-control"));
     const addPerson = event.target.closest("[data-participant-add]"); if (addPerson) addParticipant(addPerson.dataset.participantAdd);
     const removePerson = event.target.closest("[data-participant-remove]"); if (removePerson) { state.participantIds.delete(removePerson.dataset.participantRemove); renderParticipants(); requestFilter(); }

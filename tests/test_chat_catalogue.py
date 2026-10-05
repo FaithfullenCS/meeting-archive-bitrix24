@@ -71,3 +71,42 @@ async def test_chat_choices_group_meetings_and_multiselect_unions_chats(ui):
     assert choices[0] == {'id': '42', 'label': 'Чат 42', 'count': 2}
     assert (await client.get('/api/meetings', params={'chats': '42,43'})).json()['total'] == 3
     assert (await client.get('/api/meetings', params={'chats': '42,43', 'q': '4'})).json()['total'] == 0
+
+
+@pytest.mark.asyncio
+async def test_personal_dialog_name_requires_matching_internal_chat_id(settings, vault):
+    import httpx
+    from meeting_archive.bitrix import BitrixClient
+    seen = []
+    def handler(request):
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json={"result": {"result": {
+            "personal_42": {"id": 42, "name": "Синтетический собеседник"},
+            "personal_43": {"id": 999, "name": "Другой диалог"}}}})
+    client = BitrixClient(settings, vault, transport=httpx.MockTransport(handler))
+    try:
+        assert await client.personal_chat_titles({42: 99, 43: 100}) == {42: "Личный диалог: Синтетический собеседник"}
+        assert seen[0]["cmd"] == {"personal_42": "im.dialog.get?DIALOG_ID=99", "personal_43": "im.dialog.get?DIALOG_ID=100"}
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_personal_dialog_fallback_is_cached_and_preserves_participants(service):
+    data = clean_metadata({"callId": 1, "chatId": 42, "participants": [
+        {"userId": service.settings.user_id, "name": "Я"}, {"userId": 99, "name": "Собеседник"}]})
+    service.client.chat_titles = AsyncMock(return_value=({}, {"chat_42": {"error": "DIALOG_ID_EMPTY"}}))
+    service.client.personal_chat_titles = AsyncMock(return_value={42: "Личный диалог: Собеседник"})
+    assert (await service.hydrate_chats([data]))[0]["chatTitle"] == "Личный диалог: Собеседник"
+    service.client.personal_chat_titles.assert_awaited_once_with({42: 99})
+    await service.hydrate_chats([data])
+    service.client.personal_chat_titles.assert_awaited_once()
+    view = meeting_view(service.db.upsert(service.settings.portal, data))
+    assert [p["label"] for p in view["participants"]] == ["Я", "Собеседник"]
+
+
+def test_ambiguous_or_group_participants_do_not_identify_a_personal_dialog(service):
+    current = service.settings.user_id
+    items = [{"chatId": 42, "participants": [{"userId": current}, {"userId": peer}]} for peer in [99, 100]]
+    assert service.personal_chat_peers(items) == {}
+    assert service.personal_chat_peers([{"chatId": 42, "participants": [{"userId": 99}, {"userId": 100}]}]) == {}

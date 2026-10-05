@@ -100,6 +100,7 @@ def meeting_view(record: dict) -> dict:
     metadata = json.loads(record["metadata"])
     record.update(metadata=metadata, title=(metadata.get("overview") or {}).get("topic") or "Без названия",
                   startDate=metadata.get("startDate", ""), durationSeconds=metadata.get("durationSeconds", 0),
+                  participants=meeting_participants(record["portal"], metadata),
                   participant_ids=[p["id"] for p in meeting_participants(record["portal"], metadata)],
                   chat_id=metadata.get("chatId"), chat_title=metadata.get("chatTitle") or "")
     availability = metadata.get("availability", {})

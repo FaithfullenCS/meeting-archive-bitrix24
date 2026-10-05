@@ -181,6 +181,23 @@ class BitrixClient:
                 titles[chat_id] = str(data["name"]).strip()
         return titles, errors
 
+    async def personal_chat_titles(self, peers):
+        """Resolve a candidate personal dialog only if its internal chat ID matches."""
+        if not peers:
+            return {}
+        if len(peers) > 50:
+            raise ValueError("Не более 50 диалогов в одном пакете")
+        result = await self.call("batch", {"halt": 0, "cmd": {
+            f"personal_{int(chat_id)}": f"im.dialog.get?DIALOG_ID={int(user_id)}"
+            for chat_id, user_id in peers.items()}}, v3=False)
+        replies = result.get("result", {}) if isinstance(result, dict) else {}
+        titles = {}
+        for chat_id in peers:
+            data = replies.get(f"personal_{int(chat_id)}", {}) if isinstance(replies, dict) else {}
+            if isinstance(data, dict) and str(data.get("id")) == str(chat_id) and data.get("name"):
+                titles[int(chat_id)] = "Личный диалог: " + str(data["name"]).strip()
+        return titles
+
     async def catalogue(self, start: str, end: str):
         cursor = None
         seen = set()

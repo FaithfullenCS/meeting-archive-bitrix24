@@ -15,6 +15,7 @@ import httpx
 
 from .archive import Archive, clean_metadata
 from .bitrix import BitrixClient, BitrixError
+from .participants import meeting_participants
 from .db import Database
 from .modules import ModuleManager
 from .settings import Settings, Vault
@@ -105,18 +106,38 @@ class Service:
         key = f"chat_title:{self.settings.portal}:{int(chat_id)}"
         cached = json.loads(self.db.get_state(key) or "{}")
         title = cached.get("title", "")
-        if not self.chat_lookup_disabled and time.time() - cached.get("at", 0) > 86400:
+        if not self.chat_lookup_disabled and time.time() - cached.get("at", 0) > (86400 if title else 300):
             try:
                 title = await self.client.chat_title(int(chat_id))
                 self.db.set_state(key, json.dumps({"title": title, "at": time.time()}, ensure_ascii=False))
                 self.chat_warning = ""
                 await asyncio.sleep(.2)
-            except (BitrixError, httpx.HTTPError, ValueError, OSError):
-                self.chat_lookup_disabled = True
-                self.chat_warning = "Названия некоторых чатов недоступны. Для их получения добавьте право im в приложении Bitrix24 и повторите вход. Каталог и фильтр по ID чата доступны."
+            except (BitrixError, httpx.HTTPError, ValueError, OSError) as exc:
+                if not isinstance(exc, BitrixError) or exc.auth:
+                    self.chat_lookup_disabled = True
+                self.chat_warning = "Названия некоторых бесед недоступны. Проверьте подключение и право im в приложении Bitrix24."
+            if not title and not self.chat_lookup_disabled:
+                try:
+                    titles = await self.client.personal_chat_titles(self.personal_chat_peers([metadata]))
+                    title = titles.get(int(chat_id), "")
+                    self.db.set_state(key, json.dumps({"title": title, "at": time.time()}, ensure_ascii=False))
+                except (BitrixError, httpx.HTTPError, ValueError, OSError):
+                    pass
         if title:
             metadata["chatTitle"] = title
         return metadata
+
+    def personal_chat_peers(self, items):
+        candidates = {}
+        for item in items:
+            if not item.get("chatId"):
+                continue
+            people = {int(p["user_id"]) for p in meeting_participants(self.settings.portal, item)}
+            chat_id = int(item["chatId"])
+            peer = next(iter(people - {self.settings.user_id})) if len(people) == 2 and self.settings.user_id in people else None
+            candidates.setdefault(chat_id, set()).add(peer)
+        return {chat_id: next(iter(peers)) for chat_id, peers in candidates.items()
+                if len(peers) == 1 and None not in peers}
 
     async def hydrate_chats(self, items):
         missing = set()
@@ -133,12 +154,21 @@ class Service:
             group = ids[offset:offset + 50]
             try:
                 titles, errors = await self.client.chat_titles(group)
+                denied_scope = isinstance(errors, dict) and any(str(e.get("error", "")).lower() == "insufficient_scope" for e in errors.values())
+                if not denied_scope:
+                    peers = self.personal_chat_peers(items)
+                    candidates = {chat_id: peers[chat_id] for chat_id in group if chat_id not in titles and chat_id in peers}
+                    if candidates:
+                        try:
+                            titles.update(await self.client.personal_chat_titles(candidates))
+                        except (BitrixError, httpx.HTTPError, ValueError, OSError):
+                            pass  # Do not replace an unavailable name with an unverified person.
                 for chat_id in group:
                     key = f"chat_title:{self.settings.portal}:{chat_id}"
                     old = json.loads(self.db.get_state(key) or "{}")
                     self.db.set_state(key, json.dumps({"title": titles.get(chat_id, old.get("title", "")), "at": time.time()}, ensure_ascii=False))
-                self.chat_warning = "Некоторые названия чатов недоступны текущему пользователю." if errors else ""
-                if isinstance(errors, dict) and any(str(e.get("error", "")).lower() == "insufficient_scope" for e in errors.values()):
+                self.chat_warning = "Некоторые названия бесед недоступны текущему пользователю." if errors and any(chat_id not in titles for chat_id in group) else ""
+                if denied_scope:
                     self.chat_lookup_disabled = True
                     self.chat_warning = "Для названий чатов добавьте право im и повторите вход."
                 self.db.set_state("chat_revision", str(time.time_ns()))
