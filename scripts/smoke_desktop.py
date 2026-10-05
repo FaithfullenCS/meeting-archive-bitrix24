@@ -1,5 +1,6 @@
 """Launch the actual packaged WebView2/tray on a fresh synthetic profile."""
 import json
+import argparse
 from pathlib import Path
 import subprocess
 import time
@@ -7,13 +8,19 @@ import uuid
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--autostart", action="store_true")
+    args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     home = root / ".work" / ("desktop-smoke-" + uuid.uuid4().hex)
     home.mkdir()
     (home / "settings.json").write_text(json.dumps({"auto_update": False, "autostart": False,
         "archive_root": str(home / "archive"), "watch_folder": str(home / "incoming")}), encoding="utf-8")
     exe = root / "dist/MeetingArchive/MeetingArchive.exe"
-    process = subprocess.Popen([str(exe), "--home", str(home), "--desktop-smoke"],
+    command = [str(exe), "--home", str(home), "--desktop-smoke"]
+    if args.autostart:
+        command.append("--no-browser")
+    process = subprocess.Popen(command,
                                creationflags=subprocess.CREATE_NO_WINDOW)
     deadline = time.monotonic() + 100
     report_file = home / "desktop-smoke.json"

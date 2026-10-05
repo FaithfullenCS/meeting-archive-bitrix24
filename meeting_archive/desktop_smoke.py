@@ -7,8 +7,25 @@ import time
 from .settings import atomic_json
 
 
-def exercise(window, home, url, shutdown, tray):
-    report = {"checks": [], "ok": False}
+def request_autostart_open(window, home, tray, checks, shutdown):
+    """Probe the real tray-only startup before requesting a native window."""
+    try:
+        deadline = time.monotonic() + 20
+        while not tray.visible and time.monotonic() < deadline:
+            time.sleep(.1)
+        assert tray.visible, "Autostart tray did not become visible"
+        time.sleep(2)
+        assert window.window is None and not window.shown.is_set()
+        assert not window.open_requested.is_set()
+        checks.append("autostart-tray-only-no-native-window")
+        tray.open_archive()
+    except Exception as exc:
+        atomic_json(Path(home) / "desktop-smoke.json", {"ok": False, "error": str(exc), "checks": checks})
+        shutdown()
+
+
+def exercise(window, home, url, shutdown, tray, *, startup_checks=()):
+    report = {"checks": list(startup_checks), "ok": False}
     def wait(predicate, label, timeout=20):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -22,6 +39,8 @@ def exercise(window, home, url, shutdown, tray):
         native = window.window.native
         handle = int(native.Handle.ToInt64())
         wait(lambda: tray is not None and tray.visible, "archive-tray-visible")
+        if startup_checks:
+            wait(lambda: native.Visible, "autostart-tray-creates-visible-window")
         assert window.window.evaluate_js("document.title") == "Meeting Archive"
         assert window.window.evaluate_js("Boolean(document.querySelector('#settings-form'))")
         report["checks"].append("real-interface-loaded")
@@ -44,6 +63,11 @@ def exercise(window, home, url, shutdown, tray):
             tray.open_archive()
             wait(lambda: not window.minimized and native.Visible, "tray-restores-window")
             command = [sys.executable] if getattr(sys, "frozen", False) else [sys.executable, "-m", "meeting_archive.launcher"]
+            window.window.hide()
+            wait(lambda: not native.Visible, "hidden-before-second-launch")
+            subprocess.run(command + ["--home", str(home)],
+                           creationflags=subprocess.CREATE_NO_WINDOW, check=True, timeout=25)
+            wait(lambda: native.Visible, "second-launch-restores-window")
             subprocess.run(command + ["--home", str(home), "--activate", "meetingarchive:settings"],
                            creationflags=subprocess.CREATE_NO_WINDOW, check=True, timeout=25)
             wait(lambda: window.window.evaluate_js("!document.querySelector('#page-settings').hidden"), "notification-activation-settings")

@@ -54,6 +54,10 @@ jobs:
         run: .venv/Scripts/python.exe -X utf8 scripts/smoke_updates.py
       - name: Verify real embedded window, tray and single instance
         run: .venv/Scripts/python.exe -X utf8 scripts/smoke_desktop.py
+      - name: Verify tray-only Windows autostart and first window activation
+        run: .venv/Scripts/python.exe -X utf8 scripts/smoke_desktop.py --autostart
+      - name: Verify tray-only exit before opening any window
+        run: .venv/Scripts/python.exe -X utf8 scripts/smoke_windows.py --tray
       - name: Verify GUI readiness and rollback after failed page load
         run: .venv/Scripts/python.exe -X utf8 scripts/smoke_desktop_updates.py
       - uses: actions/upload-artifact@v4

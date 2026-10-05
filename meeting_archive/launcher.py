@@ -122,6 +122,9 @@ def main():
             return
         # A repeated EXE launch only needs the mutex/runtime and our window.
         # Load the server stack after that fast path, not before activating it.
+        # --no-browser is the existing Windows Run registration: start only the
+        # tray and create the desktop on demand. Both flags remain headless.
+        desktop_enabled = not (args.no_browser and args.no_tray)
         if not args.no_browser:
             from .webview_runtime import prepare_runtime
             prepare_runtime(allow_retry=not args.update_start)
@@ -147,7 +150,7 @@ def main():
         url = "http://localhost:8765/?launch=" + app.state.launch_token
         from . import __version__
         runtime = {"url": url, "pid": os.getpid(), "version": __version__,
-                   "desktop_required": not args.no_browser, "desktop_ready": False}
+                   "desktop_required": desktop_enabled, "desktop_ready": False}
         atomic_json(runtime_file, runtime)
         cleaned = threading.Event()
         def window_ready():
@@ -157,7 +160,7 @@ def main():
                 cleaned.set()
                 from .webview_runtime import cleanup_legacy_profile
                 threading.Thread(target=cleanup_legacy_profile, args=(home,), daemon=True).start()
-        window = configure_window(home, on_ready=window_ready, hide_on_close=not args.no_tray) if not args.no_browser else None
+        window = configure_window(home, on_ready=window_ready, hide_on_close=not args.no_tray) if desktop_enabled else None
         config = uvicorn.Config(app, host="127.0.0.1", port=8765, log_config=None, access_log=False, log_level="critical")
         server = uvicorn.Server(config)
         tray_icon = None
@@ -214,11 +217,28 @@ def main():
             tray_thread.start()
         try:
             if window:
+                startup_checks = []
+                if args.no_browser:
+                    if args.desktop_smoke:
+                        from .desktop_smoke import request_autostart_open
+                        threading.Thread(target=request_autostart_open,
+                                         args=(window, home, tray_icon, startup_checks, exit_requested),
+                                         daemon=True).start()
+                    # Keep the main thread available for WebView2. No native
+                    # window or runtime installer exists until an open request.
+                    while thread.is_alive() and not server.should_exit and not window.stopping:
+                        if window.open_requested.wait(.5):
+                            break
+                    if not server.should_exit and not window.stopping:
+                        from .webview_runtime import prepare_runtime
+                        prepare_runtime(allow_retry=not args.update_start)
                 def started():
                     if args.desktop_smoke and not args.desktop_smoke_fail:
                         from .desktop_smoke import exercise
-                        exercise(window, home, url, exit_requested, tray_icon)
-                window.run("http://localhost:8765/desktop-smoke-missing-page" if args.desktop_smoke_fail else url, started=started)
+                        exercise(window, home, url, exit_requested, tray_icon, startup_checks=startup_checks)
+                if not server.should_exit and not window.stopping:
+                    window.run("http://localhost:8765/desktop-smoke-missing-page" if args.desktop_smoke_fail else url,
+                               started=started)
             elif not args.no_tray:
                 while thread.is_alive() and not server.should_exit:
                     thread.join(.5)

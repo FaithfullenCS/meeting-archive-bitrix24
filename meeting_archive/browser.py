@@ -15,6 +15,7 @@ class ArchiveWindow:
         self.closed = threading.Event()
         self.stopping = False
         self.pending_open = False
+        self.open_requested = threading.Event()
         self.minimized = False
         self.hide_on_close = hide_on_close
         self.on_ready = on_ready or (lambda: None)
@@ -60,6 +61,7 @@ class ArchiveWindow:
         with self.lock:
             if self.stopping:
                 return
+            self.open_requested.set()
             if not self.shown.is_set():
                 self.pending_open = True
                 return
@@ -71,6 +73,7 @@ class ArchiveWindow:
     def close(self):
         with self.lock:
             self.stopping = True
+            self.open_requested.set()  # Wake the launcher when exiting before first open.
             window = self.window
         if window and not self.closed.is_set():
             try:
