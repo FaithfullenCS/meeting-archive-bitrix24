@@ -13,7 +13,7 @@ from pathlib import Path
 
 import httpx
 
-from .archive import Archive, clean_metadata
+from .archive import Archive, clean_metadata, followup_state
 from .bitrix import BitrixClient, BitrixError
 from .participants import meeting_participants
 from .db import Database
@@ -70,6 +70,7 @@ class Service:
         return bool(self.settings.portal and self.settings.user_id)
 
     async def start(self):
+        self.reconcile_short_calls()
         self.alive = True
         self.event_loop = asyncio.get_running_loop()
         self.tasks = [asyncio.create_task(self.job_loop(("fetch", "import"))),
@@ -290,6 +291,10 @@ class Service:
                         previous_rows = self.db.rows("SELECT * FROM meetings WHERE portal=? AND call_id=?", (self.settings.portal, str(item["callId"])))
                         changed = bool(previous_rows and json.loads(previous_rows[0]["metadata"]) != metadata)
                         meeting = self.db.upsert(self.settings.portal, metadata)
+                        state = followup_state(metadata, saved=meeting["bitrix"] == "saved")
+                        if state == "short_call" or meeting["bitrix"] == "short_call":
+                            self.db.update_meeting(meeting["id"], bitrix=state if state == "short_call" else "not_saved")
+                            meeting = self.db.meeting(meeting["id"])
                         self.catalogue["count"] += 1
                         if meeting["requested"] and (changed or full) and not self.settings.paused:
                             self.request_download(meeting["id"], automatic=True)
@@ -351,6 +356,37 @@ class Service:
             payload.update(audio_only=True, audio_requested=True, download_audio=True)
         return self.db.enqueue("fetch", meeting_id, payload)
 
+    def audio_requested(self, payload):
+        return bool(payload.get("audio_only") or payload.get("audio_requested") or payload.get(
+            "download_audio", self.settings.auto_download_audio or self.settings.auto_local))
+
+    def reconcile_short_calls(self):
+        for meeting in self.db.rows("SELECT * FROM meetings WHERE source='bitrix' AND portal=?", (self.settings.portal,)):
+            metadata = json.loads(meeting["metadata"])
+            if not any(int(p.get("userId", 0)) == self.settings.user_id for p in metadata.get("participants", [])):
+                continue
+            state = followup_state(metadata, saved=meeting["bitrix"] == "saved")
+            if state != "short_call":
+                if meeting["bitrix"] == "short_call":
+                    self.db.update_meeting(meeting["id"], bitrix="waiting")
+                continue
+            self.db.update_meeting(meeting["id"], bitrix=state)
+            if meeting["folder"]:
+                self.archive.manifest(self.db.meeting(meeting["id"]))
+            for job in self.db.rows("SELECT * FROM jobs WHERE kind='fetch' AND meeting_id=? AND state='queued'", (meeting["id"],)):
+                if not self.audio_requested(json.loads(job["payload"])) or meeting["audio"] == "saved":
+                    self.db.job_update(job["id"], state="done", progress=1, error="",
+                                       message=self.fetch_completion_message(self.db.meeting(meeting["id"])))
+                else:
+                    self.db.job_update(job["id"], message="Ожидаем аудиозапись Bitrix24")
+
+    @staticmethod
+    def fetch_completion_message(meeting):
+        if meeting["bitrix"] == "short_call":
+            return ("Аудиозапись сохранена. Короткий звонок: текст Bitrix24 не предоставлен"
+                    if meeting["audio"] == "saved" else "Короткий звонок: текст Bitrix24 не предоставлен")
+        return "Материалы Bitrix24 сохранены"
+
     async def fetch(self, job: dict, progress) -> bool:
         meeting = self.db.meeting(job["meeting_id"])
         self.owned(meeting)
@@ -367,14 +403,18 @@ class Service:
         current = self.db.rows("SELECT payload FROM jobs WHERE id=?", (job["id"],))
         payload = json.loads(current[0]["payload"] if current else job.get("payload") or "{}")
         audio_only = bool(payload.get("audio_only"))
+        state = followup_state(item, saved=meeting["bitrix"] == "saved")
+        if state == "short_call":
+            self.db.update_meeting(meeting["id"], bitrix=state)
+        elif meeting["bitrix"] == "short_call":
+            self.db.update_meeting(meeting["id"], bitrix="waiting")
         if not audio_only:
             if self.archive.transcript(folder, item.get("transcription") or {}):
                 self.db.update_meeting(meeting["id"], bitrix="saved")
-            elif meeting["bitrix"] != "saved":
+            elif state != "short_call" and meeting["bitrix"] != "saved":
                 self.db.update_meeting(meeting["id"], bitrix="waiting")
         tracks = item.get("tracks") or []
-        download_audio = bool(audio_only or payload.get("audio_requested") or payload.get(
-            "download_audio", self.settings.auto_download_audio or self.settings.auto_local))
+        download_audio = self.audio_requested(payload)
         new_audio = []
         self.archive.manifest(self.db.meeting(meeting["id"]))
         for track in tracks if download_audio else []:
@@ -389,7 +429,9 @@ class Service:
             self.defer_local(meeting["id"], new_audio)
         self.archive.manifest(self.db.meeting(meeting["id"]))
         # Keep a requested source under observation, including tracks/AI blocks arriving later.
-        return (audio_only or self.db.meeting(meeting["id"])["bitrix"] == "saved") and (not download_audio or bool(tracks))
+        saved = self.db.meeting(meeting["id"])
+        return (audio_only or saved["bitrix"] in {"saved", "short_call"}) and (
+            not download_audio or bool(tracks) or (saved["bitrix"] == "short_call" and saved["audio"] == "saved"))
 
     def request_import(self, path: Path, meeting_id: int | None = None, automatic=False) -> int:
         if meeting_id is not None:
@@ -655,7 +697,8 @@ class Service:
                 self.active_tasks[job["id"]] = task
                 await task
                 if self.db.rows("SELECT state FROM jobs WHERE id=?", (job["id"],))[0]["state"] == "running":
-                    self.db.job_update(job["id"], state="done", progress=1, message="Завершено")
+                    message = self.fetch_completion_message(self.db.meeting(job["meeting_id"])) if job["kind"] == "fetch" else "Завершено"
+                    self.db.job_update(job["id"], state="done", progress=1, message=message)
                     self.notifications.completed(job)
             except asyncio.CancelledError:
                 if not self.alive:
@@ -692,7 +735,7 @@ class Service:
                 payload["automatic"] = True
                 self.db.execute("UPDATE jobs SET payload=? WHERE id=?", (json.dumps(payload), job["id"]))
                 self.db.job_update(job["id"], state="queued", next_at=time.time() + retry_delay(job["created"]),
-                    message="Ожидаем материалы Bitrix24", error="")
+                    message="Ожидаем аудиозапись Bitrix24" if self.db.meeting(job["meeting_id"])["bitrix"] == "short_call" else "Ожидаем материалы Bitrix24", error="")
         elif job["kind"] == "import":
             await self.import_job(job, progress)
         elif job["kind"] == "transcribe":

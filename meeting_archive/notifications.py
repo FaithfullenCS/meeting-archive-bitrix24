@@ -101,6 +101,11 @@ class Notifications:
                 meeting_id = next(iter(jobs.values()))
                 uri = f"meetingarchive:meeting/{meeting_id}" if meeting_id else "meetingarchive:jobs"
                 message = "Материалы сохранены. Нажмите, чтобы открыть результат."
+                if kind == "download" and meeting_id:
+                    rows = self.service.db.rows("SELECT * FROM meetings WHERE id=?", (meeting_id,))
+                    if rows and rows[0]["bitrix"] == "short_call":
+                        title = "Аудиозапись сохранена" if rows[0]["audio"] == "saved" else "Проверка материалов завершена"
+                        message = self.service.fetch_completion_message(rows[0]) + ". Нажмите, чтобы открыть совещание."
             else:
                 uri = "meetingarchive:jobs/" + ",".join(str(n) for n in list(jobs)[:100])
                 message = f"Завершено задач: {len(jobs)}. Нажмите, чтобы открыть очередь."

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -17,6 +18,25 @@ from .settings import atomic_json
 META_KEYS = {"callId", "uuid", "callType", "chatId", "initiatorId", "startDate", "endDate", "durationSeconds", "outcomes", "createdAt", "version"}
 
 
+def followup_state(item: dict, *, saved=False) -> str | None:
+    """Infer availability, not an API-confirmed reason for rejection."""
+    if saved:
+        return "saved"
+    transcription = item.get("transcription") or {}
+    if isinstance(transcription, dict) and any(
+        isinstance(segment, dict) and str(segment.get("text") or "").strip()
+        for segment in transcription.get("segments") or []
+    ):
+        return "available"
+    if "transcription" in (item.get("outcomes") or []) or item.get("availability", {}).get("bitrix") == "available":
+        return "available"
+    duration = item.get("durationSeconds")
+    if (item.get("endDate") and isinstance(duration, (int, float)) and not isinstance(duration, bool)
+            and math.isfinite(duration) and 0 < duration < 60):
+        return "short_call"
+    return "waiting" if "outcomes" in item else None
+
+
 def clean_metadata(item: dict) -> dict:
     result = {k: v for k, v in item.items() if k in META_KEYS}
     result["chatId"] = item.get("chatId")
@@ -24,8 +44,9 @@ def clean_metadata(item: dict) -> dict:
                               for p in item.get("participants", []) if isinstance(p, dict)]
     result["overview"] = {"topic": (item.get("overview") or {}).get("topic", "")}
     availability = {}
-    if "outcomes" in item:
-        availability["bitrix"] = "available" if "transcription" in (item.get("outcomes") or []) else "waiting"
+    state = followup_state(item)
+    if state:
+        availability["bitrix"] = state
     if "tracks" in item:
         availability["audio"] = "available" if item.get("tracks") else "not_available"
     if availability:

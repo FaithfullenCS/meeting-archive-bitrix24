@@ -23,7 +23,7 @@
     secretEditing: { hf: false, webhook: false, client: false } };
   const labels = {
     saved: "Сохранено", ready: "Готово", complete: "Готово", completed: "Готово",
-    not_saved: "Не сохранено", pending: "Ожидается", queued: "В очереди", running: "В работе",
+    short_call: "Короткий звонок", not_saved: "Не сохранено", pending: "Ожидается", queued: "В очереди", running: "В работе",
     unavailable: "Недоступно", missing: "Нет файла", error: "Ошибка", failed: "Ошибка",
     available: "Можно скачать", not_available: "Запись не предоставлена",
     cancelled: "Отменено", canceled: "Отменено", waiting: "Ожидается", done: "Готово", tested: "Короткий тест"
@@ -127,7 +127,8 @@
     const settings = state.bootstrap?.settings || {};
     const audio = Boolean(settings.auto_download_audio || settings.auto_local);
     setButtonLabel($("#download-selected"), audio ? "Скачать выбранное" : "Скачать тексты Follow-up", "download");
-    setButtonLabel($("#detail-download"), audio ? "Скачать материалы" : "Скачать текст Follow-up", "download");
+    const shortCall = state.detail?.meeting?.id === state.meetingId && state.detail?.meeting?.bitrix === "short_call";
+    setButtonLabel($("#detail-download"), shortCall ? "Проверить материалы Bitrix24" : audio ? "Скачать материалы" : "Скачать текст Follow-up", "download");
     for (const selector of ["#download-selected", "#detail-download"]) {
       $(selector).title = audio ? "Скачать текст Follow-up и аудиозапись" : "Скачать текст Follow-up без аудио";
     }
@@ -610,7 +611,16 @@
     const previousFiles = new Set($$("#transcription-files input").map(input => input.value));
     $("#transcription-files").innerHTML = audio.map(file => `<label class="check-label"><input type="checkbox" value="${escapeHtml(file.name)}" ${!previousFiles.has(file.name) || selectedFiles.has(file.name) ? "checked" : ""}>${escapeHtml(file.name.replace(/^audio[\\/]/, ""))}</label>`).join("");
     renderTranscriptionControls();
-    renderText("#bitrix-text", detail.bitrix_text, meeting.source === "import" ? "Это запись с компьютера. Запустите локальную расшифровку или привяжите запись к совещанию Bitrix24." : meeting.bitrix === "available" ? "Текст готов в Bitrix24. Нажмите «Скачать материалы», чтобы сохранить его в архив." : ["pending", "waiting"].includes(meeting.bitrix) ? "Bitrix24 пока не предоставил готовый текст. После его появления архив сможет его сохранить." : "Доступность текста ещё не проверена. Обновите каталог.");
+    renderText("#bitrix-text", detail.bitrix_text, meeting.source === "import" ? "Это запись с компьютера. Запустите локальную расшифровку или привяжите запись к совещанию Bitrix24." : meeting.bitrix === "short_call" ? "Звонок короче минуты. Текст Bitrix24 не предоставлен; Follow-up обрабатывает звонки от одной минуты. Можно скачать запись и расшифровать локально." : meeting.bitrix === "available" ? "Текст готов в Bitrix24. Нажмите «Скачать материалы», чтобы сохранить его в архив." : ["pending", "waiting"].includes(meeting.bitrix) ? "Bitrix24 пока не предоставил готовый текст. После его появления архив сможет его сохранить." : "Доступность текста ещё не проверена. Обновите каталог.");
+    const shortCall = meeting.bitrix === "short_call" && !textValue(detail.bitrix_text);
+    $("#short-call-actions").hidden = !shortCall;
+    $("#short-call-audio").hidden = Boolean(audio.length);
+    $("#short-call-audio").disabled = !connected();
+    $("#short-call-import").hidden = Boolean(audio.length);
+    const localButton = $("#transcribe-button");
+    setButtonLabel($("#short-call-local"), localButton.textContent, state.bootstrap?.transcription?.ready ? "play" : "settings");
+    $("#short-call-local").disabled = localButton.disabled;
+    updateDownloadButtons();
     $("#bitrix-text-state").textContent = textValue(detail.bitrix_text) ? "Сохранён" : labels[meeting.bitrix] || "Нет текста";
     $("#bitrix-text-state").className = `badge ${statusClass(meeting.bitrix)}`;
     $("#local-text-state").textContent = textValue(detail.local_text) ? "Сохранён" : labels[meeting.local] || "Нет текста";
@@ -947,6 +957,9 @@
   $("#refresh-catalogue").onclick = event => action(event.currentTarget, async () => { await api("/api/catalogue/refresh", { method: "POST", data: {} }); state.participantsLoaded = false; state.chatsLoaded = false; notify("Обновление каталога запущено."); await bootstrap(); });
   $("#download-selected").onclick = event => action(event.currentTarget, async () => { await api("/api/download", { method: "POST", data: { ids: [...state.selected] } }); notify(`Загрузка поставлена в очередь: ${state.selected.size} совещаний.`); state.selected.clear(); renderSelection(); await loadMeetings(); await bootstrap(); });
   $("#pause-button").onclick = event => action(event.currentTarget, async () => { if (!state.bootstrap?.settings?.auto_download && !state.bootstrap?.settings?.auto_local && !state.bootstrap?.settings?.watch_enabled) { navigate("settings"); return; } const paused = !state.bootstrap?.settings?.paused; await api("/api/settings", { method: "POST", data: { paused } }); notify(paused ? "Автоматизация приостановлена." : "Автоматизация продолжена."); await bootstrap(); });
+  $("#short-call-audio").onclick = () => $("#download-audio").click();
+  $("#short-call-import").onclick = () => $("#detail-import").click();
+  $("#short-call-local").onclick = () => $("#transcribe-button").click();
   $("#download-audio").onclick = event => action(event.currentTarget, async () => { await api("/api/download", { method: "POST", data: { ids: [state.meetingId], audio_only: true } }); notify("Аудиозапись поставлена в очередь загрузки."); await bootstrap(); await loadDetail(); });
   $("#detail-download").onclick = event => action(event.currentTarget, async () => { await api("/api/download", { method: "POST", data: { ids: [state.meetingId] } }); notify("Материалы поставлены в очередь загрузки."); await bootstrap(); await loadDetail(); });
   $("#detail-folder").onclick = event => action(event.currentTarget, () => api("/api/open-folder", { method: "POST", data: { id: state.meetingId } }));

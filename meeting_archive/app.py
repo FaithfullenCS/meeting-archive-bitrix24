@@ -25,6 +25,7 @@ from .hardware import MODELS, detect, worker_probe
 from .service import MEDIA_EXTENSIONS, Service, now_iso
 from .settings import portal_domain
 from .participants import meeting_participants, options as participant_options
+from .archive import followup_state
 
 STATIC = Path(__file__).parent / "static"
 CALLBACK = "http://127.0.0.1:8765/oauth/callback"
@@ -105,6 +106,11 @@ def meeting_view(record: dict) -> dict:
                   chat_id=metadata.get("chatId"), chat_title=metadata.get("chatTitle") or "")
     availability = metadata.get("availability", {})
     if record["source"] == "bitrix":
+        state = followup_state(metadata, saved=record["bitrix"] == "saved")
+        if state == "short_call":
+            record["bitrix"] = state
+        elif record["bitrix"] == "short_call":
+            record["bitrix"] = "not_saved"
         for field in ("audio", "bitrix"):
             if availability.get(field) and (record[field] == "not_saved" or
                     (field == "audio" and record[field] == "waiting" and availability[field] == "not_available")):
