@@ -86,15 +86,16 @@ def main():
                 runtime = json.loads(runtime_file.read_text("utf-8"))
                 url = runtime.get("url", "")
                 if url.startswith(("http://127.0.0.1:8765/?launch=", "http://localhost:8765/?launch=")):
+                    from urllib.parse import parse_qs, urlsplit
+                    import httpx
+                    token = parse_qs(urlsplit(url).query)["launch"][0]
                     if args.activate:
-                        from urllib.parse import parse_qs, urlsplit
-                        import httpx
-                        token = parse_qs(urlsplit(url).query)["launch"][0]
                         response = httpx.post("http://localhost:8765/api/desktop/activate",
                                               json={"uri": args.activate}, headers={"x-desktop-token": token}, timeout=10)
                         response.raise_for_status()
                     if not args.no_browser:
-                        open_browser(url)
+                        httpx.post("http://localhost:8765/api/desktop/open", json={},
+                                   headers={"x-desktop-token": token}, timeout=20).raise_for_status()
             return
         # A repeated EXE launch only needs the mutex/runtime and our window.
         # Load the server stack after that fast path, not before activating it.
@@ -107,6 +108,8 @@ def main():
         listener.bind(("127.0.0.1", 8765))
         listener.listen(128)
         service = Service(home)
+        from .browser import configure_window, close_browser, retire_legacy_registered_windows
+        configure_window(home)
         from .notifications import register_windows
         try:
             if not args.no_tray:
@@ -124,6 +127,8 @@ def main():
         tray_icon = None
 
         def exit_requested():
+            if not close_browser():
+                raise ValueError("Не удалось закрыть окно Meeting Archive. Закройте его и повторите действие.")
             server.should_exit = True
             if tray_icon:
                 tray_icon.stop()
@@ -139,6 +144,7 @@ def main():
         if not server.started:
             raise RuntimeError("Локальный интерфейс не запустился")
         if not args.no_browser:
+            retire_legacy_registered_windows()
             open_browser(url)
         if args.no_tray:
             try:

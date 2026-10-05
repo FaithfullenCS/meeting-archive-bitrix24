@@ -181,7 +181,7 @@ class BitrixClient:
                 titles[chat_id] = str(data["name"]).strip()
         return titles, errors
 
-    async def personal_chat_titles(self, peers):
+    async def personal_chat_titles(self, peers, names=None):
         """Resolve a candidate personal dialog only if its internal chat ID matches."""
         if not peers:
             return {}
@@ -194,8 +194,13 @@ class BitrixClient:
         titles = {}
         for chat_id in peers:
             data = replies.get(f"personal_{int(chat_id)}", {}) if isinstance(replies, dict) else {}
-            if isinstance(data, dict) and str(data.get("id")) == str(chat_id) and data.get("name"):
-                titles[int(chat_id)] = "Личный диалог: " + str(data["name"]).strip()
+            if not isinstance(data, dict) or str(data.get("id")) != str(chat_id):
+                continue
+            name = str(data.get("name") or "").strip()
+            if not name and data.get("type") == "private":
+                name = (names or {}).get(peers[chat_id], "")
+            if name:
+                titles[int(chat_id)] = "Личный диалог: " + name
         return titles
 
     async def catalogue(self, start: str, end: str):

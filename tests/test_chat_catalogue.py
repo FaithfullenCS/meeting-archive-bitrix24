@@ -98,7 +98,7 @@ async def test_personal_dialog_fallback_is_cached_and_preserves_participants(ser
     service.client.chat_titles = AsyncMock(return_value=({}, {"chat_42": {"error": "DIALOG_ID_EMPTY"}}))
     service.client.personal_chat_titles = AsyncMock(return_value={42: "Личный диалог: Собеседник"})
     assert (await service.hydrate_chats([data]))[0]["chatTitle"] == "Личный диалог: Собеседник"
-    service.client.personal_chat_titles.assert_awaited_once_with({42: 99})
+    service.client.personal_chat_titles.assert_awaited_once_with({42: 99}, {service.settings.user_id: "Я", 99: "Собеседник"})
     await service.hydrate_chats([data])
     service.client.personal_chat_titles.assert_awaited_once()
     view = meeting_view(service.db.upsert(service.settings.portal, data))
@@ -110,3 +110,16 @@ def test_ambiguous_or_group_participants_do_not_identify_a_personal_dialog(servi
     items = [{"chatId": 42, "participants": [{"userId": current}, {"userId": peer}]} for peer in [99, 100]]
     assert service.personal_chat_peers(items) == {}
     assert service.personal_chat_peers([{"chatId": 42, "participants": [{"userId": 99}, {"userId": 100}]}]) == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind,returned_id,expected", [("private",42,{42:"Личный диалог: Собеседник"}), ("chat",42,{}), ("private",999,{})])
+async def test_empty_private_name_uses_followup_name_only_after_confirmation(settings, vault, kind, returned_id, expected):
+    import httpx
+    from meeting_archive.bitrix import BitrixClient
+    client = BitrixClient(settings,vault,transport=httpx.MockTransport(lambda _: httpx.Response(200,json={"result":{"result":{
+        "personal_42":{"id":returned_id,"type":kind,"name":""}}}})))
+    try:
+        assert await client.personal_chat_titles({42:99},{99:"Собеседник"}) == expected
+    finally:
+        await client.close()

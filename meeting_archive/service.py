@@ -106,7 +106,7 @@ class Service:
         key = f"chat_title:{self.settings.portal}:{int(chat_id)}"
         cached = json.loads(self.db.get_state(key) or "{}")
         title = cached.get("title", "")
-        if not self.chat_lookup_disabled and time.time() - cached.get("at", 0) > (86400 if title else 300):
+        if not self.chat_lookup_disabled and ((not title and cached.get("resolver") != 2) or time.time() - cached.get("at", 0) > (86400 if title else 300)):
             try:
                 title = await self.client.chat_title(int(chat_id))
                 self.db.set_state(key, json.dumps({"title": title, "at": time.time()}, ensure_ascii=False))
@@ -118,9 +118,9 @@ class Service:
                 self.chat_warning = "Названия некоторых бесед недоступны. Проверьте подключение и право im в приложении Bitrix24."
             if not title and not self.chat_lookup_disabled:
                 try:
-                    titles = await self.client.personal_chat_titles(self.personal_chat_peers([metadata]))
+                    titles = await self.client.personal_chat_titles(self.personal_chat_peers([metadata]), self.personal_chat_names([metadata]))
                     title = titles.get(int(chat_id), "")
-                    self.db.set_state(key, json.dumps({"title": title, "at": time.time()}, ensure_ascii=False))
+                    self.db.set_state(key, json.dumps({"title": title, "at": time.time(), "resolver": 2}, ensure_ascii=False))
                 except (BitrixError, httpx.HTTPError, ValueError, OSError):
                     pass
         if title:
@@ -139,13 +139,21 @@ class Service:
         return {chat_id: next(iter(peers)) for chat_id, peers in candidates.items()
                 if len(peers) == 1 and None not in peers}
 
+    def personal_chat_names(self, items):
+        names = {}
+        for item in items:
+            for person in meeting_participants(self.settings.portal, item):
+                if person["named"]:
+                    names.setdefault(int(person["user_id"]), person["label"])
+        return names
+
     async def hydrate_chats(self, items):
         missing = set()
         for metadata in items:
             chat_id = metadata.get("chatId")
             if chat_id:
                 cached = json.loads(self.db.get_state(f"chat_title:{self.settings.portal}:{int(chat_id)}") or "{}")
-                if time.time() - cached.get("at", 0) > (86400 if cached.get("title") else 300):
+                if (not cached.get("title") and cached.get("resolver") != 2) or time.time() - cached.get("at", 0) > (86400 if cached.get("title") else 300):
                     missing.add(int(chat_id))
         ids = sorted(missing)
         for offset in range(0, len(ids), 50):
@@ -160,13 +168,13 @@ class Service:
                     candidates = {chat_id: peers[chat_id] for chat_id in group if chat_id not in titles and chat_id in peers}
                     if candidates:
                         try:
-                            titles.update(await self.client.personal_chat_titles(candidates))
+                            titles.update(await self.client.personal_chat_titles(candidates, self.personal_chat_names(items)))
                         except (BitrixError, httpx.HTTPError, ValueError, OSError):
                             pass  # Do not replace an unavailable name with an unverified person.
                 for chat_id in group:
                     key = f"chat_title:{self.settings.portal}:{chat_id}"
                     old = json.loads(self.db.get_state(key) or "{}")
-                    self.db.set_state(key, json.dumps({"title": titles.get(chat_id, old.get("title", "")), "at": time.time()}, ensure_ascii=False))
+                    self.db.set_state(key, json.dumps({"title": titles.get(chat_id, old.get("title", "")), "at": time.time(), "resolver": 2}, ensure_ascii=False))
                 self.chat_warning = "Некоторые названия бесед недоступны текущему пользователю." if errors and any(chat_id not in titles for chat_id in group) else ""
                 if denied_scope:
                     self.chat_lookup_disabled = True

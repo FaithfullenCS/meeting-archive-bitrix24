@@ -174,7 +174,7 @@ def create_app(service: Service, launch_token: str | None = None, *, manage_life
         host = request.headers.get("host", "")
         if host not in {"127.0.0.1:8765", "localhost:8765", "testserver"}:
             return JSONResponse({"error": "Недопустимый адрес интерфейса"}, status_code=403)
-        if request.url.path == "/api/desktop/activate" and request.method == "POST":
+        if request.url.path in {"/api/desktop/activate", "/api/desktop/open"} and request.method == "POST":
             if request.headers.get("origin") or not secrets.compare_digest(request.headers.get("x-desktop-token", ""), launch_token):
                 return JSONResponse({"error": "Недопустимый переход"}, status_code=403)
             return await call_next(request)
@@ -243,6 +243,12 @@ def create_app(service: Service, launch_token: str | None = None, *, manage_life
     async def browser_ready():
         from .browser import register_window
         return {"registered": bool(register_window())}
+
+    @app.post("/api/desktop/open")
+    async def desktop_open():
+        from .browser import open_browser
+        await asyncio.to_thread(open_browser, "http://localhost:8765/?launch=" + app.state.launch_token)
+        return {"opened": True}
 
     @app.post("/api/desktop/activate")
     async def desktop_activate(data: dict):

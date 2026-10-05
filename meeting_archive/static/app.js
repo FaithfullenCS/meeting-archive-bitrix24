@@ -825,7 +825,7 @@
     try {
       const previousChatRevision = state.bootstrap?.chat_revision;
       const data = await api("/api/bootstrap"); renderBootstrap(data); if (data.activation) await consumeActivation(data.activation);
-      if (!state.windowAnnounced) { state.windowAnnounced = true; api("/api/browser/ready", {method: "POST"}).catch(() => {}); }
+      if (!state.windowAnnounced) { api("/api/browser/ready", {method: "POST"}).then(result => { state.windowAnnounced = Boolean(result.registered); }).catch(() => {}); }
       if (state.route === "archive" && participantsNeedRefresh()) await loadParticipants();
       if (state.route === "archive" && chatsNeedRefresh()) await loadChats();
       if (state.route === "module" && (!state.hardware || state.hardwareProfile !== hardwareProfile())) await loadHardware();

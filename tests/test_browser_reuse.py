@@ -128,3 +128,76 @@ async def test_surviving_window_reconnects_after_server_restart_but_profile_rese
     app = create_app(service, "reset-launch", manage_lifecycle=False)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://localhost:8765", cookies=cookies) as client:
         assert (await client.get("/api/bootstrap")).status_code == 401
+
+
+def test_isolated_profile_launch_debounces_slow_browser_start(tmp_path):
+    calls=[]
+    native=SimpleNamespace(valid=lambda _:False,find=lambda **_:None)
+    clock=[0]
+    window=browser.ArchiveWindow(native,"browser.exe",lambda argv,**_:calls.append(argv),clock=lambda:clock[0],profile=tmp_path/"browser-window")
+    window.open("http://localhost:8765/?launch=synthetic")
+    clock[0]=2
+    window.open("http://localhost:8765/?launch=synthetic")
+    assert len(calls)==1
+    assert "--user-data-dir="+str(tmp_path/"browser-window") in calls[0]
+
+
+def test_owned_profile_window_with_browser_suffix_is_reused_and_closed_without_shared_browser(tmp_path):
+    properties,closed={},[]
+    alive={1,2}
+    native=browser.WindowsWindow.__new__(browser.WindowsWindow)
+    native.profile=tmp_path/"own-browser"
+    native.owned_processes=lambda:{100}
+    native.callback_type=lambda fn:fn
+    def enumerate_windows(callback,_):
+        for hwnd in list(alive):
+            if not callback(hwnd,0):
+                break
+    def close(hwnd,*_):
+        closed.append(hwnd)
+        alive.remove(hwnd)
+        return True
+    native.api=SimpleNamespace(IsWindow=lambda hwnd:hwnd in alive,IsWindowVisible=lambda _:True,
+        GetPropW=lambda hwnd,_:properties.get(hwnd),SetPropW=lambda hwnd,_,value:properties.setdefault(hwnd,value),
+        GetWindowThreadProcessId=lambda hwnd,pid:setattr(pid._obj,"value",100 if hwnd==1 else 200),
+        GetWindowTextW=lambda hwnd,buffer,_:setattr(buffer,"value","Meeting Archive - Browser"),
+        GetClassNameW=lambda hwnd,buffer,_:setattr(buffer,"value","Chrome_WidgetWin_1"),
+        EnumWindows=enumerate_windows,PostMessageW=close)
+    assert native.find(register=True)==1
+    window=browser.ArchiveWindow(native,"browser.exe",profile=native.profile)
+    assert window.close()
+    assert closed==[1] and alive=={2}
+
+
+@pytest.mark.asyncio
+async def test_desktop_open_uses_capability_and_running_controller(service,monkeypatch):
+    calls=[]
+    monkeypatch.setattr(browser,"open_browser",lambda url:calls.append(url))
+    app=create_app(service,"desktop-test-token",manage_lifecycle=False)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url="http://localhost:8765") as client:
+        assert (await client.post("/api/desktop/open")).status_code==403
+        headers={"x-desktop-token":"desktop-test-token"}
+        assert (await client.post("/api/desktop/open",headers={**headers,"origin":"http://localhost:8765"})).status_code==403
+        assert (await client.post("/api/desktop/open",headers=headers,json={"url":"https://untrusted.test"})).status_code==200
+    assert calls==["http://localhost:8765/?launch=desktop-test-token"]
+
+
+def test_profile_process_identity_rejects_other_profile_and_executable(tmp_path, monkeypatch):
+    import psutil
+    executable = tmp_path / "browser.exe"
+    profile = tmp_path / "own-profile"
+    def process(pid, exe, folder):
+        return SimpleNamespace(info={"pid": pid, "exe": str(exe), "cmdline": [str(exe), "--user-data-dir=" + str(folder)]},
+                               children=lambda **_: [SimpleNamespace(pid=pid + 10)])
+    monkeypatch.setattr(psutil, "process_iter", lambda _: [
+        process(1, executable, profile), process(2, executable, tmp_path / "shared"),
+        process(3, tmp_path / "different.exe", profile)])
+    native = browser.WindowsWindow.__new__(browser.WindowsWindow)
+    native.profile, native.executable = profile, executable
+    assert native.owned_processes() == {1, 11}
+
+
+def test_refused_window_close_does_not_report_success(tmp_path):
+    native = SimpleNamespace(find=lambda **_: 1, close=lambda _: False)
+    window = browser.ArchiveWindow(native, "browser.exe", profile=tmp_path / "own-profile")
+    assert not window.close()
