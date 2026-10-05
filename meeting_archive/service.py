@@ -281,7 +281,7 @@ class Service:
                 for row, metadata in zip(known, enriched):
                     if metadata.get("chatTitle"):
                         self.db.update_meeting(row["id"], metadata=json.dumps(metadata, ensure_ascii=False))
-                async for page in self.client.catalogue(start, end):
+                async for page in self.catalogue_pages(start, end):
                     page = [item for item in page if any(int(p.get("userId", 0)) == self.settings.user_id for p in item.get("participants", []))]
                     cleaned = await self.hydrate_chats([clean_metadata(item) for item in page])
                     for item, metadata in zip(page, cleaned):
@@ -321,6 +321,14 @@ class Service:
                 self.scan_retry_at = time.time() + min(3600, 60 * 2**min(failures, 6))
             finally:
                 self.catalogue["running"] = False
+
+    async def catalogue_pages(self, start, end):
+        async for page in self.client.catalogue(start, end):
+            yield page
+        from .call_discovery import discover
+        # Backfill independently of the normal seven-day Follow-up overlap.
+        async for page in discover(self, "2000-01-01T00:00:00Z", end):
+            yield page
 
     async def scheduler(self):
         while self.alive:

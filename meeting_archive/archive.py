@@ -15,7 +15,20 @@ from urllib.parse import urljoin
 from .bitrix import BitrixClient, BitrixError
 from .settings import atomic_json
 
-META_KEYS = {"callId", "uuid", "callType", "chatId", "initiatorId", "startDate", "endDate", "durationSeconds", "outcomes", "createdAt", "version"}
+META_KEYS = {"callId", "uuid", "callType", "chatId", "initiatorId", "startDate", "endDate", "durationSeconds", "outcomes", "createdAt", "version", "recordingDurationSeconds"}
+
+
+def recording_duration(item: dict):
+    tracks = [track for track in item.get("tracks") or [] if isinstance(track, dict) and track.get("type") == "record"]
+    if not tracks:
+        return item.get("recordingDurationSeconds")
+    if len(tracks) != 1:
+        return None  # Multiple tracks may be sequential parts of a longer recording.
+    durations = [track.get("duration") for track in tracks]
+    if all(isinstance(value, (int, float)) and not isinstance(value, bool)
+           and math.isfinite(value) and value > 0 for value in durations):
+        return max(durations)
+    return None
 
 
 def followup_state(item: dict, *, saved=False) -> str | None:
@@ -31,6 +44,10 @@ def followup_state(item: dict, *, saved=False) -> str | None:
     if "transcription" in (item.get("outcomes") or []) or item.get("availability", {}).get("bitrix") == "available":
         return "available"
     duration = item.get("durationSeconds")
+    recorded = recording_duration(item)
+    if (item.get("endDate") and not item.get("outcomes") and isinstance(recorded, (int, float))
+            and not isinstance(recorded, bool) and math.isfinite(recorded) and 0 < recorded < 60):
+        return "short_call"
     if (item.get("endDate") and isinstance(duration, (int, float)) and not isinstance(duration, bool)
             and math.isfinite(duration) and 0 < duration < 60):
         return "short_call"
@@ -39,6 +56,9 @@ def followup_state(item: dict, *, saved=False) -> str | None:
 
 def clean_metadata(item: dict) -> dict:
     result = {k: v for k, v in item.items() if k in META_KEYS}
+    recorded = recording_duration(item)
+    if recorded is not None:
+        result["recordingDurationSeconds"] = recorded
     result["chatId"] = item.get("chatId")
     result["participants"] = [{k: p[k] for k in ("userId", "name", "talkedSeconds", "workPosition") if k in p}
                               for p in item.get("participants", []) if isinstance(p, dict)]

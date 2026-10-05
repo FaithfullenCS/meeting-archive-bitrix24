@@ -225,8 +225,31 @@ class BitrixClient:
             seen.add(signature)
             await asyncio.sleep(0.2)
 
+    async def recent_dialogs(self, offset=0) -> dict:
+        result = await self.call("im.recent.list", {"OFFSET": offset, "LIMIT": 50,
+            "SKIP_OPENLINES": "Y", "PARSE_TEXT": "N", "GET_ORIGINAL_TEXT": "N"}, v3=False)
+        if not isinstance(result, dict) or not isinstance(result.get("items"), list):
+            raise BitrixError("Неизвестный формат списка чатов")
+        return result
+
+    async def dialog_messages(self, dialog_id: str, chat_id: int, before=0) -> list[dict]:
+        params = {"DIALOG_ID": dialog_id, "LIMIT": 50}
+        if before:
+            params["LAST_ID"] = before
+        result = await self.call("im.dialog.messages.get", params, v3=False)
+        if (not isinstance(result, dict) or str(result.get("chat_id")) != str(chat_id)
+                or not isinstance(result.get("messages"), list)):
+            raise BitrixError("Bitrix24 вернул историю другого чата или неизвестный формат сообщений")
+        return result["messages"]
+
+    async def followup_metadata(self, call_id: str) -> dict:
+        return await self._followup(call_id, METADATA_FIELDS)
+
     async def followup(self, call_id: str) -> dict:
-        result = await self.call("call.followup.get", {"callId": int(call_id), "select": METADATA_FIELDS + ["transcription"], "mentionFormat": "none"})
+        return await self._followup(call_id, METADATA_FIELDS + ["transcription"])
+
+    async def _followup(self, call_id: str, fields: list[str]) -> dict:
+        result = await self.call("call.followup.get", {"callId": int(call_id), "select": fields, "mentionFormat": "none"})
         if not isinstance(result, dict) or not isinstance(result.get("item"), dict):
             raise BitrixError("Неизвестный формат ответа Follow-up")
         return result["item"]

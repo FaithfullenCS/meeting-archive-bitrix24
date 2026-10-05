@@ -84,6 +84,8 @@ async def test_catalogue_scan_exposes_participants_before_any_material_download(
 
     def metadata_only(request):
         requests.append(request)
+        if request.url.path.endswith("/im.recent.list"):
+            return httpx.Response(200, json={"result": {"items": [], "hasMore": False}})
         assert request.url.path.endswith("/call.followup.list")
         assert "participants" in json.loads(request.content)["select"]
         return httpx.Response(200, json={"result": {"items": [{
@@ -103,4 +105,5 @@ async def test_catalogue_scan_exposes_participants_before_any_material_download(
     assert meeting["folder"] == ""
     assert not service.db.rows("SELECT * FROM jobs")
     assert not Path(service.settings.archive_root).exists()
-    assert len(requests) == 1
+    assert len(requests) == 2
+    assert all(not request.url.path.endswith("/call.followup.get") for request in requests)
