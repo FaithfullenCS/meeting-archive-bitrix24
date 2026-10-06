@@ -64,6 +64,22 @@ def portal_domain(value: str) -> str:
 @dataclass
 class Settings:
     archive_root: str = ""
+    chat_archive_root: str = ""
+    chat_auto_save: bool = False
+    chat_scope: str = "all"
+    chat_selected_ids: list[int] = field(default_factory=list)
+    chat_excluded_ids: list[int] = field(default_factory=list)
+    chat_history_since: str = ""
+    chat_poll_seconds: int = 60
+    chat_events: bool = False
+    chat_download_images: bool = False
+    chat_download_documents: bool = False
+    chat_download_audio: bool = False
+    chat_download_video: bool = False
+    chat_download_other: bool = False
+    chat_download_history: bool = False
+    chat_attachment_schedule: dict = field(default_factory=default_schedule)
+    chat_max_file_mb: int = 0
     portal: str = ""
     auth_mode: str = "oauth"
     user_id: int = 0
@@ -110,6 +126,8 @@ class Settings:
         if not result.archive_root:
             result.archive_root = default_archive(home)
             Path(result.archive_root).mkdir(parents=True, exist_ok=True)
+        if not result.chat_archive_root:
+            result.chat_archive_root = str(Path(result.archive_root).parent / "Чаты")
         if not result.watch_folder:
             result.watch_folder = str(default_files(home) / "Входящие записи")
             Path(result.watch_folder).mkdir(parents=True, exist_ok=True)

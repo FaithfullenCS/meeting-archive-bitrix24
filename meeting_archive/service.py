@@ -61,6 +61,8 @@ class Service:
         from .notifications import Notifications
         self.updates = UpdateManager(self)
         self.notifications = Notifications(self)
+        from .chat_sync import ChatArchive
+        self.chat_archive = ChatArchive(self)
 
     @property
     def archive(self):
@@ -76,7 +78,8 @@ class Service:
         self.tasks = [asyncio.create_task(self.job_loop(("fetch", "import"))),
                       asyncio.create_task(self.job_loop(("transcribe", "install"))),
                       asyncio.create_task(self.scheduler()), asyncio.create_task(self.discover_resources()),
-                      asyncio.create_task(self.refresh_identity()), asyncio.create_task(self.updates.loop())]
+                      asyncio.create_task(self.refresh_identity()), asyncio.create_task(self.updates.loop()),
+                      asyncio.create_task(self.chat_archive.loop()), asyncio.create_task(self.chat_archive.file_loop())]
 
     def identity_key(self):
         return f"account_name:{self.settings.portal}:{self.settings.user_id}"

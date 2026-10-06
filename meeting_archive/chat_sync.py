@@ -1,0 +1,620 @@
+"""Bounded, fair personal chat synchronization and a separate single-file queue."""
+from __future__ import annotations
+
+import asyncio
+import copy
+import hashlib
+import json
+import os
+import re
+import shutil
+import tempfile
+import time
+from datetime import datetime, timedelta, timezone, time as day_time
+from dataclasses import replace
+from pathlib import Path
+from urllib.parse import parse_qs, urljoin, urlsplit
+
+import httpx
+
+from .bitrix import BitrixError
+from .chat_model import canonical, positive, safe_metadata, safe_name, sequence, stamp
+from .chat_storage import ChatStore
+from .scheduling import window_status
+
+ACCESS_CODES = {"ACCESS_ERROR", "ACCESS_DENIED", "CHAT_NOT_FOUND", "DIALOG_ID_INVALID"}
+UNSUPPORTED_CODES = {"METHOD_NOT_FOUND", "ERROR_METHOD_NOT_FOUND", "NOT_IMPLEMENTED", "UNKNOWN_METHOD"}
+
+
+def iso_day(value, end=False):
+    if not value:
+        return ""
+    try:
+        day = datetime.strptime(value, "%Y-%m-%d").date()
+    except (ValueError, TypeError) as exc:
+        raise ValueError("Укажите дату в формате ГГГГ-ММ-ДД") from exc
+    return datetime.combine(day, day_time.max if end else day_time.min).astimezone().isoformat()
+
+
+def instant(value):
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def validate_chat_settings(values, settings, home):
+    if values.get("chat_scope", settings.chat_scope) not in {"all", "selected"}:
+        raise ValueError("Выберите все доступные чаты или выбранные чаты")
+    for key in ("chat_selected_ids", "chat_excluded_ids"):
+        if key in values and (len(values[key]) > 10000 or any(type(i) is not int or i <= 0 for i in values[key])):
+            raise ValueError("Список чатов должен содержать положительные ID")
+    if values.get("chat_poll_seconds", settings.chat_poll_seconds) not in {60, 300, 900}:
+        raise ValueError("Интервал проверки: 1, 5 или 15 минут")
+    iso_day(values.get("chat_history_since", settings.chat_history_since))
+    if "chat_archive_root" in values:
+        path = Path(values["chat_archive_root"]).expanduser()
+        root, private = path.resolve(), home.resolve()
+        meetings = Path(values.get("archive_root", settings.archive_root)).resolve()
+        if not path.is_absolute() or root.is_relative_to(private) or private.is_relative_to(root) or root.is_relative_to(meetings) or meetings.is_relative_to(root):
+            raise ValueError("Папка чатов должна находиться отдельно от служебной папки и архива совещаний")
+        values["chat_archive_root"] = str(root)
+
+
+class ChatArchive:
+    def __init__(self, service):
+        self.service = service
+        self.lock = asyncio.Lock()
+        self.file_lock = asyncio.Lock()
+        self.error = ""
+        self.active = ""
+        self.recovered = set()
+        ChatStore.initialize(service.db)
+
+    def store(self):
+        s = self.service.settings
+        return ChatStore(self.service.db, s.chat_archive_root, s.portal, s.user_id)
+
+    def selected(self, id):
+        s = self.service.settings
+        return id not in s.chat_excluded_ids and (s.chat_scope == "all" or id in s.chat_selected_ids)
+
+    def request_discovery(self, automatic=False):
+        if not self.service.connected():
+            raise ValueError("Сначала подключите Bitrix24 с правом im")
+        store = self.store()
+        store.set_state("discover_requested", {"automatic": automatic})
+        store.set_state("discovery_offset", 0)
+
+    def request_history(self, ids=None, date_from="", date_to=""):
+        start, end = iso_day(date_from), iso_day(date_to, True)
+        if start and end and start > end:
+            raise ValueError("Начало периода должно быть не позже окончания")
+        store = self.store()
+        ids = ids or [c["id"] for c in store.chats() if self.selected(c["id"])]
+        for id in ids:
+            store.chat(positive(id))
+        for id in ids:
+            kind = "period:" + date_from + ":" + date_to if start or end else "history"
+            since = start or iso_day(self.service.settings.chat_history_since)
+            store.enqueue(positive(id), kind, {"cursor": 0, "date_from": since, "date_to": end, "automatic": False}, 8 if kind.startswith("period") else 10)
+        return len(ids)
+
+    def schedule_chat(self, store, chat, automatic):
+        if not self.selected(chat["id"]):
+            return
+        newest = self.service.db.rows("SELECT max(id) AS id FROM ca_messages WHERE account=? AND chat=?", (store.account, chat["id"]))[0]["id"] or 0
+        store.enqueue(chat["id"], "new", {"cursor": 0, "stop_id": newest, "automatic": automatic}, 0)
+        if time.time() - chat.get("participants_at", 0) > 86400:
+            store.enqueue(chat["id"], "metadata", {"automatic": automatic}, 1)
+        if not chat.get("history_complete"):
+            store.enqueue(chat["id"], "history", {"cursor": 0, "date_from": iso_day(chat.get("history_since") or self.service.settings.chat_history_since), "automatic": automatic}, 10)
+
+    async def add_dialog(self, store, dialog, hint=None):
+        result = await self.service.client.call("im.dialog.get", {"DIALOG_ID": str(dialog)}, v3=False)
+        id = positive(result.get("id")) if isinstance(result, dict) else 0
+        if not id:
+            raise ValueError("Источник не подтвердил ID доступного чата")
+        hint = hint or {}
+        title = str(result.get("name") or hint.get("title") or hint.get("name") or f"Чат {id}")
+        members = sequence(result.get("users"))
+        participants = [{"id": positive(u.get("id")), "name": str(u.get("name") or "")} if isinstance(u, dict)
+                        else {"id": positive(u), "name": ""} for u in members]
+        store.upsert_chat(id, dialog, title=title, type="user" if hint.get("type") == "user" or str(dialog).isdigit() else str(result.get("type") or "chat"),
+                          participants=participants, parent_chat_id=positive(result.get("parent_chat_id")),
+                          parent_message_id=positive(result.get("parent_message_id")))
+        return store.chat(id)
+
+    async def add(self, value):
+        value = str(value).strip()
+        if "://" in value:
+            parsed = urlsplit(value)
+            if parsed.hostname != self.service.settings.portal:
+                raise ValueError("Ссылка должна относиться к подключённому порталу")
+            query = parse_qs(parsed.query)
+            value = (query.get("IM_DIALOG") or query.get("dialog") or [""])[0]
+        if not re.fullmatch(r"(?:chat|sg)?[1-9]\d*", value):
+            raise ValueError("Укажите chat123, ID собеседника или ссылку Bitrix24 с IM_DIALOG")
+        async with self.service.auth_lock, self.lock:
+            store = self.store()
+            chat = await self.add_dialog(store, value)
+            self.schedule_chat(store, chat, False)
+            store.flush(chat["id"])
+            return chat
+
+    async def discover(self, store, automatic):
+        offset = store.state("discovery_offset", 0)
+        page = await self.service.client.call("im.recent.list", {"OFFSET": offset, "LIMIT": 200,
+                            "SKIP_OPENLINES": "N", "PARSE_TEXT": "N", "GET_ORIGINAL_TEXT": "Y"}, v3=False)
+        if not isinstance(page, dict) or not isinstance(page.get("items"), list):
+            raise ValueError("Неизвестный формат списка чатов; обнаружение не завершено")
+        for item in page["items"]:
+            id = positive(item.get("chat_id") or item.get("chatId") or (item.get("chat") or {}).get("id"))
+            dialog = str(item.get("id")) if item.get("type") == "user" else f"chat{id}" if id else str(item.get("id") or "")
+            if id:
+                hint = item.get("user") if item.get("type") == "user" else item.get("chat")
+                hint = hint if isinstance(hint, dict) else {}
+                store.upsert_chat(id, dialog, title=str(item.get("title") or hint.get("name") or f"Чат {id}"), type=str(item.get("type") or "chat"))
+            elif re.fullmatch(r"(?:chat|sg)?[1-9]\d*", dialog):
+                chat = await self.add_dialog(store, dialog, item)
+                id = chat["id"]
+            if id:
+                self.schedule_chat(store, store.chat(id), automatic)
+        # Only meetings whose participant list contains this account may seed chat IDs.
+        known = [json.loads(r["metadata"]) for r in self.service.db.rows("SELECT metadata FROM meetings WHERE portal=? AND source='bitrix'", (store.portal,))]
+        peers = self.service.personal_chat_peers(known)
+        existing = {chat["id"] for chat in store.chats()}
+        for metadata in known:
+            id = positive(metadata.get("chatId"))
+            participant_ids = {positive(p.get("userId") or p.get("user_id") or p.get("id")) if isinstance(p, dict) else positive(p) for p in metadata.get("participants", [])}
+            if id and id not in existing and store.user_id in participant_ids:
+                dialog = str(peers.get(id) or f"chat{id}")
+                store.upsert_chat(id, dialog, title=str(metadata.get("chatTitle") or f"Чат {id}"))
+                existing.add(id)
+        for chat in store.chats():
+            self.schedule_chat(store, chat, automatic)
+        if page.get("hasMore") or page.get("hasMorePages"):
+            if not page["items"]:
+                raise ValueError("Пустая страница при незавершённом списке чатов")
+            store.set_state("discovery_offset", offset + len(page["items"]))
+        else:
+            store.set_state("discover_requested", None)
+            store.set_state("discovery_offset", 0)
+            store.set_state("last_discovery", time.time())
+
+    async def fetch_page(self, chat, work):
+        client = self.service.client
+        params = {"CHAT_ID": chat["id"], "ORDER": {"ID": "DESC"}, "LIMIT": 200}
+        if work.get("cursor"):
+            params["LAST_ID"] = work["cursor"]
+        for field, key in (("DATE_FROM", "date_from"), ("DATE_TO", "date_to")):
+            if work.get(key):
+                params[field] = work[key]
+        fallback = chat.get("method") == "get"
+        if not fallback:
+            try:
+                page = await client.call("im.dialog.messages.search", params, v3=False)
+            except BitrixError as exc:
+                if exc.code not in UNSUPPORTED_CODES:
+                    raise
+                fallback = True
+        if fallback:
+            args = {"DIALOG_ID": chat["dialog"], "LIMIT": 50}
+            if work.get("cursor"):
+                args["LAST_ID"] = work["cursor"]
+            page = await client.call("im.dialog.messages.get", args, v3=False)
+            if positive(page.get("chat_id") or page.get("chatId")) != chat["id"]:
+                raise ValueError("Источник вернул историю другого чата")
+        if not isinstance(page, dict) or not isinstance(page.get("messages"), list):
+            raise ValueError("Неизвестный формат истории; страница не считается пустой")
+        return page, "get" if fallback else "search"
+
+    async def process_work(self, store, row):
+        chat = store.chat(row["chat"])
+        work = json.loads(row["data"])
+        if row["kind"] == "metadata":
+            try:
+                details = await self.service.client.call("im.dialog.get", {"DIALOG_ID": chat["dialog"]}, v3=False)
+                if not isinstance(details, dict) or positive(details.get("id")) != chat["id"]:
+                    raise ValueError("Источник не подтвердил идентичность чата")
+                members = await self.service.client.call("im.chat.user.list", {"CHAT_ID": chat["id"]}, v3=False)
+                if not isinstance(members, list) or any(not positive(id) for id in members):
+                    raise ValueError("Источник не предоставил состав участников")
+                names = {}
+                for offset in range(0, len(members), 100):
+                    users = await self.service.client.call("im.user.list.get", {"ID": members[offset:offset+100], "RESULT_TYPE": "array"}, v3=False)
+                    names.update({positive(u.get("id")): str(u.get("name") or "") for u in sequence(users) if isinstance(u, dict)})
+                store.update_chat(chat["id"], title=str(details.get("name") or chat["title"]), participants=[{"id":positive(id),"name":names.get(positive(id),"")} for id in members],
+                                  participants_at=time.time(), participants_warning="", parent_chat_id=positive(details.get("parent_chat_id")), parent_message_id=positive(details.get("parent_message_id")))
+            except (BitrixError, httpx.HTTPError, ValueError, OSError) as exc:
+                store.update_chat(chat["id"], participants_at=time.time(), participants_warning=self.service.vault.redact(str(exc)))
+            self.service.db.execute("DELETE FROM ca_work WHERE account=? AND chat=? AND kind=?", (store.account, chat["id"], row["kind"]))
+            await asyncio.to_thread(store.flush, chat["id"])
+            return
+        page, method = await self.fetch_page(chat, work)
+        raw_messages = page["messages"]
+        # get treats a missing/deleted anchor as an empty result. Restart a bounded
+        # traversal from the newest page; only a verified lower boundary may finish it.
+        if not raw_messages and work.get("cursor") and method == "get":
+            if not work.get("anchor_restart"):
+                work.update(restart_below=work["cursor"], cursor=0, anchor_restart=True)
+                self.service.db.execute("UPDATE ca_work SET data=?,touched=? WHERE account=? AND chat=? AND kind=?",
+                                        (canonical(work), time.time(), store.account, chat["id"], row["kind"]))
+                store.update_chat(chat["id"], coverage="verifying_boundary", limitations=["Проверяется граница истории: курсор мог быть удалён"])
+                store.flush(chat["id"])
+                return
+        # Fallback has no date filter. Traverse source pages, but only persist the
+        # requested period; outside-period related originals remain context.
+        selected_page = dict(page)
+        if method == "get" and (work.get("date_from") or work.get("date_to")):
+            def in_period(raw):
+                date = raw.get("date") or ""
+                moment = instant(date)
+                return moment is not None and (not work.get("date_from") or moment >= instant(work["date_from"])) and (not work.get("date_to") or moment <= instant(work["date_to"]))
+            selected_page["messages"] = [m for m in raw_messages if in_period(m)]
+        messages = await asyncio.to_thread(store.save_page, chat["id"], selected_page)
+        ids = [positive(m.get("id")) for m in raw_messages]
+        if any(not id for id in ids):
+            raise ValueError("Источник вернул сообщение без ID; курсор не продвинут")
+        cursor = min(ids) if ids else work.get("cursor", 0)
+        if ids and work.get("cursor") and cursor >= work["cursor"]:
+            raise ValueError("Источник повторил курсор истории; граница не подтверждена")
+        limit = 50 if method == "get" else 200
+        stop = bool(work.get("stop_id") and any(id <= work["stop_id"] for id in ids))
+        below_date = bool(work.get("date_from") and any(instant(m.get("date")) is not None and instant(m["date"]) < instant(work["date_from"]) for m in raw_messages))
+        finished = not ids or len(ids) < limit or stop or (method == "get" and below_date) or (row["kind"] == "new" and not work.get("stop_id"))
+        if method == "get" and work.get("anchor_restart") and not ids and work.get("cursor"):
+            # Repeated empty cursor does not prove completeness.
+            raise ValueError("Граница истории не подтверждена после повторного прохода; повторите сверку")
+        if method == "get" and work.get("restart_below") and ids and cursor >= work["restart_below"]:
+            finished = False
+        tariff = bool((page.get("tariffRestrictions") or {}).get("isHistoryLimitExceeded"))
+        limitations = list(dict.fromkeys(chat.get("limitations", []) + (["История ограничена тарифом Bitrix24"] if tariff else []) +
+                     (["Метод поиска недоступен; связи и граница тарифа могут отсутствовать"] if method == "get" else [])))
+        update = {"last_checked": stamp(), "method": method, "limitations": limitations, "error": ""}
+        from .call_discovery import structured_calls
+        call_ids = structured_calls(raw_messages)
+        meeting_ids = set(chat.get("meeting_ids", []))
+        for call_id in call_ids:
+            for meeting in self.service.db.rows("SELECT id,metadata FROM meetings WHERE portal=? AND call_id=? AND source='bitrix'", (store.portal, str(call_id))):
+                metadata = json.loads(meeting["metadata"])
+                people = {positive(p.get("userId") or p.get("user_id") or p.get("id")) if isinstance(p, dict) else positive(p) for p in metadata.get("participants", [])}
+                if positive(metadata.get("chatId")) == chat["id"] and store.user_id in people:
+                    meeting_ids.add(meeting["id"])
+        update["meeting_ids"] = sorted(meeting_ids)
+        if row["kind"] == "history":
+            update.update(history_since=work.get("date_from", "")[:10], history_complete=finished,
+                          coverage="tariff_limited" if tariff else "source_boundary" if finished and method == "search" else "boundary_unverified" if finished else "backfilling")
+        elif chat["coverage"] in {"access_lost", "error"}:
+            update["coverage"] = "backfilling" if not chat.get("history_complete") else "source_boundary" if method == "search" else "boundary_unverified"
+        if tariff:
+            update["coverage"] = "tariff_limited"
+        store.update_chat(chat["id"], **update)
+        # Schedule only files discovered in this page unless history opt-in is on.
+        historical = row["kind"] != "new"
+        since = instant(store.state("auto_since", stamp()))
+        for message in messages:
+            moment = instant(message["date"])
+            if (not historical and moment is not None and moment >= since) or self.service.settings.chat_download_history:
+                for file_id in message["file_ids"]:
+                    self.queue_file(store, chat["id"], file_id, automatic=True, missing_ok=True)
+        if finished:
+            self.service.db.execute("DELETE FROM ca_work WHERE account=? AND chat=? AND kind=?", (store.account, chat["id"], row["kind"]))
+        else:
+            work["cursor"] = cursor
+            self.service.db.execute("UPDATE ca_work SET data=?,touched=?,next_at=0 WHERE account=? AND chat=? AND kind=?",
+                                    (canonical(work), time.time(), store.account, chat["id"], row["kind"]))
+        await asyncio.to_thread(store.flush, chat["id"])
+
+    def queue_file(self, store, chat, id, *, automatic=False, missing_ok=False):
+        try:
+            file = store.file(chat, id)
+        except ValueError:
+            if missing_ok:
+                return
+            raise
+        s = self.service.settings
+        if automatic and (not self.selected(chat) or not getattr(s, "chat_download_" + file["category"]) or
+                          s.chat_max_file_mb and file["size"] > s.chat_max_file_mb * 1024**2):
+            return
+        if file["state"] == "running" or automatic and file["state"] == "saved":
+            return
+        # Manual request promotes a queued automatic job and bypasses all gates.
+        store.file_update(chat, id, state="queued", automatic=int(automatic and (file["state"] != "queued" or file["automatic"])), error="", next_at=0)
+
+    async def settings_changed(self, old):
+        store = self.store()
+        s = self.service.settings
+        if self.service.connected():
+            if s.chat_auto_save and not old.chat_auto_save:
+                store.set_state("auto_since", stamp())
+            if s.chat_auto_save and (not old.chat_auto_save or old.chat_archive_root != s.chat_archive_root or
+                                    old.chat_scope != s.chat_scope or old.chat_selected_ids != s.chat_selected_ids or
+                                    old.chat_excluded_ids != s.chat_excluded_ids or old.chat_history_since != s.chat_history_since):
+                self.request_discovery(True)
+                if s.chat_history_since != old.chat_history_since:
+                    for chat in store.chats():
+                        store.update_chat(chat["id"], history_complete=False, history_since=s.chat_history_since)
+                        self.service.db.execute("DELETE FROM ca_work WHERE account=? AND chat=? AND kind='history'", (store.account, chat["id"]))
+            for chat in store.chats():
+                for file in store.files(chat["id"]):
+                    enabled = self.selected(chat["id"]) and getattr(s, "chat_download_" + file["category"])
+                    if file["state"] == "queued" and file["automatic"] and (not enabled or not s.chat_auto_save):
+                        store.file_update(chat["id"], file["id"], state="not_saved", automatic=0)
+                    elif s.chat_download_history and enabled and s.chat_auto_save:
+                        self.queue_file(store, chat["id"], file["id"], automatic=True)
+        # Event consent belongs to a portal/user, independently of the storage root.
+        if not s.chat_events and old.chat_events and self.service.connected():
+            self.service.db.set_state(f"chat_events:{s.portal}:{s.user_id}:unsubscribe", "1")
+        if s.chat_events and not old.chat_events:
+            key = f"chat_events:{s.portal}:{s.user_id}:consent" if self.service.connected() else "chat_events:pending_consent"
+            self.service.db.set_state(key, "1")
+        if not s.chat_events:
+            self.service.db.set_state("chat_events:pending_consent", "")
+
+    async def events(self, store):
+        db, client = self.service.db, self.service.client
+        prefix = f"chat_events:{store.portal}:{store.user_id}:"
+        if not db.get_state(prefix + "subscribed"):
+            await client.call("im.v2.Event.subscribe", {}, v3=False)
+            db.set_state(prefix + "subscribed", "1")
+        offset = int(db.get_state(prefix + "offset", "0"))
+        last = float(db.get_state(prefix + "last", "0"))
+        if last and time.time() - last > 86400:
+            for chat in store.chats():
+                store.update_chat(chat["id"], event_gap=True)
+                self.schedule_chat(store, chat, True)
+        page = await client.call("im.v2.Event.get", {"offset": offset, "limit": 100}, v3=False)
+        if not isinstance(page, dict) or not isinstance(page.get("events"), list) or type(page.get("nextOffset")) is not int:
+            raise ValueError("Неизвестный формат событий; подтверждение не отправлено")
+        for event in page["events"]:
+            if not isinstance(event, dict) or not isinstance(event.get("data") or {}, dict):
+                raise ValueError("Неизвестный формат события; подтверждение не отправлено")
+            id = positive(event.get("eventId"))
+            if not id:
+                raise ValueError("Событие без ID; подтверждение не отправлено")
+            data = event.get("data") or {}
+            chat_raw = data.get("chat") or {}
+            raw = data.get("message") or {}
+            if not isinstance(chat_raw, dict) or not isinstance(raw, dict):
+                raise ValueError("Неизвестный формат сообщения события; подтверждение не отправлено")
+            chat_id = positive(chat_raw.get("id") or raw.get("chatId") or data.get("chatId"))
+            # Excluded/unknown chats retain only an acknowledgment marker, never their content.
+            journal = safe_metadata(event) if chat_id and self.selected(chat_id) else {"eventId": id, "type": str(event.get("type") or ""), "chatId": chat_id, "skipped": True}
+            db.execute("INSERT OR IGNORE INTO ca_events VALUES(?,?,?)", (store.account, id, canonical(journal)))
+            if chat_id and self.selected(chat_id):
+                if not db.rows("SELECT id FROM ca_chats WHERE account=? AND id=?", (store.account, chat_id)):
+                    store.upsert_chat(chat_id, f"chat{chat_id}", title=str(chat_raw.get("name") or f"Чат {chat_id}"))
+                message_id = positive(raw.get("id") or data.get("messageId"))
+                previous = store.message(chat_id, message_id)
+                deleted = event.get("type") == "ONIMV2MESSAGEDELETE"
+                if message_id and (deleted or "text" in raw or event.get("type") in {"ONIMV2REACTIONCHANGE", "ONIMV2MESSAGEREACTIONCHANGE"}):
+                    # Reduced event payloads must not erase fields omitted by the source.
+                    merged = {"id": message_id, "chatId": chat_id}
+                    if previous:
+                        merged.update(authorId=previous["author_id"], date=previous["date"], text=previous["text"],
+                                      params=previous["source"].get("params", {}), reactions=previous["reactions"],
+                                      fileIds=previous["file_ids"], isSystem=previous["system"], deleted=previous["deleted"],
+                                      forward=[{"id": r["message_id"], "chatId": r["chat_id"], "userId": r["author_id"],
+                                                "date": r["date"], "text": r["excerpt"]} for r in previous["relations"] if r["kind"] == "forward"])
+                        for field, value in previous["source"].items():
+                            merged.setdefault(field, value)
+                        for link in previous["relations"]:
+                            if link["kind"] in {"reply", "quote"}:
+                                merged[link["kind"]] = {"id": link["message_id"], "chatId": link["chat_id"], "userId": link["author_id"], "text": link["excerpt"], "date": link["date"]}
+                    merged.update(raw)
+                    if event.get("type") in {"ONIMV2REACTIONCHANGE", "ONIMV2MESSAGEREACTIONCHANGE"}:
+                        reaction = data.get("reaction")
+                        if isinstance(reaction, str):
+                            reactions = copy.deepcopy(previous["reactions"]) if previous and isinstance(previous["reactions"], dict) else {}
+                            users_by_reaction = reactions.setdefault("reactionUsers", {})
+                            counters = reactions.setdefault("reactionCounters", {})
+                            person = positive((data.get("user") or {}).get("id"))
+                            people = users_by_reaction.setdefault(reaction, [])
+                            if data.get("action") == "add" and person and person not in people:
+                                people.append(person)
+                                counters[reaction] = max(positive(counters.get(reaction)), len(people) - 1) + 1
+                            elif data.get("action") == "delete" and person in people:
+                                people.remove(person)
+                                counters[reaction] = max(0, positive(counters.get(reaction)) - 1)
+                            merged["reactions"] = reactions
+                        else:
+                            merged["reactions"] = data.get("reactions") or raw.get("reactions") or merged.get("reactions", [])
+                    if deleted:
+                        merged["deleted"] = True
+                    user = data.get("user") or {}
+                    users = [user] if isinstance(user, dict) else []
+                    if previous and previous["author"]:
+                        users.append({"id": previous["author_id"], "name": previous["author"]})
+                    store.save_page(chat_id, {"messages": [merged], "users": users, "files": data.get("files", [])})
+                self.schedule_chat(store, store.chat(chat_id), True)
+                store.flush(chat_id)
+        # Journal is portable and durable before advancing the ACK offset.
+        from .chat_storage import atomic_text
+        entries = db.rows("SELECT data FROM ca_events WHERE account=? ORDER BY id", (store.account,))
+        atomic_text(store.folder / "events.jsonl", "".join(r["data"] + "\n" for r in entries))
+        db.set_state(prefix + "offset", str(page["nextOffset"]))
+        db.set_state(prefix + "last", str(time.time()))
+
+    async def step(self):
+        if not self.service.connected():
+            return
+        async with self.service.auth_lock, self.lock:
+            store = self.store()
+            s = self.service.settings
+            if store.account not in self.recovered:
+                await asyncio.to_thread(store.recover)
+                self.recovered.add(store.account)
+            automatic = s.chat_auto_save and not s.paused
+            prefix = f"chat_events:{store.portal}:{store.user_id}:"
+            if automatic and not store.state("auto_since"):
+                store.set_state("auto_since", stamp())
+            if s.chat_events and self.service.db.get_state("chat_events:pending_consent"):
+                self.service.db.set_state(prefix + "consent", "1")
+                self.service.db.set_state("chat_events:pending_consent", "")
+            if self.service.db.get_state(prefix + "unsubscribe"):
+                await self.service.client.call("im.v2.Event.unsubscribe", {}, v3=False)
+                self.service.db.set_state(prefix + "subscribed", "")
+                self.service.db.set_state(prefix + "consent", "")
+                self.service.db.set_state(prefix + "unsubscribe", "")
+            requested = store.state("discover_requested")
+            if automatic and not requested and time.time() - store.state("last_discovery", 0) >= s.chat_poll_seconds:
+                self.request_discovery(True)
+                requested = store.state("discover_requested")
+            if requested and time.time() >= store.state("discovery_retry_at", 0) and (not requested.get("automatic") or automatic):
+                try:
+                    await self.discover(store, requested.get("automatic", False))
+                    store.set_state("discovery_retry_at", 0)
+                except (BitrixError, httpx.HTTPError, ValueError, OSError) as exc:
+                    # An inventory failure must not block already known chats.
+                    self.error = self.service.vault.redact(str(exc))
+                    store.set_state("discovery_retry_at", time.time() + 300)
+            if automatic:
+                for kind, seconds, days, priority in (("recent_check", 86400, 7, 3), ("audit", 604800, 0, 15)):
+                    if time.time() - store.state(kind + "_at", 0) >= seconds:
+                        for chat in store.chats():
+                            if self.selected(chat["id"]):
+                                start = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat() if days else iso_day(chat.get("history_since", ""))
+                                store.enqueue(chat["id"], kind, {"cursor": 0, "date_from": start, "automatic": True}, priority)
+                        store.set_state(kind + "_at", time.time())
+            if s.chat_events and self.service.db.get_state(prefix + "consent") and not s.paused and time.time() - store.state("events_at", 0) >= 15:
+                try:
+                    await self.events(store)
+                    store.set_state("event_error", "")
+                except (BitrixError, httpx.HTTPError, ValueError, OSError) as exc:
+                    store.set_state("event_error", self.service.vault.redact(str(exc)))
+                store.set_state("events_at", time.time())
+            rows = self.service.db.rows("SELECT * FROM ca_work WHERE account=? AND next_at<=? ORDER BY priority,touched,chat", (store.account, time.time()))
+            for row in rows:
+                work = json.loads(row["data"])
+                if work.get("automatic") and (not automatic or not self.selected(row["chat"])):
+                    continue
+                self.active = f"Чат {row['chat']}"
+                try:
+                    await self.process_work(store, row)
+                    self.error = ""
+                except (BitrixError, httpx.HTTPError, ValueError, OSError) as exc:
+                    message = self.service.vault.redact(str(exc))
+                    self.service.db.execute("UPDATE ca_work SET next_at=?,touched=? WHERE account=? AND chat=? AND kind=?",
+                                            (time.time() + 300, time.time(), store.account, row["chat"], row["kind"]))
+                    store.update_chat(row["chat"], error=message, coverage="access_lost" if isinstance(exc, BitrixError) and exc.code in ACCESS_CODES else "error")
+                    self.error = message
+                finally:
+                    self.active = ""
+                break  # One page per turn: fair across chats and cancellable.
+
+    async def loop(self):
+        while self.service.alive:
+            try:
+                await self.step()
+            except (BitrixError, httpx.HTTPError, ValueError, OSError) as exc:
+                self.error = self.service.vault.redact(str(exc))
+                await asyncio.sleep(10)
+            await asyncio.sleep(1)
+
+    async def download_file(self, store, file, client=None):
+        chat = store.chat(file["chat"])
+        client = client or self.service.client
+        result = {"downloadUrl": file["download_url"]} if file.get("download_url") else await client.call("im.v2.File.download", {"dialogId": chat["dialog"], "fileId": file["id"]}, v3=False)
+        url = client.safe_download_url(result.get("downloadUrl") or "")
+        if not result.get("downloadUrl"):
+            raise ValueError("Источник не предоставил ссылку скачивания")
+        folder = store.chat_folder(file["chat"]) / "attachments" / f"file-{file['id']}"
+        folder.mkdir(parents=True, exist_ok=True)
+        if shutil.disk_usage(folder).free < file["size"] + 1024**3:
+            raise OSError("Недостаточно места: требуется размер файла и резерв 1 ГБ")
+        fd, name = tempfile.mkstemp(prefix=".download-", dir=folder)
+        os.close(fd)
+        temp = Path(name)
+        digest, size = hashlib.sha256(), 0
+        try:
+            for redirect in range(6):
+                async with client.http.stream("GET", url) as response:
+                    if response.status_code in {301, 302, 303, 307, 308}:
+                        url = client.safe_download_url(urljoin(url, response.headers.get("location") or ""))
+                        continue
+                    response.raise_for_status()
+                    declared = positive(response.headers.get("content-length"))
+                    maximum = file.get("maximum", self.service.settings.chat_max_file_mb * 1024**2) if file["automatic"] else 0
+                    if maximum and max(file["size"], declared) > maximum:
+                        raise ValueError("Размер превышает лимит автоматической загрузки; доступно ручное скачивание")
+                    with temp.open("wb") as output:
+                        async for chunk in response.aiter_bytes():
+                            size += len(chunk)
+                            if maximum and size > maximum:
+                                raise ValueError("Размер превышает лимит автоматической загрузки")
+                            if shutil.disk_usage(folder).free < len(chunk) + 1024**3:
+                                raise OSError("Недостаточно места: резерв 1 ГБ")
+                            output.write(chunk)
+                            digest.update(chunk)
+                        output.flush()
+                        os.fsync(output.fileno())
+                    expected = file.get("source_size", file["size"])
+                    if expected and expected != size or declared and declared != size:
+                        raise OSError("Размер скачанного файла не совпадает; повторите загрузку")
+                    break
+            else:
+                raise ValueError("Слишком много перенаправлений файла")
+            sha = digest.hexdigest()
+            with temp.open("rb") as check:
+                verified = hashlib.file_digest(check, "sha256").hexdigest()
+            if verified != sha:
+                raise OSError("Проверка SHA-256 файла не пройдена")
+            target = folder / (sha + "_" + safe_name(file["name"]))
+            os.replace(temp, target)
+            async with self.lock:
+                data = json.loads(self.service.db.rows("SELECT data FROM ca_files WHERE account=? AND chat=? AND id=?", (store.account, file["chat"], file["id"]))[0]["data"])
+                content = {"path": target.relative_to(store.chat_folder(file["chat"])).as_posix(), "sha256": sha, "size": size, "observed_at": stamp()}
+                contents = data.get("contents", [])
+                if not any(c["sha256"] == sha for c in contents):
+                    contents.append(content)
+                data.update(contents=contents, path=content["path"], sha256=sha, size=size)
+                store.file_update(file["chat"], file["id"], data=canonical(data), state="saved", error="")
+                await asyncio.to_thread(store.flush, file["chat"])
+        finally:
+            temp.unlink(missing_ok=True)
+
+    async def file_step(self):
+        if not self.service.connected():
+            return
+        async with self.file_lock:
+            store = self.store()
+            s = self.service.settings
+            rows = self.service.db.rows("SELECT * FROM ca_files WHERE account=? AND state='queued' AND next_at<=? ORDER BY automatic,id", (store.account, time.time()))
+            for row in rows:
+                file = {**json.loads(row["data"]), **{k: v for k, v in row.items() if k != "data"}}
+                if file["automatic"]:
+                    if not s.chat_auto_save or not self.selected(file["chat"]) or not getattr(s, "chat_download_" + file["category"]):
+                        store.file_update(file["chat"], file["id"], state="not_saved")
+                        continue
+                    if s.paused or not window_status(s.chat_attachment_schedule)["allowed"]:
+                        continue
+                try:
+                    async with self.service.auth_lock:
+                        # Capture identity and resolve the one-time link while auth is
+                        # stable. Streaming uses no bearer token and holds no sync lock.
+                        if store.account != self.store().account:
+                            return
+                        client = copy.copy(self.service.client)
+                        client.settings = replace(self.service.settings)
+                        file["maximum"] = s.chat_max_file_mb * 1024**2
+                        result = await client.call("im.v2.File.download", {"dialogId": store.chat(file["chat"])["dialog"], "fileId": file["id"]}, v3=False)
+                        file["download_url"] = result.get("downloadUrl") or ""
+                        if not file["download_url"]:
+                            raise ValueError("Источник не предоставил ссылку скачивания")
+                        store.file_update(file["chat"], file["id"], state="running", attempts=file["attempts"] + 1)
+                    await self.download_file(store, file, client)
+                except (BitrixError, httpx.HTTPError, ValueError, OSError) as exc:
+                    permanent = isinstance(exc, BitrixError) and exc.code in ACCESS_CODES or isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in {403, 404}
+                    store.file_update(file["chat"], file["id"], state="unavailable" if permanent else "error", error=self.service.vault.redact(str(exc)), next_at=time.time() + 300)
+                    if not permanent and not isinstance(exc, ValueError):
+                        store.file_update(file["chat"], file["id"], state="queued")
+                break
+
+    async def file_loop(self):
+        while self.service.alive:
+            try:
+                await self.file_step()
+            except (BitrixError, httpx.HTTPError, ValueError, OSError) as exc:
+                self.error = self.service.vault.redact(str(exc))
+            await asyncio.sleep(1)

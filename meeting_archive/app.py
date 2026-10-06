@@ -66,6 +66,22 @@ async def probe_relay(base: str, portal: str) -> dict:
 class SettingsPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
     archive_root: str | None = None
+    chat_archive_root: str | None = None
+    chat_auto_save: bool | None = None
+    chat_scope: str | None = None
+    chat_selected_ids: list[int] | None = None
+    chat_excluded_ids: list[int] | None = None
+    chat_history_since: str | None = None
+    chat_poll_seconds: int | None = None
+    chat_events: bool | None = None
+    chat_download_images: bool | None = None
+    chat_download_documents: bool | None = None
+    chat_download_audio: bool | None = None
+    chat_download_video: bool | None = None
+    chat_download_other: bool | None = None
+    chat_download_history: bool | None = None
+    chat_attachment_schedule: dict | None = None
+    chat_max_file_mb: int | None = Field(None, ge=0, le=1000000)
     auto_download: bool | None = None
     auto_download_audio: bool | None = None
     auto_local: bool | None = None
@@ -213,7 +229,7 @@ def create_app(service: Service, launch_token: str | None = None, *, manage_life
 
     @app.get("/static/{name}")
     async def static(name: str):
-        if name not in {"app.js", "styles.css", "icon.svg", "icon.png", "favicon.ico"}:
+        if name not in {"app.js", "styles.css", "chat-archive.js", "chat-archive.css", "icon.svg", "icon.png", "favicon.ico"}:
             return JSONResponse({"error": "Файл не найден"}, status_code=404)
         return FileResponse(STATIC / name)
 
@@ -221,7 +237,7 @@ def create_app(service: Service, launch_token: str | None = None, *, manage_life
     async def bootstrap():
         from .scheduling import window_status
         jobs = service.db.rows("SELECT id,kind,meeting_id,state,attempts,created,error,progress,message,next_at FROM jobs ORDER BY id DESC LIMIT 100")
-        windows = {"download": window_status(service.settings.download_schedule), "local": window_status(service.settings.local_schedule)}
+        windows = {"download": window_status(service.settings.download_schedule), "local": window_status(service.settings.local_schedule), "chat_attachment": window_status(service.settings.chat_attachment_schedule)}
         for job in jobs:
             payload = json.loads(service.db.rows("SELECT payload FROM jobs WHERE id=?", (job["id"],))[0]["payload"])
             job["automatic"] = bool(payload.get("automatic"))
@@ -385,12 +401,15 @@ def create_app(service: Service, launch_token: str | None = None, *, manage_life
     @app.post("/api/settings")
     async def settings(data: SettingsPatch):
         from .scheduling import validate_schedule
+        from .chat_sync import validate_chat_settings
         values = data.model_dump(exclude_unset=True, exclude_none=True)
+        validate_chat_settings(values, service.settings, service.home)
+        old_settings = replace(service.settings)
         if values.get("auto_local", service.settings.auto_local):
             if values.get("auto_download_audio") is False:
                 raise ValueError("Для локальной авторасшифровки требуется скачивание аудио. Сначала выключите локальную авторасшифровку")
             values["auto_download_audio"] = True
-        for key in ("download_schedule", "local_schedule"):
+        for key in ("download_schedule", "local_schedule", "chat_attachment_schedule"):
             if key in values:
                 values[key] = validate_schedule(values[key])
         if values.get("engine", service.settings.engine) not in {"whisper", "parakeet", "gigaam"}:
@@ -422,9 +441,11 @@ def create_app(service: Service, launch_token: str | None = None, *, manage_life
             service.settings.auto_since = now_iso()
         if "autostart" in values and values["autostart"] != service.settings.autostart:
             autostart(values["autostart"])
-        for key, value in values.items():
-            setattr(service.settings, key, value)
-        service.settings.save(service.home)
+        async with service.auth_lock, service.chat_archive.lock:
+            for key, value in values.items():
+                setattr(service.settings, key, value)
+            service.settings.save(service.home)
+            await service.chat_archive.settings_changed(old_settings)
         service.schedule_local_pending()
         return {"settings": asdict(service.settings)}
 
@@ -850,4 +871,6 @@ def create_app(service: Service, launch_token: str | None = None, *, manage_life
             shutdown_callback()
         return {"stopping": True}
 
+    from .chat_api import register_chat_api
+    register_chat_api(app, service)
     return app

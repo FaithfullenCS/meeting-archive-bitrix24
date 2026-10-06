@@ -29,8 +29,16 @@
     cancelled: "Отменено", canceled: "Отменено", waiting: "Ожидается", done: "Готово", tested: "Короткий тест"
   };
   const kinds = { download: "Загрузка материалов", fetch: "Загрузка материалов", transcribe: "Локальная расшифровка", install: "Установка модуля", import: "Импорт записи", catalogue: "Обновление каталога" };
-  const routes = { archive: "Совещания", detail: "Совещание", jobs: "Очередь", module: "Настройки расшифровки", settings: "Настройки", connection: "Подключение Bitrix24", help: "Как пользоваться" };
+  const routes = { "chat-archive": "Архив чатов", archive: "Совещания", detail: "Совещание", jobs: "Очередь", module: "Настройки расшифровки", settings: "Настройки", connection: "Подключение Bitrix24", help: "Как пользоваться" };
   const iconPaths = {
+    chat: '<path d="M21 11a8 8 0 0 1-8 8H7l-5 3V7a4 4 0 0 1 4-4h11a4 4 0 0 1 4 4zM7 8h10M7 12h6"/>',
+    file: '<path d="M14 2H6v20h12V6zM14 2v5h5M9 12h6M9 16h6"/>',
+    image: '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8" cy="8" r="1"/><path d="m3 17 5-5 4 4 5-7 4 5"/>',
+    music: '<path d="M9 18V5l12-2v13M9 8l12-2"/><ellipse cx="6" cy="18" rx="3" ry="3"/><ellipse cx="18" cy="16" rx="3" ry="3"/>',
+    video: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="m10 8 6 4-6 4z"/>',
+    reply: '<path d="m9 5-6 6 6 6M3 11h10a7 7 0 0 1 7 7"/>',
+    forward: '<path d="m15 3 6 6-6 6M21 9H11a8 8 0 0 0-8 8v4"/>',
+    info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7h.01"/>',
     settings: '<path d="M4 7h16M4 17h16M8 4v6M16 14v6"/>', volume: '<path d="M3 10h4l5-4v12l-5-4H3zM16 8a6 6 0 0 1 0 8"/>',
     search: '<circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/>', users: '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/><circle cx="9" cy="7" r="4"/>',
     plus: '<path d="M12 5v14M5 12h14"/>', x: '<path d="m6 6 12 12M6 18 18 6"/>', check: '<path d="m5 12 4 4L19 6"/>',
@@ -374,6 +382,7 @@
     if (route === "module" && !state.hardware && state.csrf) loadHardware().catch(error => notify(error.message, true));
     if (route === "module" && !state.engines && state.csrf) loadEngines().catch(error => notify(error.message, true));
     if (route === "archive" && participantsNeedRefresh() && state.csrf) loadParticipants();
+    if (state.csrf) caUI.onRoute(route).catch(error => notify(error.message, true));
   }
   function updateSettingsForm(settings, force = false) {
     if (state.settingsReady && !force) return;
@@ -381,11 +390,13 @@
       const input = $("#settings-form").elements.namedItem(name);
       if (!input) continue;
       if (input.type === "checkbox") input.checked = Boolean(value);
+      else if (input.multiple) { for (const option of input.options) option.selected = (value || []).includes(Number(option.value)); }
       else if (["min_speakers", "max_speakers"].includes(name) && !value) input.value = "";
       else input.value = value ?? "";
     }
     state.settingsReady = true; state.settingsDirty = false;
     fillSchedules(settings);
+    caUI.settingsReset(settings);
     $("#settings-status").textContent = "Настройки сохранены.";
     $(".settings-footer").classList.remove("dirty");
     updateCpuAcknowledgement();
@@ -415,8 +426,8 @@
     $("#connected-portal").textContent = settings.portal ? `Подключён ${settings.portal}` : "Bitrix24 подключён";
     $("#connected-description").textContent = `Способ: ${settings.auth_mode === "webhook" ? "входящий webhook" : "OAuth"}. Каталог ограничен текущим пользователем${settings.user_id ? ` (ID ${settings.user_id})` : ""}.`;
     $("#refresh-catalogue").disabled = !isConnected || Boolean(data.catalogue?.running);
-    const status = $("#app-status"); status.textContent = (settings.auto_download || settings.auto_local || settings.watch_enabled) && settings.paused ? "Автоматизация на паузе" : "Приложение работает"; status.className = `badge ${settings.paused ? "waiting" : "success"}`;
-    setButtonLabel($("#pause-button"), settings.auto_download || settings.auto_local || settings.watch_enabled ? settings.paused ? "Продолжить автоматизацию" : "Приостановить автоматизацию" : "Настроить автоматизацию", settings.auto_download || settings.auto_local || settings.watch_enabled ? settings.paused ? "play" : "pause" : "settings");
+    const status = $("#app-status"); status.textContent = (settings.auto_download || settings.auto_local || settings.watch_enabled || settings.chat_auto_save || settings.chat_events) && settings.paused ? "Автоматизация на паузе" : "Приложение работает"; status.className = `badge ${settings.paused ? "waiting" : "success"}`;
+    setButtonLabel($("#pause-button"), settings.auto_download || settings.auto_local || settings.watch_enabled || settings.chat_auto_save || settings.chat_events ? settings.paused ? "Продолжить автоматизацию" : "Приостановить автоматизацию" : "Настроить автоматизацию", settings.auto_download || settings.auto_local || settings.watch_enabled || settings.chat_auto_save || settings.chat_events ? settings.paused ? "play" : "pause" : "settings");
     const timing = data.automation_timing || {};
     $("#automation-timing-status").textContent = !isConnected ? "Для фоновой проверки подключите Bitrix24." : timing.catalogue_running ? "Сейчас проверяем каталог совещаний." : `${timing.last_scan ? `Последняя успешная проверка: ${dateString(timing.last_scan)}. ` : ""}Обычный интервал — минута после завершения предыдущей проверки; при ошибках ожидание увеличивается.`;
     $("#metric-download").textContent = settings.auto_download ? (settings.paused ? "На паузе" : "Включена") : "Выключена";
@@ -425,7 +436,7 @@
     $("#metric-local-sub").textContent = settings.auto_local ? "Для новых сохранённых записей" : "По кнопке в карточке совещания";
     $$("[data-schedule]").forEach(editor => {
       const window = data.automation_windows?.[editor.dataset.schedule];
-      $("[data-schedule-status]", editor).textContent = window?.label || "По времени этого компьютера. Расписание ограничивает запуск новых задач.";
+      $("[data-schedule-status]", editor).textContent = (window?.label || "По времени этого компьютера. Расписание ограничивает запуск новых задач.") + (editor.dataset.schedule === "chat_attachment" ? " Сохранение текста продолжается вне окна скачивания." : "");
     });
     const count = data.catalogue?.total ?? state.total;
     $("#metric-total").textContent = Number(count).toLocaleString("ru-RU"); $("#nav-total").textContent = String(count);
@@ -836,7 +847,7 @@
     state.busy = true;
     try {
       const previousChatRevision = state.bootstrap?.chat_revision;
-      const data = await api("/api/bootstrap"); renderBootstrap(data); if (data.activation) await consumeActivation(data.activation);
+      const data = await api("/api/bootstrap"); renderBootstrap(data); if (["chat-archive","settings"].includes(state.route)) await caUI.onBootstrap(data, state.route); if (data.activation) await consumeActivation(data.activation);
       if (!state.windowAnnounced) { api("/api/desktop/ready", {method: "POST"}).then(result => { state.windowAnnounced = Boolean(result.ready); }).catch(() => {}); }
       if (state.route === "archive" && participantsNeedRefresh()) await loadParticipants();
       if (state.route === "archive" && chatsNeedRefresh()) await loadChats();
@@ -951,7 +962,7 @@
   $("#next-page").onclick = () => { state.offset += state.limit; action($("#next-page"), loadMeetings); };
   $("#refresh-catalogue").onclick = event => action(event.currentTarget, async () => { await api("/api/catalogue/refresh", { method: "POST", data: {} }); state.participantsLoaded = false; state.chatsLoaded = false; notify("Обновление каталога запущено."); await bootstrap(); });
   $("#download-selected").onclick = event => action(event.currentTarget, async () => { await api("/api/download", { method: "POST", data: { ids: [...state.selected] } }); notify(`Загрузка поставлена в очередь: ${state.selected.size} совещаний.`); state.selected.clear(); renderSelection(); await loadMeetings(); await bootstrap(); });
-  $("#pause-button").onclick = event => action(event.currentTarget, async () => { if (!state.bootstrap?.settings?.auto_download && !state.bootstrap?.settings?.auto_local && !state.bootstrap?.settings?.watch_enabled) { navigate("settings"); return; } const paused = !state.bootstrap?.settings?.paused; await api("/api/settings", { method: "POST", data: { paused } }); notify(paused ? "Автоматизация приостановлена." : "Автоматизация продолжена."); await bootstrap(); });
+  $("#pause-button").onclick = event => action(event.currentTarget, async () => { if (!state.bootstrap?.settings?.auto_download && !state.bootstrap?.settings?.auto_local && !state.bootstrap?.settings?.watch_enabled && !state.bootstrap?.settings?.chat_auto_save && !state.bootstrap?.settings?.chat_events) { navigate("settings"); return; } const paused = !state.bootstrap?.settings?.paused; await api("/api/settings", { method: "POST", data: { paused } }); notify(paused ? "Автоматизация приостановлена." : "Автоматизация продолжена."); await bootstrap(); });
   $("#download-audio").onclick = event => action(event.currentTarget, async () => { await api("/api/download", { method: "POST", data: { ids: [state.meetingId], audio_only: true } }); notify("Аудиозапись поставлена в очередь загрузки."); await bootstrap(); await loadDetail(); });
   $("#detail-download").onclick = event => action(event.currentTarget, async () => { await api("/api/download", { method: "POST", data: { ids: [state.meetingId] } }); notify("Материалы поставлены в очередь загрузки."); await bootstrap(); await loadDetail(); });
   $("#detail-folder").onclick = event => action(event.currentTarget, () => api("/api/open-folder", { method: "POST", data: { id: state.meetingId } }));
@@ -1031,7 +1042,7 @@
   $("#settings-form").addEventListener("submit", event => {
     event.preventDefault(); action(event.submitter, async () => {
       const form = event.currentTarget; const data = {};
-      [...form.elements].filter(input => input.name).forEach(input => { data[input.name] = input.type === "checkbox" ? input.checked : input.type === "number" ? Number(input.value) || 0 : input.value.trim(); });
+      [...form.elements].filter(input => input.name).forEach(input => { data[input.name] = input.multiple ? [...input.selectedOptions].map(option => Number(option.value)) : input.type === "checkbox" ? input.checked : input.type === "number" || input.name === "chat_poll_seconds" ? Number(input.value) || 0 : input.value.trim(); });
       $$("[data-schedule]").forEach(editor => { const schedule = readSchedule(editor); if (schedule.mode === "window" && (!schedule.days.length || !schedule.start || !schedule.end)) throw new Error("Для расписания выберите хотя бы один день и заполните начало и окончание."); data[`${editor.dataset.schedule}_schedule`] = schedule; });
       if (data.device === "cpu" && !data.cpu_confirmed) throw new Error("Отметьте явное разрешение обработки на CPU.");
       if (data.watch_enabled && !data.watch_folder) throw new Error("Выберите папку для автоматического импорта записей.");
@@ -1157,6 +1168,7 @@
   window.addEventListener("hashchange", applyRoute);
   window.addEventListener("beforeunload", event => { if (state.settingsDirty) { event.preventDefault(); event.returnValue = ""; } });
   document.addEventListener("visibilitychange", () => { if (!document.hidden) bootstrap(); });
+  const caUI = window.ChatArchiveUI.create({api, icon, escapeHtml, dateString, notify, action, getSettings: () => state.bootstrap?.settings || {}});
   decorateStaticIcons(); renderParticipants(); renderCalendar(); applyRoute();
 
   function renderDesktopSettings(data) {
