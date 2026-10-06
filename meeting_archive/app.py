@@ -229,7 +229,7 @@ def create_app(service: Service, launch_token: str | None = None, *, manage_life
 
     @app.get("/static/{name}")
     async def static(name: str):
-        if name not in {"app.js", "styles.css", "chat-archive.js", "chat-archive.css", "icon.svg", "icon.png", "favicon.ico"}:
+        if name not in {"app.js", "styles.css", "chat-archive.js", "chat-archive.css", "archive-controls.js", "archive-controls.css", "icon.svg", "icon.png", "favicon.ico"}:
             return JSONResponse({"error": "Файл не найден"}, status_code=404)
         return FileResponse(STATIC / name)
 
@@ -250,6 +250,7 @@ def create_app(service: Service, launch_token: str | None = None, *, manage_life
                 "notification_error": service.notifications.error,
                 "account_name": service.db.get_state(service.identity_key()) if service.connected() else "",
                 "chat_warning": service.chat_warning, "chat_revision": service.db.get_state("chat_revision"),
+                "chat_archive": {**service.chat_archive.store().summary(), "poll_seconds": service.settings.chat_poll_seconds},
                 "secret_status": {"webhook_saved": bool(saved.get("webhook")),
                                   "hf_token_saved": bool(saved.get("hf_token")),
                                   "client_secret_saved": bool(saved.get("client_secret")),

@@ -73,14 +73,23 @@ class ChatStore:
         return self.folder / "chats" / f"chat-{int(chat)}"
 
     def chats(self):
-        rows = self.db.rows("SELECT * FROM ca_chats WHERE account=?", (self.account,))
+        rows = self.db.rows("""SELECT c.*,COALESCE(m.n,0) AS message_count,m.first,m.last,COALESCE(w.n,0) AS pending
+            FROM ca_chats c LEFT JOIN (SELECT chat,count(*) AS n,min(date) AS first,max(date) AS last
+            FROM ca_messages WHERE account=? GROUP BY chat) m ON m.chat=c.id
+            LEFT JOIN (SELECT chat,count(*) AS n FROM ca_work WHERE account=? GROUP BY chat) w ON w.chat=c.id
+            WHERE c.account=?""", (self.account, self.account, self.account))
         for row in rows:
             data = json.loads(row.pop("data"))
             row.update(data)
-            row["count"] = self.db.rows("SELECT count(*) AS n,min(date) AS first,max(date) AS last FROM ca_messages WHERE account=? AND chat=?",
-                                        (self.account, row["id"]))[0]
-            row["pending"] = len(self.db.rows("SELECT kind FROM ca_work WHERE account=? AND chat=?", (self.account, row["id"])))
+            row["count"] = {"n": row.pop("message_count"), "first": row.pop("first"), "last": row.pop("last")}
         return rows
+
+    def summary(self):
+        """Cheap account-wide counters, independent of the current view filters."""
+        counts = self.db.rows("SELECT count(*) AS count FROM ca_chats WHERE account=?", (self.account,))[0]
+        counts.update(self.db.rows("SELECT count(DISTINCT chat) AS archived,count(*) AS messages FROM ca_messages WHERE account=?", (self.account,))[0])
+        counts["pending"] = self.db.rows("SELECT count(*) AS n FROM ca_work WHERE account=?", (self.account,))[0]["n"]
+        return counts
 
     def chat(self, id):
         rows = self.db.rows("SELECT * FROM ca_chats WHERE account=? AND id=?", (self.account, int(id)))
@@ -183,7 +192,7 @@ class ChatStore:
                     if old:
                         previous = json.loads(old["data"])
                         changed = file["source"] != previous.get("source", {})
-                        file.update({key: previous[key] for key in ("path", "sha256", "contents") if key in previous})
+                        file.update({key: previous[key] for key in ("path", "sha256", "contents", "download_origin") if key in previous})
                     con.execute("INSERT INTO ca_files(account,chat,id,data) VALUES(?,?,?,?) ON CONFLICT(account,chat,id) DO UPDATE SET data=excluded.data",
                                 (self.account, chat_id, file["id"], canonical(file)))
                     if changed:
@@ -202,10 +211,11 @@ class ChatStore:
 
     def file(self, chat, id):
         self.chat(chat)
-        matches = [file for file in self.files(chat) if file["id"] == int(id)]
+        matches = self.db.rows("SELECT * FROM ca_files WHERE account=? AND chat=? AND id=?", (self.account, chat, int(id)))
         if not matches:
             raise ValueError("Вложение не найдено")
-        return matches[0]
+        row = matches[0]
+        return {**json.loads(row["data"]), **{k: v for k, v in row.items() if k != "data"}}
 
     def file_update(self, chat, id, **values):
         self.db.execute(f"UPDATE ca_files SET {','.join(k+'=?' for k in values)} WHERE account=? AND chat=? AND id=?",
@@ -243,10 +253,14 @@ class ChatStore:
     def query(self, *, chat=0, q="", date_from="", date_to="", author=0, direction="", kind="", attachment="",
               file_state="", system="", type="", participant=0, coverage="", offset=0, limit=50):
         conditions, args = ["account=?"], [self.account]
-        for column, value in (("chat", positive(chat)), ("author", positive(author))):
+        for column, value in (("chat", positive(chat)),):
             if value:
                 conditions.append(column + "=?")
                 args.append(value)
+        authors = {positive(i) for i in str(author).split(",")} - {0}
+        if authors:
+            conditions.append("author IN (" + ",".join("?" for _ in authors) + ")")
+            args.extend(sorted(authors))
         if q:
             conditions.append("instr(ca_casefold(text),ca_casefold(?))>0")
             args.append(q)
@@ -260,8 +274,9 @@ class ChatStore:
             conditions.append("author" + ("=" if direction == "outgoing" else "!=") + "?")
             args.append(self.user_id)
         if type or participant or coverage:
+            participants = {positive(i) for i in str(participant).split(",")} - {0}
             allowed = [c["id"] for c in self.chats() if (not type or c["type"] == type) and
-                       (not participant or any(p["id"] == positive(participant) for p in c.get("participants", []))) and
+                       (not participants or participants.issubset({p["id"] for p in c.get("participants", [])})) and
                        (not coverage or c["coverage"] == coverage)]
             if not allowed:
                 return {"items": [], "total": 0, "offset": 0, "limit": limit}

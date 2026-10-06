@@ -3,17 +3,21 @@ window.ChatArchiveUI = {
   create({api, icon, escapeHtml: esc, dateString, notify, action, getSettings}) {
     const $ = selector => document.querySelector(selector);
     const form = $("#ca-filters");
-    const s = {account: "", chats: [], chat: 0, items: [], total: 0, offset: 0, nextOffset: 0, request: 0, last: 0, busy: false, optionsLoaded: false};
+    const s = {account: "", chats: [], chat: 0, items: [], total: 0, offset: 0, nextOffset: 0, request: 0, last: 0, busy: false, optionsLoaded: false, selected: new Set(), chatOffset: 0, visible: [], pageItems: [], anchor: 0};
     const coverage = {pending: "Ожидает сохранения", backfilling: "Догружается…", source_boundary: "Доступная история сохранена", tariff_limited: "История ограничена тарифом", access_lost: "Потеря доступа", error: "Ошибка — повторим позже", boundary_unverified: "Граница не подтверждена", verifying_boundary: "Проверяется граница"};
-    const files = {not_saved: "Не скачан", queued: "В очереди", running: "Скачивается…", saved: "Скачан", unavailable: "Недоступен", error: "Ошибка", missing: "Файл перемещён"};
+    const files = {not_saved: "Не скачан", queued: "В очереди", running: "Скачивается…", saved: "Скачан", unavailable: "Недоступен", error: "Ошибка", missing: "Файл перемещён", size_limited: "Превышен лимит размера"};
     const fileIcons = {images: "image", documents: "file", audio: "music", video: "video", other: "file"};
     const avatar = name => `<span class="ca-avatar" aria-hidden="true">${esc(String(name || "?").split(/\s+/).filter(Boolean).slice(0,2).map(n => n[0]).join("").toUpperCase())}</span>`;
     const selected = selector => [...$(selector).selectedOptions].map(option => Number(option.value));
-    function values() { return Object.fromEntries(new FormData(form).entries()); }
+    function values() {
+      const data = Object.fromEntries(new FormData(form).entries());
+      for (const name of ["author","participant"]) data[name] = [...form.elements[name].selectedOptions].map(o=>o.value).join(",");
+      return data;
+    }
     function showError(message) { $("#ca-error").hidden = !message; $("#ca-error").textContent = message || ""; }
     function populateSettings() {
       const settings = getSettings();
-      for (const [selector, saved] of [["#ca-selected-chats",settings.chat_selected_ids || []],["#ca-excluded-chats",settings.chat_excluded_ids || []],["#ca-period-chats",selected("#ca-period-chats")]]) {
+      for (const [selector, saved] of [["#ca-selected-chats",settings.chat_selected_ids || []],["#ca-excluded-chats",settings.chat_excluded_ids || []]]) {
         const element = $(selector);
         const current = s.optionsLoaded ? selected(selector) : saved;
         const items = [...s.chats];
@@ -21,13 +25,39 @@ window.ChatArchiveUI = {
         element.innerHTML = items.map(c => `<option value="${c.id}"${current.includes(c.id) ? " selected" : ""}>${esc(c.title)} · ID ${c.id}</option>`).join("");
       }
       s.optionsLoaded = true;
+      window.ArchiveControls?.refresh($("#settings-form"));
+    }
+    function renderSelection() {
+      const n=s.selected.size, count=s.pageItems.filter(c=>s.selected.has(c.id)).length;
+      $("#ca-selection-label").textContent=n ? `Выбрано: ${n}` : "Выбрать страницу";
+      $("#ca-save-selected").disabled=!n;
+      const check=$("#ca-select-page"); check.checked=Boolean(s.pageItems.length && count===s.pageItems.length);
+      check.indeterminate=count>0 && count<s.pageItems.length; check.disabled=!s.pageItems.length;
     }
     function renderChats() {
-      const q = $("#ca-chat-search").value.trim().toLocaleLowerCase("ru");
-      const filters = values();
-      const chats = s.chats.filter(c => (!q || c.title.toLocaleLowerCase("ru").includes(q) || String(c.id) === q) && (!filters.type || c.type === filters.type) && (!filters.coverage || c.coverage === filters.coverage) && (!filters.participant || c.participants?.some(p => p.id === Number(filters.participant))));
-      $("#ca-chat-count").textContent = `${chats.length}`;
-      $("#ca-chat-list").innerHTML = chats.length ? chats.map(c => `<button type="button" class="ca-chat${s.chat === c.id ? " active" : ""}" data-ca-chat="${c.id}" aria-pressed="${s.chat === c.id}">${avatar(c.title)}<span class="ca-chat-text"><strong>${esc(c.title)}</strong><small>${c.type === "user" ? "Личный чат" : "Групповой чат"} · ${Number(c.count.messages ?? c.count.n ?? 0).toLocaleString("ru")} сообщений</small><small class="ca-chat-preview">${esc(c.preview)}</small><small class="ca-chat-state">${icon(c.coverage === "source_boundary" ? "check" : ["error","access_lost","tariff_limited"].includes(c.coverage) ? "alert" : "refresh")}${esc(coverage[c.coverage] || c.coverage)}</small></span></button>`).join("") : '<div class="ca-empty"><p>Сохранённых чатов пока нет. Нажмите «Обновить» или добавьте доступный чат в настройках.</p></div>';
+      const q = $("#ca-chat-search").value.trim().toLocaleLowerCase("ru"), filters=values();
+      const participants=filters.participant.split(",").filter(Boolean).map(Number);
+      s.visible=s.chats.filter(c=>(!q || c.title.toLocaleLowerCase("ru").includes(q) || String(c.id)===q) && (!filters.type || c.type===filters.type) && (!filters.coverage || c.coverage===filters.coverage) && participants.every(id=>c.participants?.some(p=>p.id===id)));
+      if(s.chatOffset>=s.visible.length) s.chatOffset=Math.max(0,Math.floor((s.visible.length-1)/50)*50);
+      s.pageItems=s.visible.slice(s.chatOffset,s.chatOffset+50);
+      $("#ca-chat-count").textContent=`${s.visible.length}`;
+      $("#ca-chat-list").innerHTML=s.pageItems.length ? s.pageItems.map(c=>`<div class="ca-chat-row${s.chat===c.id ? " active" : ""}"><input type="checkbox" data-ca-select="${c.id}" aria-label="Выбрать ${esc(c.title)}"${s.selected.has(c.id) ? " checked" : ""}><button type="button" class="ca-chat" data-ca-chat="${c.id}" aria-pressed="${s.chat===c.id}">${avatar(c.title)}<span class="ca-chat-text"><strong>${esc(c.title)}</strong><small>${c.type==="user" ? "Личный чат" : "Групповой чат"} · ${Number(c.count.messages ?? c.count.n ?? 0).toLocaleString("ru")} сообщений</small><small class="ca-chat-preview">${esc(c.preview)}</small><small class="ca-chat-state">${icon(c.coverage==="source_boundary" ? "check" : ["error","access_lost","tariff_limited"].includes(c.coverage) ? "alert" : c.coverage==="pending" ? "archive" : "refresh")}${esc(coverage[c.coverage] || c.coverage)}</small></span></button></div>`).join("") : '<div class="ca-empty"><p>Чаты не найдены. Обновите каталог или измените фильтры.</p></div>';
+      $("#ca-chat-page-label").textContent=s.visible.length ? `${s.chatOffset+1}–${Math.min(s.chatOffset+50,s.visible.length)} из ${s.visible.length}` : "0 чатов";
+      $("#ca-chat-page").textContent=String(Math.floor(s.chatOffset/50)+1);
+      $("#ca-chat-previous").disabled=!s.chatOffset; $("#ca-chat-next").disabled=s.chatOffset+50>=s.visible.length;
+      renderSelection();
+    }
+    function renderSummary(result) {
+      const total=result.count ?? result.total ?? s.chats.length;
+      $("#nav-chat-total").textContent=Number(total).toLocaleString("ru");
+      $("#ca-metric-chats").textContent=Number(total).toLocaleString("ru");
+      $("#ca-metric-messages").textContent=Number(result.messages ?? s.chats.reduce((n,c)=>n+Number(c.count.messages ?? c.count.n ?? 0),0)).toLocaleString("ru");
+      $("#ca-metric-saved").textContent=`Чатов с сообщениями: ${result.archived ?? s.chats.filter(c=>Number(c.count.messages ?? c.count.n ?? 0)).length}`;
+      $("#ca-metric-auto").textContent=result.auto_save ? "Включено" : "Выключено";
+      $("#ca-metric-poll").textContent=`Новые сообщения · раз в ${Math.max(1,Math.round((result.poll_seconds || getSettings().chat_poll_seconds || 300)/60))} мин.`;
+      const pending=Number(result.pending ?? result.pending_total ?? 0);
+      $("#ca-metric-loading").textContent=result.active ? "В работе" : pending ? "В очереди" : "Нет задач";
+      $("#ca-sync-status").textContent=result.active || (pending ? `Ожидают: ${pending}` : "Старая история — по выбору");
     }
     function renderHeading() {
       const chat = s.chats.find(c => c.id === s.chat);
@@ -39,7 +69,7 @@ window.ChatArchiveUI = {
       $("#ca-thread-heading").innerHTML = `${avatar(chat.title)}<div><h2>${esc(chat.title)}</h2><p class="footnote">${chat.type === "user" ? "Личный чат" : "Групповой чат"} · ID ${chat.id}</p></div><details><summary>Участники</summary><p class="footnote">${chat.participants?.length ? chat.participants.map(p => esc(p.name || `ID ${p.id}`)).join(", ") : "Список участников не предоставлен источником"}</p></details>`;
       const first = chat.count.first?.slice(0,10) || "—", last = chat.count.last?.slice(0,10) || "—";
       $("#ca-coverage").hidden = false;
-      $("#ca-coverage").innerHTML = `${icon("info")} ${esc(coverage[chat.coverage] || chat.coverage)} · ${esc(first)} — ${esc(last)} · Проверено: ${esc(chat.last_checked ? dateString(chat.last_checked) : "ещё не проверено")}${chat.history_since ? `<br>Граница сбора: ${esc(chat.history_since)}` : ""}${chat.event_gap ? "<br>Возможен разрыв событий: промежуточные редакции могут отсутствовать." : ""}${(chat.limitations || []).map(t => `<br>${esc(t)}`).join("")}${chat.error ? `<br>${esc(chat.error)}` : ""}${chat.meeting_ids?.length ? `<br>Совещания: ${chat.meeting_ids.map(id => `<a href="#meeting/${id}">№${id}</a>`).join(", ")}` : ""}`;
+      $("#ca-coverage").innerHTML = `${icon("info")} ${esc(coverage[chat.coverage] || chat.coverage)} · ${esc(first)} — ${esc(last)} · Проверено: ${esc(chat.last_checked ? dateString(chat.last_checked) : "ещё не проверено")}${chat.history_since ? `<br>Граница сбора: ${esc(chat.history_since)}` : ""}${chat.event_gap ? "<br>Пропущены уведомления об изменениях: промежуточные редакции могут отсутствовать." : ""}${(chat.limitations || []).map(t => `<br>${esc(t)}`).join("")}${chat.error ? `<br>${esc(chat.error)}` : ""}${chat.meeting_ids?.length ? `<br>Совещания: ${chat.meeting_ids.map(id => `<a href="#meeting/${id}">№${id}</a>`).join(", ")}` : ""}`;
     }
     function renderMessage(m) {
       const name = m.author || (m.system ? "Bitrix24" : `Автор ID ${m.author_id}`);
@@ -76,44 +106,64 @@ window.ChatArchiveUI = {
       s.busy = true;
       try {
         const result = await api("/api/chat-archive");
-        if (s.account && s.account !== result.account) { s.chat=0; s.items=[]; s.request++; s.optionsLoaded=false; }
+        if (s.account && s.account !== result.account) { s.chat=0; s.items=[]; s.request++; s.optionsLoaded=false; s.selected.clear(); s.chatOffset=0; }
         s.account=result.account; s.chats=result.items; s.last=Date.now();
-        $("#ca-sync-status").textContent = `${result.auto_save ? "Автосохранение включено" : "Автосохранение выключено"}${result.active ? " · " + result.active : ""}`;
+        renderSummary(result);
         $("#ca-discovery").textContent=result.discovery;
         showError(result.error || result.events_error);
         $("#ca-events-status").textContent=result.events_status;
         populateSettings(); renderChats();
         const scroll=$("#ca-messages"), readingOlder=scroll.scrollHeight-scroll.scrollTop-scroll.clientHeight>100;
         const keepView=s.items.length && (readingOlder || s.items.length>50 || scroll.querySelector("details[open]"));
-        if (load && (s.chat || values().q || values().kind || values().attachment) && (force || !keepView)) await loadMessages();
+        if (load && (s.chat || s.items.length || Object.values(values()).some(Boolean)) && (force || !keepView)) await loadMessages();
         else renderHeading();
       } catch(error) { showError(error.message); }
       finally { s.busy=false; }
     }
     async function loadPeople() {
-      const result = await api("/api/chat-archive/filters");
-      for (const name of ["author","participant"]) {
-        const element = form.elements[name], current=element.value;
-        element.innerHTML='<option value="">Все</option>' + result.authors.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
-        element.value=current;
+      const result=await api("/api/chat-archive/filters");
+      for(const name of ["author","participant"]) {
+        const element=form.elements[name], current=new Set([...element.selectedOptions].map(o=>o.value));
+        element.innerHTML=result.authors.map(p=>`<option value="${p.id}"${current.has(String(p.id)) ? " selected" : ""}>${esc(p.name)}</option>`).join("");
       }
       const element=form.elements.type, current=element.value;
-      element.innerHTML='<option value="">Все</option>' + [...new Set(["user","chat",...result.types])].map(type => `<option value="${esc(type)}">${type === "user" ? "Личный" : type === "chat" ? "Групповой" : esc(type)}</option>`).join(""); element.value=current;
+      element.innerHTML='<option value="">Все</option>'+[...new Set(["user","chat",...result.types])].map(type=>`<option value="${esc(type)}">${type==="user" ? "Личный" : type==="chat" ? "Групповой" : esc(type)}</option>`).join(""); element.value=current;
+      window.ArchiveControls?.refresh(form);
     }
     async function choose(id,around=0) { s.chat=Number(id); renderChats(); await loadMessages(false,around); }
     let timer, silentReset = false;
-    function resetForContext() { clearTimeout(timer); silentReset = true; form.reset(); silentReset = false; }
+    function clearFilters() {
+      for (const input of form.elements) {
+        if (!input.name) continue;
+        if (input.multiple) [...input.options].forEach(option=>option.selected=false);
+        else input.value="";
+      }
+      window.ArchiveControls?.refresh(form);
+    }
+    function resetForContext() { clearTimeout(timer); silentReset = true; form.reset(); clearFilters(); silentReset = false; }
     form.addEventListener("submit", e => e.preventDefault());
-    form.addEventListener("input", () => { clearTimeout(timer); timer=setTimeout(() => { if (form.elements.q.value) s.chat=0; renderChats(); loadMessages().catch(e=>showError(e.message)); },250); });
-    form.addEventListener("reset", () => { if (!silentReset) setTimeout(() => { renderChats(); loadMessages().catch(e=>showError(e.message)); },0); });
-    $("#ca-chat-search").oninput=renderChats;
+    form.addEventListener("input", () => { clearTimeout(timer); timer=setTimeout(() => { if (form.elements.q.value) s.chat=0; s.chatOffset=0; renderChats(); loadMessages().catch(e=>showError(e.message)); },250); });
+    form.addEventListener("reset", () => { if (!silentReset) setTimeout(() => { clearFilters(); s.chatOffset=0; renderChats(); loadMessages().catch(e=>showError(e.message)); },0); });
+    $("#ca-chat-search").oninput=()=>{s.chatOffset=0; renderChats();};
     $("#ca-chat-list").addEventListener("click", e=>{ const button=e.target.closest("[data-ca-chat]"); if(button) choose(button.dataset.caChat).catch(e=>showError(e.message)); });
-    $("#ca-refresh").onclick=e=>action(e.currentTarget,async()=>{ await api("/api/chat-archive/sync",{method:"POST"}); notify("Сохранение чатов поставлено в очередь."); await refresh(true,true); });
+    $("#ca-refresh").onclick=e=>action(e.currentTarget,async()=>{ await api("/api/chat-archive/sync",{method:"POST"}); notify("Обновление каталога поставлено в очередь. Старая история сохраняется по выбору."); await refresh(true,true); });
     $("#ca-export").onclick=e=>action(e.currentTarget,async()=>{ const result=await api("/api/chat-archive/export",{method:"POST",data:{ids:s.chat?[s.chat]:[]}}); const link=document.createElement("a"); link.href=result.url; link.download="Архив чатов.zip"; link.click(); });
     $("#ca-more").onclick=e=>action(e.currentTarget,()=>loadMessages(true));
-    $("#ca-backfill").onclick=e=>action(e.currentTarget,async()=>{ const result=await api("/api/chat-archive/backfill",{method:"POST",data:{}}); $("#ca-settings-result").textContent=`В очереди: ${result.queued} чатов. Параметры сбора берутся из сохранённых настроек.`; });
-    $("#ca-period").onclick=e=>action(e.currentTarget,async()=>{ const result=await api("/api/chat-archive/backfill",{method:"POST",data:{ids:selected("#ca-period-chats"),date_from:$("#ca-period-from").value,date_to:$("#ca-period-to").value}}); $("#ca-settings-result").textContent=`Сохранение периода поставлено в очередь: ${result.queued} чатов.`; });
-    $("#ca-add-chat").onclick=e=>action(e.currentTarget,async()=>{ await api("/api/chat-archive/chats",{method:"POST",data:{dialog:$("#ca-dialog").value}}); $("#ca-dialog").value=""; await refresh(false); $("#ca-settings-result").textContent="Чат добавлен. Сохранение истории в очереди."; });
+    $("#ca-chat-previous").onclick=()=>{s.chatOffset=Math.max(0,s.chatOffset-50); s.anchor=0; renderChats(); $("#ca-chat-list").scrollTop=0;};
+    $("#ca-chat-next").onclick=()=>{s.chatOffset+=50; s.anchor=0; renderChats(); $("#ca-chat-list").scrollTop=0;};
+    $("#ca-select-page").onchange=e=>{s.pageItems.forEach(c=>e.target.checked ? s.selected.add(c.id) : s.selected.delete(c.id)); renderChats();};
+    $("#ca-chat-list").addEventListener("click",e=>{
+      const input=e.target.closest("[data-ca-select]"); if(!input) return;
+      const id=Number(input.dataset.caSelect), current=s.pageItems.findIndex(c=>c.id===id), anchor=s.pageItems.findIndex(c=>c.id===s.anchor);
+      const range=e.shiftKey && anchor>=0 ? s.pageItems.slice(Math.min(anchor,current),Math.max(anchor,current)+1) : [s.pageItems[current]];
+      range.forEach(c=>input.checked ? s.selected.add(c.id) : s.selected.delete(c.id)); s.anchor=id;
+      document.querySelectorAll("[data-ca-select]").forEach(node=>node.checked=s.selected.has(Number(node.dataset.caSelect))); renderSelection();
+    });
+    $("#ca-save-selected").onclick=e=>action(e.currentTarget,async()=>{
+      const result=await api("/api/chat-archive/backfill",{method:"POST",data:{ids:[...s.selected]}});
+      notify(`Вся доступная история поставлена в очередь: ${result.queued} чатов. Вложения — по сохранённым настройкам.`);
+      s.selected.clear(); renderChats(); await refresh(false,true);
+    });
     $("#ca-messages").addEventListener("click", e=> {
       const file=e.target.closest("[data-ca-file]"), source=e.target.closest("[data-ca-source]"), chat=e.target.closest("[data-ca-chat]");
       if(file) action(file,async()=>{ await api(`/api/chat-archive/chats/${file.dataset.fileChat}/files/${file.dataset.caFile}/download`,{method:"POST"}); notify("Вложение поставлено в очередь."); await loadMessages(); });
@@ -141,13 +191,13 @@ window.ChatArchiveUI = {
         }).catch(error=>{box.textContent=error.message;});
       }
     },true);
-    for (const [id,name] of [["ca-refresh","refresh"],["ca-export","download"],["ca-more","clock"],["ca-backfill","refresh"],["ca-period","calendar"],["ca-add-chat","plus"]]) {
+    for (const [id,name] of [["ca-refresh","refresh"],["ca-export","download"],["ca-more","clock"],["ca-save-selected","download"]]) {
       const button=$("#"+id); button.innerHTML=icon(name)+`<span>${esc(button.textContent)}</span>`;
     }
     return {
       async onRoute(route) { if(route === "chat-archive" || route === "settings") { await refresh(route === "chat-archive"); if(route === "chat-archive") await loadPeople(); } },
       async onBootstrap(data,route) { if (["chat-archive","settings"].includes(route) && Date.now()-s.last>7000) await refresh(route === "chat-archive"); },
-      settingsReset(settings) { s.optionsLoaded=false; populateSettings(); for (const [selector,key] of [["#ca-selected-chats","chat_selected_ids"],["#ca-excluded-chats","chat_excluded_ids"]]) for(const option of $(selector).options) option.selected=(settings[key]||[]).includes(Number(option.value)); },
+      settingsReset(settings) { s.optionsLoaded=false; populateSettings(); for (const [selector,key] of [["#ca-selected-chats","chat_selected_ids"],["#ca-excluded-chats","chat_excluded_ids"]]) for(const option of $(selector).options) option.selected=(settings[key]||[]).includes(Number(option.value)); window.ArchiveControls?.refresh($("#settings-form")); },
     };
   }
 };

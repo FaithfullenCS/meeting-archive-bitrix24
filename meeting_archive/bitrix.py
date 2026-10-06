@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import time
+from email.utils import parsedate_to_datetime
 from urllib.parse import unquote, urljoin, urlsplit
 
 import httpx
@@ -23,10 +24,11 @@ def oauth_scopes(value) -> set[str]:
 
 
 class BitrixError(RuntimeError):
-    def __init__(self, message: str, *, auth=False, retryable=False, code=""):
+    def __init__(self, message: str, *, auth=False, retryable=False, code="", retry_at=0):
         super().__init__(message)
         self.auth, self.retryable = auth, retryable
         self.code = code.upper()
+        self.retry_at = retry_at
 
 
 class BitrixClient:
@@ -34,6 +36,12 @@ class BitrixClient:
         self.settings, self.vault = settings, vault
         self.http = httpx.AsyncClient(timeout=httpx.Timeout(60, connect=15), transport=transport, follow_redirects=False)
         self.refresh_lock = asyncio.Lock()
+        # A single gate is shared by meetings, chats and copied file clients.
+        # Stay below the ordinary cloud's sustainable 2 HTTP requests/second.
+        self.request_lock = asyncio.Lock()
+        self.request_budget = {"next_at": 0.0, "blocked_until": 0.0, "failures": 0}
+        self.method_budget = {}
+        self.request_interval = 1.0
 
     async def close(self):
         await self.http.aclose()
@@ -81,11 +89,11 @@ class BitrixClient:
 
     @staticmethod
     def _response(response: httpx.Response) -> dict:
-        if response.status_code == 429:
-            raise BitrixError("Ограничение частоты Bitrix24. Повторим позже", retryable=True)
         try:
             data = response.json()
         except ValueError as exc:
+            if response.status_code == 429:
+                raise BitrixError("Ограничение частоты Bitrix24. Повторим позже", retryable=True, code="RATE_LIMITED") from exc
             raise BitrixError("Bitrix24 вернул ответ без JSON", retryable=response.status_code >= 500) from exc
         if not isinstance(data, dict):
             raise BitrixError("Bitrix24 вернул неизвестный формат JSON. Ответ не считается пустым",
@@ -104,7 +112,7 @@ class BitrixClient:
                 raise BitrixError(f"Bitrix24 не предоставил право call этому подключению ({code}). Сохраните права приложения и выполните новый вход", auth=True)
             raise BitrixError(f"Bitrix24: {code}. Проверьте доступ и права приложения" if auth else f"Bitrix24: {code}", auth=auth, retryable=retry, code=code)
         if response.status_code >= 400:
-            raise BitrixError(f"Bitrix24: HTTP {response.status_code}", auth=response.status_code in (401, 403), retryable=response.status_code >= 500)
+            raise BitrixError(f"Bitrix24: HTTP {response.status_code}", auth=response.status_code in (401, 403), retryable=response.status_code >= 500 or response.status_code == 429, code="RATE_LIMITED" if response.status_code == 429 else "")
         return data
 
     async def token(self, force=False, failed_token: str = "") -> str:
@@ -126,6 +134,63 @@ class BitrixClient:
                 secrets = self.vault.read()
             return secrets["access_token"]
 
+    @staticmethod
+    def retry_after(response):
+        value = response.headers.get("Retry-After", "")
+        try:
+            return max(0.0, float(value))
+        except ValueError:
+            try:
+                return max(0.0, parsedate_to_datetime(value).timestamp() - time.time())
+            except (ValueError, TypeError, OverflowError):
+                return 0.0
+
+    async def rest_request(self, method, url, payload):
+        """One paced HTTP request; long cooldowns return to the durable queue."""
+        async with self.request_lock:
+            budget = self.method_budget.setdefault(method, {"until": 0.0, "reset_at": 0.0})
+            until = max(budget["until"], self.request_budget["blocked_until"])
+            if until > time.time():
+                raise BitrixError("Bitrix24: ожидается безопасный повтор после ограничения нагрузки", retryable=True,
+                                  code="RATE_LIMITED", retry_at=until)
+            delay = max(0.0, self.request_budget["next_at"] - time.monotonic())
+            if delay:
+                await asyncio.sleep(delay)
+                until = max(budget["until"], self.request_budget["blocked_until"])
+                if until > time.time():
+                    raise BitrixError("Bitrix24: ожидается безопасный повтор после ограничения нагрузки", retryable=True,
+                                      code="RATE_LIMITED", retry_at=until)
+            self.request_budget["next_at"] = time.monotonic() + self.request_interval
+        # Pace starts without holding the gate through network latency: this
+        # preserves concurrent OAuth refresh guards and fair request admission.
+        response = await self.http.post(url, json=payload)
+        try:
+            data = self._response(response)
+        except BitrixError as exc:
+            if exc.code in {"QUERY_LIMIT_EXCEEDED", "RATE_LIMITED", "OPERATION_TIME_LIMIT"}:
+                if exc.code == "OPERATION_TIME_LIMIT":
+                    budget["until"] = max(time.time() + max(60, self.retry_after(response)), budget["reset_at"])
+                    exc.retry_at = budget["until"]
+                else:
+                    self.request_budget["failures"] += 1
+                    seconds = max(self.retry_after(response), min(60, 2 ** min(6, self.request_budget["failures"])))
+                    self.request_budget["blocked_until"] = time.time() + seconds
+                    exc.retry_at = self.request_budget["blocked_until"]
+            raise
+        self.request_budget["failures"] = 0
+        metrics = data.get("time") or {}
+        if isinstance(metrics, dict):
+            try:
+                reset = float(metrics.get("operating_reset_at", 0))
+                operating = float(metrics.get("operating", 0))
+            except (TypeError, ValueError):
+                reset, operating = 0, 0
+            budget["reset_at"] = reset
+            # This is our conservative soft budget, not a claimed vendor
+            # threshold (the actual cloud threshold is configurable).
+            budget["until"] = reset if operating >= 240 and reset > time.time() else 0.0
+        return data
+
     async def call(self, method: str, params: dict, *, v3=True) -> dict:
         portal = portal_domain(self.settings.portal)
         if self.settings.auth_mode == "webhook":
@@ -143,7 +208,7 @@ class BitrixClient:
             payload = {**params, "auth": await self.token()}
         for attempt in range(2):
             try:
-                data = self._response(await self.http.post(url, json=payload))
+                data = await self.rest_request(method, url, payload)
                 return data.get("result", data)
             except BitrixError as exc:
                 recoverable = exc.code in {"EXPIRED_TOKEN", "INVALID_TOKEN", "NO_AUTH_FOUND"} or (

@@ -70,7 +70,7 @@ class Settings:
     chat_selected_ids: list[int] = field(default_factory=list)
     chat_excluded_ids: list[int] = field(default_factory=list)
     chat_history_since: str = ""
-    chat_poll_seconds: int = 60
+    chat_poll_seconds: int = 300
     chat_events: bool = False
     chat_download_images: bool = False
     chat_download_documents: bool = False
@@ -121,6 +121,10 @@ class Settings:
         path = home / "settings.json"
         data = json.loads(path.read_text("utf-8")) if path.exists() else {}
         result = cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+        # Earlier chat settings allowed overlap and exclusions took precedence.
+        # Preserve that effective scope while migrating to disjoint pickers.
+        result.chat_excluded_ids = sorted(set(result.chat_excluded_ids))
+        result.chat_selected_ids = sorted(set(result.chat_selected_ids) - set(result.chat_excluded_ids))
         if result.auto_local:
             result.auto_download_audio = True
         if not result.archive_root:

@@ -49,7 +49,10 @@
     trash: '<path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7"/>', undo: '<path d="M3 10h10a6 6 0 0 1 0 12M3 10l5-5M3 10l5 5"/>',
     external: '<path d="M14 3h7v7M10 14 21 3M21 14v7H3V3h7"/>', link: '<path d="m10 13 4-4M8 16l-2 2a4 4 0 0 1-6-6l5-5a4 4 0 0 1 6 0M16 8l2-2a4 4 0 0 1 6 6l-5 5a4 4 0 0 1-6 0"/>',
     clock: '<circle cx="12" cy="12" r="9"/><path d="M12 6v6l4 2"/>', alert: '<path d="m12 3 10 18H2zM12 9v4M12 17h.01"/>', calendar: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M7 3v4M17 3v4M3 10h18"/>',
-    archive: '<rect x="3" y="3" width="18" height="5" rx="1"/><path d="M5 8v13h14V8M9 12h6"/>', cpu: '<rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/>'
+    archive: '<rect x="3" y="3" width="18" height="5" rx="1"/><path d="M5 8v13h14V8M9 12h6"/>', cpu: '<rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/>',
+    bell: '<path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4M12 2v2"/>',
+    database: '<ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 4 16 4 16 0V5M4 12c0 4 16 4 16 0"/>',
+    gear: '<path d="m9 3 1 2h4l1-2 3 2-1 2 2 3 2 1v3l-2 1-2 3 1 2-3 2-1-2h-4l-1 2-3-2 1-2-2-3-2-1v-3l2-1 2-3-1-2z"/><circle cx="12" cy="12.5" r="3"/>'
   };
   const icon = name => `<svg class="ui-icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${iconPaths[name] || iconPaths.check}</svg>`;
   function decorateButton(button, name) { if (button) button.innerHTML = `${icon(name)}<span>${escapeHtml(button.textContent.trim())}</span>`; }
@@ -397,6 +400,7 @@
     state.settingsReady = true; state.settingsDirty = false;
     fillSchedules(settings);
     caUI.settingsReset(settings);
+    window.ArchiveControls?.refresh(document);
     $("#settings-status").textContent = "Настройки сохранены.";
     $(".settings-footer").classList.remove("dirty");
     updateCpuAcknowledgement();
@@ -416,6 +420,7 @@
     state.bootstrap = data; state.csrf = data.csrf || state.csrf;
     updateDownloadButtons();
     const settings = data.settings || {};
+    if (data.chat_archive && $("#nav-chat-total")) $("#nav-chat-total").textContent = Number(data.chat_archive.count || 0).toLocaleString("ru");
     updateSettingsForm(settings); renderDesktopSettings(data);
     const isConnected = connected();
     $("#connection-dot").classList.toggle("connected", isConnected);
@@ -1169,6 +1174,8 @@
   window.addEventListener("beforeunload", event => { if (state.settingsDirty) { event.preventDefault(); event.returnValue = ""; } });
   document.addEventListener("visibilitychange", () => { if (!document.hidden) bootstrap(); });
   const caUI = window.ChatArchiveUI.create({api, icon, escapeHtml, dateString, notify, action, getSettings: () => state.bootstrap?.settings || {}});
+  window.ArchiveControls?.init(document, {icon});
+  window.ArchiveControls?.dateRange($("#ca-period-control"), {from: $("#ca-filters").elements.date_from, to: $("#ca-filters").elements.date_to, label: "Период сообщений", icon});
   decorateStaticIcons(); renderParticipants(); renderCalendar(); applyRoute();
 
   function renderDesktopSettings(data) {

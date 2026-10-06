@@ -35,7 +35,7 @@ def main() -> None:
 
     root = Path(__file__).resolve().parents[1]
     package = root / "meeting_archive"
-    for relative in ("launcher.py", "static/index.html", "static/app.js", "static/styles.css", "static/chat-archive.js", "static/chat-archive.css", "worker/entry.py",
+    for relative in ("launcher.py", "static/index.html", "static/app.js", "static/styles.css", "static/chat-archive.js", "static/chat-archive.css", "static/archive-controls.js", "static/archive-controls.css", "worker/entry.py",
                      "resources/worker-cpu.lock", "resources/worker-cuda.lock", "resources/worker-cuda126.lock"):
         if not (package / relative).is_file():
             raise SystemExit(f"Missing build input: {relative}")
@@ -88,7 +88,7 @@ def main() -> None:
         (distribution / "Данные" / name).mkdir(parents=True, exist_ok=True)
     for relative in ("meeting_archive/resources/uv.exe", "meeting_archive/worker/entry.py",
                      "meeting_archive/static/index.html", "meeting_archive/static/app.js",
-                     "meeting_archive/static/styles.css", "meeting_archive/static/chat-archive.js", "meeting_archive/static/chat-archive.css", "meeting_archive/resources/worker-cuda.lock",
+                     "meeting_archive/static/styles.css", "meeting_archive/static/chat-archive.js", "meeting_archive/static/chat-archive.css", "meeting_archive/static/archive-controls.js", "meeting_archive/static/archive-controls.css", "meeting_archive/resources/worker-cuda.lock",
                      "meeting_archive/resources/worker-cuda126.lock", "meeting_archive/resources/MicrosoftEdgeWebview2Setup.exe"):
         if not (distribution / "_internal" / relative).is_file():
             raise SystemExit(f"Packaged input missing: {relative}")

@@ -87,6 +87,7 @@ async def test_expired_oauth_rotates_refresh_token_once_for_concurrent_requests(
 
     client = BitrixClient(settings, vault, transport=httpx.MockTransport(handler))
     try:
+        client.request_interval = 0  # Isolate token rotation from HTTP pacing.
         profiles = await asyncio.wait_for(asyncio.gather(client.profile(), client.profile()), timeout=2)
         assert profiles == [{"ID": "41"}, {"ID": "41"}]
     finally:
@@ -255,3 +256,43 @@ def test_recording_url_rejects_unsafe_hosts(settings, vault, url):
             client.safe_download_url(url)
     finally:
         asyncio.run(client.close())
+
+
+@pytest.mark.asyncio
+async def test_common_pacing_retry_after_and_method_budget(settings, vault, monkeypatch):
+    import copy
+    clock = [100.0]
+    starts = []
+    responses = [httpx.Response(200, json={"result": {}}),
+                 httpx.Response(503, headers={"Retry-After": "90"}, json={"error": "QUERY_LIMIT_EXCEEDED"}),
+                 httpx.Response(200, json={"result": {}, "time": {"operating": 250, "operating_reset_at": time.time() + 300}})]
+    async def sleep(seconds):
+        clock[0] += seconds
+    def handler(request):
+        starts.append(clock[0])
+        return responses.pop(0)
+    monkeypatch.setattr("meeting_archive.bitrix.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("meeting_archive.bitrix.asyncio.sleep", sleep)
+    client = BitrixClient(settings, vault, transport=httpx.MockTransport(handler))
+    try:
+        await client.call("im.recent.list", {}, v3=False)
+        copied = copy.copy(client)
+        with pytest.raises(BitrixError) as limited:
+            await copied.call("call.followup.list", {})
+        assert starts == [100.0, 101.0] and limited.value.retry_at >= time.time() + 89
+        with pytest.raises(BitrixError):
+            await client.call("im.recent.list", {}, v3=False)
+        assert len(starts) == 2  # Common portal cooldown blocks all request lanes.
+        client.request_budget["blocked_until"] = 0
+        await client.call("im.dialog.messages.search", {}, v3=False)
+        with pytest.raises(BitrixError) as operating:
+            await copied.call("im.dialog.messages.search", {}, v3=False)
+        assert operating.value.retry_at >= time.time() + 299 and len(starts) == 3
+    finally:
+        await client.close()
+
+
+def test_operation_limit_keeps_structured_error_code():
+    with pytest.raises(BitrixError) as error:
+        BitrixClient._response(httpx.Response(429, json={"error": "OPERATION_TIME_LIMIT"}))
+    assert error.value.code == "OPERATION_TIME_LIMIT" and error.value.retryable

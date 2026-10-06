@@ -36,7 +36,7 @@ def chat_service(tmp_path, settings, vault):
 
 def seed(service, id=101):
     store = service.chat_archive.store()
-    store.upsert_chat(id, f"chat{id}", title="Синтетическая беседа", participants=[{"id": 42, "name": "Участник"}])
+    store.upsert_chat(id, f"chat{id}", title="Синтетическая беседа", participants=[{"id": 42, "name": "Участник"}], participants_at=time.time())
     return store
 
 
@@ -112,6 +112,10 @@ async def test_latest_pages_all_chats_before_history_and_idempotent_backfill(cha
         return {"messages": [message(i,id) for i in range(min(430,before-1),max(0,min(430,before-1)-200),-1)]}
     service.client.call = call
     service.chat_archive.request_discovery()
+    await service.chat_archive.step()
+    store = service.chat_archive.store()
+    assert store.summary()["count"] == 2 and not store.query()["total"]
+    service.chat_archive.request_history([101, 102])
     for _ in range(12):
         await service.chat_archive.step()
     searches = [params for method,params in calls if method == "im.dialog.messages.search"]
@@ -406,7 +410,7 @@ async def test_event_enable_before_connection_applies_only_to_first_account(chat
     service.settings.user_id=43
     calls.clear()
     await service.chat_archive.step()
-    assert not calls and not service.db.get_state("chat_events:pending_consent")
+    assert not any(method.startswith("im.v2.Event") for method in calls) and not service.db.get_state("chat_events:pending_consent")
 
 
 async def test_recovered_automatic_file_keeps_download_policy(chat_service):
@@ -428,3 +432,174 @@ async def test_recovered_automatic_file_keeps_download_policy(chat_service):
     service.client.call=forbidden
     await service.chat_archive.file_step()
     assert store.file(101,77)["state"]=="queued"
+
+
+async def test_inventory_baseline_new_chats_and_existing_cutoff(chat_service):
+    service = chat_service
+    service.settings.chat_auto_save = True
+    service.settings.chat_history_since = "2099-01-01"  # Legacy hidden date cannot clip the new policy.
+    round = 0
+    calls = []
+    future = (datetime.now(timezone.utc) + timedelta(seconds=2)).isoformat()
+    async def call(method, params, **kwargs):
+        calls.append((method, dict(params)))
+        if method == "im.recent.list":
+            ids = [101] if round == 0 else [101, 102]
+            return {"items": [{"id": id, "chat_id": id, "type": "chat"} for id in ids], "hasMore": False}
+        if method == "im.dialog.messages.search":
+            id = params["CHAT_ID"]
+            return {"messages": [message(3, id, date=future), message(2, id), message(1, id)]}
+        return {"id": 101} if method == "im.dialog.get" else []
+    service.client.call = call
+    await service.chat_archive.step()
+    store = service.chat_archive.store()
+    assert store.state("inventory_ready") and not store.chat(101).get("auto_history")
+    assert store.query(chat=101)["total"] == 1 and store.message(101, 3)
+    round = 1
+    service.chat_archive.request_discovery()
+    for _ in range(8):
+        await service.chat_archive.step()
+    assert store.chat(102)["auto_history"] and store.chat(102)["history_complete"]
+    assert not store.chat(102)["history_since"]
+    assert store.query(chat=102)["total"] == 3 and store.query(chat=101)["total"] == 1
+    assert all(params.get("DATE_FROM") for method, params in calls if method == "im.dialog.messages.search" and params["CHAT_ID"] == 101)
+    assert all(not params.get("DATE_FROM") for method, params in calls if method == "im.dialog.messages.search" and params["CHAT_ID"] == 102)
+
+
+async def test_short_inventory_pages_restart_and_no_implicit_history(chat_service):
+    service = chat_service
+    offsets = []
+    async def call(method, params, **kwargs):
+        if method == "im.recent.list":
+            offsets.append(params["OFFSET"])
+            return {"items": [{"id": 101, "chat_id": 101, "type": "chat"}], "hasMore": params["OFFSET"] == 0}
+        return {}  # No content calls are permitted while collection is disabled.
+    service.client.call = call
+    await service.chat_archive.step()
+    service.chat_archive.request_discovery()  # UI refresh must not reset page1.
+    await service.chat_archive.step()
+    store = service.chat_archive.store()
+    assert offsets == [0, 200] and store.summary()["count"] == 1 and not store.query()["total"]
+    assert not service.db.rows("SELECT * FROM ca_work WHERE kind IN ('new','history')")
+
+
+async def test_upgrade_keeps_manual_history_cancels_old_automatic(chat_service):
+    service = chat_service
+    store = seed(service)
+    store.upsert_chat(102, "chat102", participants_at=time.time())
+    store.enqueue(101, "history", {"automatic": True})
+    store.enqueue(102, "history", {"automatic": False})
+    async def call(method, params, **kwargs):
+        return {"items": [], "hasMore": False} if method == "im.recent.list" else {"messages": [message(1, params["CHAT_ID"])]}
+    service.client.call = call
+    for _ in range(4):
+        await service.chat_archive.step()
+    assert not store.query(chat=101)["total"] and store.query(chat=102)["total"] == 1
+    assert store.state("collection_policy") == 2
+
+
+async def test_manual_history_download_types_and_explicit_size_limit(chat_service):
+    service = chat_service
+    store = seed(service)
+    service.settings.chat_download_documents = True
+    service.settings.chat_max_file_mb = 1
+    service.settings.chat_excluded_ids = [101]  # Manual choices are independent.
+    async def call(method, params, **kwargs):
+        if method == "im.recent.list":
+            return {"items": [], "hasMore": False}
+        return {"messages": [message(1, fileIds=[77, 78])], "files": [
+            {"id": 77, "name": "small.txt", "size": 9}, {"id": 78, "name": "large.pdf", "size": 2 * 1024**2}]}
+    service.client.call = call
+    service.chat_archive.request_history([101])
+    await service.chat_archive.step()
+    assert store.message(101, 1) and store.file(101, 77)["state"] == "queued"
+    assert store.file(101, 77)["download_origin"] == "manual_collection"
+    assert store.file(101, 78)["state"] == "size_limited" and "Текст сохранён" in store.file(101, 78)["error"]
+    service.chat_archive.queue_file(store, 101, 78)
+    assert store.file(101, 78)["state"] == "queued" and not store.file(101, 78)["automatic"]
+
+
+async def test_audit_only_existing_messages_and_multiple_people_filters(chat_service):
+    service = chat_service
+    store = seed(service)
+    store.update_chat(101, participants=[{"id": 42, "name": "Участник"}, {"id": 7, "name": "Другой"}])
+    store.save_page(101, {"messages": [message(2, author_id=7)]})
+    store.enqueue(101, "audit", {"cursor": 0})
+    async def call(method, params, **kwargs):
+        return {"items": [], "hasMore": False} if method == "im.recent.list" else {"messages": [message(2, author_id=7, text="Правка"), message(1)]}
+    service.client.call = call
+    for _ in range(3):
+        await service.chat_archive.step()
+    assert store.query()["total"] == 1 and len(store.versions(101, 2)) == 1
+    assert store.query(author="7,42", participant="7,42")["total"] == 1
+    assert store.query(author="8,9", participant="7,42")["total"] == 0
+
+
+def test_chat_settings_disjoint_selection_and_default_poll(chat_service):
+    from meeting_archive.chat_sync import validate_chat_settings
+    from meeting_archive.settings import Settings
+    assert Settings().chat_poll_seconds == 300
+    with pytest.raises(ValueError, match="одновременно"):
+        validate_chat_settings({"chat_selected_ids": [101], "chat_excluded_ids": [101]}, chat_service.settings, chat_service.home)
+
+
+async def test_event_new_chat_history_and_disabled_collection_no_content(chat_service):
+    service = chat_service
+    store = seed(service)
+    store.set_state("inventory_ready", True)
+    event = {"eventId": 1, "type": "ONIMV2MESSAGEADD", "data": {"chat": {"id": 102}, "message": message(1, 102, text="Synthetic unsaved")}}
+    async def call(method, params, **kwargs):
+        return {"events": [event], "nextOffset": event["eventId"] + 1} if method == "im.v2.Event.get" else True
+    service.client.call = call
+    await service.chat_archive.events(store)
+    assert not store.query(chat=102)["total"] and "Synthetic unsaved" not in (store.folder / "events.jsonl").read_text("utf-8")
+    service.settings.chat_auto_save = True
+    event.update(eventId=2, data={"chat": {"id": 103}, "message": message(1, 103)})
+    await service.chat_archive.events(store)
+    assert store.chat(103)["auto_history"] and store.query(chat=103)["total"] == 1
+    assert service.db.rows("SELECT kind FROM ca_work WHERE account=? AND chat=? AND kind='history'", (store.account, 103))
+
+
+async def test_metadata_limit_retains_work_and_manual_request_takes_priority(chat_service):
+    service = chat_service
+    store = seed(service)
+    store.set_state("collection_policy", 2)
+    store.set_state("last_discovery", time.time())
+    store.enqueue(101, "metadata", {}, 4)
+    store.upsert_chat(102, "chat102", participants_at=time.time())
+    service.chat_archive.request_history([102])
+    reset = time.time() + 180
+    async def call(method, params, **kwargs):
+        if method == "im.dialog.messages.search":
+            return {"messages": [message(1, 102)]}
+        raise BitrixError("Synthetic limit", code="OPERATION_TIME_LIMIT", retryable=True, retry_at=reset)
+    service.client.call = call
+    await service.chat_archive.step()
+    assert store.query(chat=102)["total"] == 1
+    await service.chat_archive.step()
+    row = service.db.rows("SELECT next_at FROM ca_work WHERE account=? AND chat=? AND kind='metadata'", (store.account, 101))[0]
+    assert row["next_at"] == reset and store.chat(101)["participants_at"] < reset
+
+
+async def test_attachment_history_opt_in_downloads_with_text_automation_off(chat_service):
+    service = chat_service
+    store = seed(service)
+    store.save_page(101, {"messages": [message(1, fileIds=[77])], "files": [{"id": 77, "name": "old.txt", "size": 14}]})
+    old = replace(service.settings)
+    service.settings.chat_download_documents = service.settings.chat_download_history = True
+    await service.chat_archive.settings_changed(old)
+    assert store.file(101, 77)["state"] == "queued" and store.file(101, 77)["download_origin"] == "history_opt_in"
+    async def call(method, params, **kwargs):
+        return {"downloadUrl": "https://synthetic.bitrix24.ru/old.txt"}
+    service.client.call = call
+    await service.chat_archive.file_step()
+    assert store.file(101, 77)["state"] == "saved"
+
+
+def test_legacy_overlap_migrates_with_exclusion_precedence(chat_service):
+    from meeting_archive.settings import Settings
+    chat_service.settings.chat_selected_ids = [101, 102, 101]
+    chat_service.settings.chat_excluded_ids = [101, 101]
+    chat_service.settings.save(chat_service.home)
+    migrated = Settings.load(chat_service.home)
+    assert migrated.chat_selected_ids == [102] and migrated.chat_excluded_ids == [101]

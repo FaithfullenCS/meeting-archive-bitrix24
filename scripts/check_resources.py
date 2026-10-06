@@ -19,7 +19,7 @@ def main():
     assert (root / "static/index.html").is_file()
     assert (root / "static/app.js").is_file()
     assert (root / "static/styles.css").is_file()
-    for name in ("chat-archive.js", "chat-archive.css"):
+    for name in ("chat-archive.js", "chat-archive.css", "archive-controls.js", "archive-controls.css"):
         assert (root / "static" / name).is_file()
     assert (root / "static/icon.png").is_file()
     assert (root / "static/icon.svg").is_file()

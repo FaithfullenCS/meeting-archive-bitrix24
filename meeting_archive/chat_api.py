@@ -15,29 +15,33 @@ def register_chat_api(app, service):
     engine = service.chat_archive
 
     @app.get("/api/chat-archive")
-    async def catalogue(q: str = "", type: str = "", participant: int = 0, coverage: str = ""):
+    async def catalogue(q: str = "", type: str = "", participant: str = "", coverage: str = ""):
         store = engine.store()
         if service.connected() and store.account not in engine.recovered:
             async with engine.lock:
                 await asyncio.to_thread(store.recover)
                 engine.recovered.add(store.account)
+        if service.connected() and not store.state("last_discovery"):
+            engine.request_discovery(False)
+        participants = {positive(i) for i in participant.split(",")} - {0}
         items = store.chats()
         items = [c for c in items if (not q or q.casefold() in c["title"].casefold() or q == str(c["id"])) and
                  (not type or c["type"] == type) and (not coverage or c["coverage"] == coverage) and
-                 (not participant or any(p["id"] == participant for p in c.get("participants", [])))]
+                 (not participants or participants.issubset({p["id"] for p in c.get("participants", [])}))]
+        previews = {r["id"]: r["preview"] for r in service.db.rows("SELECT c.id,(SELECT text FROM ca_messages m WHERE m.account=c.account AND m.chat=c.id ORDER BY date DESC,id DESC LIMIT 1) AS preview FROM ca_chats c WHERE c.account=?", (store.account,))}
         for item in items:
-            last = service.db.rows("SELECT data FROM ca_messages WHERE account=? AND chat=? ORDER BY date DESC,id DESC LIMIT 1", (store.account, item["id"]))
-            item["preview"] = json.loads(last[0]["data"])["text"][:160] if last else "Сообщения ещё не сохранены"
+            item["preview"] = (previews.get(item["id"]) or "Сообщения ещё не сохранены")[:160]
         return {"items": sorted(items, key=lambda c: c["count"]["last"] or "", reverse=True), "account": store.account,
+                **store.summary(), "total": len(items), "poll_seconds": service.settings.chat_poll_seconds,
                 "connected": service.connected(), "error": engine.error, "active": engine.active,
                 "auto_save": service.settings.chat_auto_save, "events_error": store.state("event_error", ""),
-                "events_status": ("Отключено" if not service.settings.chat_events else "Ожидается подключение аккаунта" if not service.connected() else "Подписка разрешена для этого аккаунта" if service.db.get_state(f"chat_events:{store.portal}:{store.user_id}:consent") or service.db.get_state("chat_events:pending_consent") else "Для этого аккаунта подписка не разрешена. Выключите и включите отслеживание правок, затем сохраните настройки."),
-                "discovery": "Последние диалоги, известные чаты и добавленные вручную. Скрытые ветки могут отсутствовать."}
+                "events_status": ("Отключено" if not service.settings.chat_events else "Ожидается подключение аккаунта" if not service.connected() else "Быстрое получение правок и удалений разрешено для этого аккаунта" if service.db.get_state(f"chat_events:{store.portal}:{store.user_id}:consent") or service.db.get_state("chat_events:pending_consent") else "Для этого аккаунта режим ещё не разрешён. Выключите и включите сохранение правок, затем сохраните настройки."),
+                "discovery": "Последние диалоги и известные приложению чаты. Скрытые ветки могут отсутствовать."}
 
     @app.get("/api/chat-archive/messages")
-    async def messages(chat: int = 0, q: str = "", date_from: str = "", date_to: str = "", author: int = 0,
+    async def messages(chat: int = 0, q: str = "", date_from: str = "", date_to: str = "", author: str = "",
                        direction: str = "", kind: str = "", attachment: str = "", file_state: str = "",
-                       system: str = "", type: str = "", participant: int = 0, coverage: str = "", around: int = 0, offset: int = 0, limit: int = 50):
+                       system: str = "", type: str = "", participant: str = "", coverage: str = "", around: int = 0, offset: int = 0, limit: int = 50):
         store = engine.store()
         if chat:
             store.chat(chat)
