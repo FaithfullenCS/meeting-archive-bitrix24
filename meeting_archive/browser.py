@@ -89,6 +89,8 @@ class ArchiveWindow:
 
     def run(self, url, *, started=None, webview=None):
         if webview is None:
+            from .desktop_runtime import prepare_clr_runtime
+            prepare_clr_runtime()
             import webview
         webview.settings.update(ALLOW_DOWNLOADS=True, ALLOW_FILE_URLS=False,
                                 OPEN_EXTERNAL_LINKS_IN_BROWSER=True, OPEN_DEVTOOLS_IN_DEBUG=False)

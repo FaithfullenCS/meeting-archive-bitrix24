@@ -48,10 +48,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build standalone Windows app
         run: .venv/Scripts/python.exe -X utf8 scripts/build_windows.py
+      - name: Verify Internet-marked CLR libraries without system Python on PATH
+        run: .venv/Scripts/python.exe -X utf8 scripts/smoke_downloaded_runtime.py
       - name: Smoke test packaged executable and local server
         run: .venv/Scripts/python.exe -X utf8 scripts/smoke_windows.py
       - name: Verify program update, activation, preservation and rollback
         run: .venv/Scripts/python.exe -X utf8 scripts/smoke_updates.py
+      - name: Mark desktop libraries before actual GUI acceptance
+        run: .venv/Scripts/python.exe -X utf8 scripts/smoke_downloaded_runtime.py --mark-only
       - name: Verify real embedded window, tray and single instance
         run: .venv/Scripts/python.exe -X utf8 scripts/smoke_desktop.py
       - name: Verify tray-only Windows autostart and first window activation

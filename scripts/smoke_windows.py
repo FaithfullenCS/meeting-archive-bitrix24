@@ -44,7 +44,7 @@ def main():
     with socket.socket() as probe:
         if probe.connect_ex(("127.0.0.1", 8765)) == 0:
             raise SystemExit("Port 8765 is occupied. This check will not touch another application.")
-    launch_arguments = [str(executable), "--no-browser", "--home", str(home)]
+    launch_arguments = [str(executable), "--no-browser", "--no-windows-registration", "--home", str(home)]
     if not args.tray:
         launch_arguments.append("--no-tray")
     environment = os.environ.copy()

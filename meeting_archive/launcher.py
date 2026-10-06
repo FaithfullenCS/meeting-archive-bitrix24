@@ -38,9 +38,12 @@ def self_test():
     from .notifications import APP_ID
     assert XmlDocument and ToastNotification
     assert isinstance(ToastNotificationManager.create_toast_notifier_with_id(APP_ID), ToastNotifier)
+    from .desktop_runtime import prepare_clr_runtime
+    prepare_clr_runtime()
     import webview
+    from webview.platforms import winforms
     from .webview_runtime import verify_bootstrapper
-    assert webview
+    assert webview and winforms
     verify_bootstrapper(package / "resources/MicrosoftEdgeWebview2Setup.exe")
     if getattr(sys, "frozen", False):
         from .webview_runtime import execution_level
@@ -75,6 +78,7 @@ def main():
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument("--no-tray", action="store_true")
+    parser.add_argument("--no-windows-registration", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--home", type=Path)
     parser.add_argument("--activate")
     parser.add_argument("--desktop-smoke", action="store_true", help=argparse.SUPPRESS)
@@ -140,7 +144,7 @@ def main():
         from .browser import configure_window, close_browser
         from .notifications import register_windows
         try:
-            if not args.no_tray and not args.desktop_smoke:
+            if not args.no_tray and not args.desktop_smoke and not args.no_windows_registration:
                 register_windows(home)
         except OSError as exc:
             service.notifications.error = str(exc)

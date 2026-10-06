@@ -80,6 +80,10 @@ def main() -> None:
     if source_hashes(root) != inputs:
         raise SystemExit("Source files changed during the build. Build again from stable inputs.")
     distribution = root / "dist" / "MeetingArchive"
+    from meeting_archive.desktop_runtime import CLR_DLLS
+    for relative in CLR_DLLS:
+        if not (distribution / relative).is_file():
+            raise SystemExit(f"Packaged desktop DLL missing: {relative}")
     for name in ("Совещания", "Входящие записи"):
         (distribution / "Данные" / name).mkdir(parents=True, exist_ok=True)
     for relative in ("meeting_archive/resources/uv.exe", "meeting_archive/worker/entry.py",

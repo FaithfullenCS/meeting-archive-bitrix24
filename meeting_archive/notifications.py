@@ -29,6 +29,11 @@ def parse_activation(uri: str) -> dict:
 def register_windows(home):
     if os.name != "nt" or not getattr(sys, "frozen", False):
         return
+    from .settings import app_home
+    # A synthetic/custom --home must never replace the user's Start Menu
+    # shortcut, notification identity or protocol handler.
+    if Path(home).resolve() != app_home().resolve():
+        return
     import winreg
     command = subprocess.list2cmdline([sys.executable, "--home", str(home), "--activate"]) + ' "%1"'
     values = {

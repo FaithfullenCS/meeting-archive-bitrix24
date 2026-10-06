@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import zipfile
 
 import httpx
@@ -84,6 +85,19 @@ def test_activation_rejects_arbitrary_input(uri):
 def test_activation_routes():
     assert parse_activation("meetingarchive:meeting/15") == {"route": "meeting", "ids": [15]}
     assert parse_activation("meetingarchive:jobs/2,3")["ids"] == [2, 3]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows registration")
+def test_synthetic_frozen_profile_cannot_replace_windows_registration(tmp_path, monkeypatch):
+    import sys
+    import winreg
+    from meeting_archive import notifications, settings, desktop_shortcut
+    real_home = tmp_path / "real-profile"
+    monkeypatch.setattr(settings, "app_home", lambda: real_home)
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(winreg, "CreateKey", lambda *args: pytest.fail("Synthetic profile touched Windows registry"))
+    monkeypatch.setattr(desktop_shortcut, "notification_shortcut", lambda *args: pytest.fail("Synthetic profile replaced Start Menu shortcut"))
+    notifications.register_windows(tmp_path / "synthetic-profile")
 
 
 async def test_notification_delivery_failure_isolated(service):
