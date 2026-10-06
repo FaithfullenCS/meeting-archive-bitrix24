@@ -17,6 +17,59 @@ from meeting_archive.chat_storage import ChatStore
 from meeting_archive.service import Service
 
 
+async def test_catalogue_orders_unsaved_chats_by_source_message_date(chat_service):
+    store = seed(chat_service)
+    store.update_chat(101, source_last_message_at="2026-09-18T10:00:00+03:00", source_last_message_id=5)
+    store.save_page(101, {"messages": [message(1, date="2026-10-01T00:00:00Z")]})
+    store.upsert_chat(102, "chat102", source_last_message_at="2026-09-18T10:00:00Z", source_last_message_id=6)
+    store.upsert_chat(103, "7", type="user", title="Демо: неактивный сотрудник", peer_active=False,
+                      source_last_message_at="2026-09-18T11:00:00+03:00", source_last_message_id=7)
+    app = create_app(chat_service, launch_token="synthetic-order", manage_lifecycle=False)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8765") as client:
+        await client.get("/?launch=synthetic-order")
+        items = (await client.get("/api/chat-archive")).json()["items"]
+    assert [item["id"] for item in items] == [102, 103, 101]
+    assert items[1]["peer_active"] is False and items[1]["count"]["n"] == 0
+
+
+async def test_extra_recent_keeps_inactive_dialog_without_saving_text(chat_service):
+    store = seed(chat_service)
+    store.update_chat(101, source_recent_seen_at=time.time(), source_last_message_at="2026-10-01T00:00:00Z")
+    async def call(method, params, **kwargs):
+        assert method == "im.recent.get"
+        assert params["SKIP_DIALOG"] == "N"
+        return [
+            {"id":"chat101", "chat_id":101, "type":"chat", "message":{"id":1,"date":"2020-01-01T00:00:00Z"}},
+            {"id":7,"chat_id":102,"type":"user","title":"Демо: бывший сотрудник", "user":{"active":False},
+             "message":{"id":10,"date":"2026-09-18T13:00:00+03:00","text":"Do not store this text"}},
+        ]
+    chat_service.client.call = call
+    await chat_service.chat_archive.extra_recent(store)
+    assert store.chat(102)["peer_active"] is False
+    assert store.chat(102)["source_last_message_at"] == "2026-09-18T10:00:00+00:00"
+    assert not store.chat(102)["auto_history"] and store.query(chat=102)["total"] == 0
+    assert store.chat(101)["source_last_message_at"] == "2026-10-01T00:00:00Z"
+    store.flush(102)
+    assert "Do not store" not in (store.chat_folder(102) / "chat.json").read_text("utf-8")
+    # Unchanged supplemental inventory is read no more than daily.
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("Repeated supplement must not call the portal")
+    chat_service.client.call = forbidden
+    await chat_service.chat_archive.extra_recent(store)
+
+
+async def test_unavailable_extra_list_preserves_primary_discovery(chat_service):
+    store = seed(chat_service)
+    async def call(method, params, **kwargs):
+        if method == "im.recent.get":
+            raise BitrixError("Method unavailable", code="METHOD_NOT_FOUND")
+        return {"items":[{"id":"chat102","chat_id":102,"type":"chat","message":{"id":5,"date":"2026-10-01T00:00:00Z"}}],"hasMore":False}
+    chat_service.client.call = call
+    await chat_service.chat_archive.discover(store, False)
+    assert store.state("inventory_ready") and store.chat(102)["source_last_message_id"] == 5
+    assert store.state("extra_recent_warning") and store.query(chat=102)["total"] == 0
+
+
 def message(id, chat=101, **values):
     return {"id": id, "chat_id": chat, "author_id": 42, "date": "2026-09-18T10:00:00+03:00", "text": f"Сообщение {id}", **values}
 
@@ -99,6 +152,8 @@ async def test_latest_pages_all_chats_before_history_and_idempotent_backfill(cha
     service, calls = chat_service, []
     async def call(method, params, **kwargs):
         calls.append((method, dict(params)))
+        if method == "im.recent.get":
+            return []
         if method == "im.recent.list":
             return {"items": [{"type":"chat", "id":101,"chat_id":101,"title":"Чат A"}, {"type":"chat","id":102,"chat_id":102,"title":"Чат B"}], "hasMore":False}
         if method == "im.dialog.get":
@@ -443,6 +498,8 @@ async def test_inventory_baseline_new_chats_and_existing_cutoff(chat_service):
     future = (datetime.now(timezone.utc) + timedelta(seconds=2)).isoformat()
     async def call(method, params, **kwargs):
         calls.append((method, dict(params)))
+        if method == "im.recent.get":
+            return []
         if method == "im.recent.list":
             ids = [101] if round == 0 else [101, 102]
             return {"items": [{"id": id, "chat_id": id, "type": "chat"} for id in ids], "hasMore": False}
@@ -470,6 +527,8 @@ async def test_short_inventory_pages_restart_and_no_implicit_history(chat_servic
     service = chat_service
     offsets = []
     async def call(method, params, **kwargs):
+        if method == "im.recent.get":
+            return []
         if method == "im.recent.list":
             offsets.append(params["OFFSET"])
             return {"items": [{"id": 101, "chat_id": 101, "type": "chat"}], "hasMore": params["OFFSET"] == 0}
@@ -490,6 +549,8 @@ async def test_upgrade_keeps_manual_history_cancels_old_automatic(chat_service):
     store.enqueue(101, "history", {"automatic": True})
     store.enqueue(102, "history", {"automatic": False})
     async def call(method, params, **kwargs):
+        if method == "im.recent.get":
+            return []
         return {"items": [], "hasMore": False} if method == "im.recent.list" else {"messages": [message(1, params["CHAT_ID"])]}
     service.client.call = call
     for _ in range(4):
@@ -505,6 +566,8 @@ async def test_manual_history_download_types_and_explicit_size_limit(chat_servic
     service.settings.chat_max_file_mb = 1
     service.settings.chat_excluded_ids = [101]  # Manual choices are independent.
     async def call(method, params, **kwargs):
+        if method == "im.recent.get":
+            return []
         if method == "im.recent.list":
             return {"items": [], "hasMore": False}
         return {"messages": [message(1, fileIds=[77, 78])], "files": [

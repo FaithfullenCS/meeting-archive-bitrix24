@@ -86,6 +86,55 @@ class ChatArchive:
         s = self.service.settings
         return id not in s.chat_excluded_ids and (s.chat_scope == "all" or id in s.chat_selected_ids)
 
+    @staticmethod
+    def recent_metadata(item):
+        message = item.get("message") if isinstance(item.get("message"), dict) else {}
+        user = item.get("user") if isinstance(item.get("user"), dict) else {}
+        values = {}
+        moment = instant(message.get("date") or item.get("date_last_activity") or item.get("date_update"))
+        if moment is not None:
+            values["source_last_message_at"] = datetime.fromtimestamp(moment, timezone.utc).isoformat()
+            values["source_last_message_id"] = positive(message.get("id"))
+        if item.get("type") == "user" and type(user.get("active")) is bool:
+            values["peer_active"] = user["active"]
+        return values
+
+    async def extra_recent(self, store):
+        """Read a second documented recent list; never enumerate staff or save text."""
+        if time.time() < store.state("extra_recent_at", 0) + 86400:
+            return
+        try:
+            page = await self.service.client.call("im.recent.get", {"SKIP_OPENLINES": "N", "SKIP_CHAT": "N", "SKIP_DIALOG": "N"}, v3=False)
+            if not isinstance(page, list):
+                raise ValueError("Дополнительный список чатов вернул неизвестный формат")
+            for item in page:
+                if not isinstance(item, dict):
+                    continue
+                id = positive(item.get("chat_id") or (item.get("chat") or {}).get("id"))
+                if not id:
+                    continue
+                existing = self.service.db.rows("SELECT id FROM ca_chats WHERE account=? AND id=?", (store.account, id))
+                values = self.recent_metadata(item)
+                # The paginated current list has authority if both lists expose it.
+                current = store.chat(id) if existing else {}
+                primary_fresh = current.get("source_recent_seen_at", 0) >= time.time() - self.service.settings.chat_poll_seconds
+                if primary_fresh:
+                    values.pop("source_last_message_at", None)
+                    values.pop("source_last_message_id", None)
+                if not existing:
+                    values["auto_history"] = False
+                store.upsert_chat(id, current["dialog"] if primary_fresh else str(item["id"]) if item.get("type") == "user" else f"chat{id}",
+                                  title=str(current["title"] if primary_fresh else item.get("title") or current.get("title") or f"Чат {id}"),
+                                  type=str(current["type"] if primary_fresh else item.get("type") or "chat"), **values)
+            store.set_state("extra_recent_warning", "")
+        except BitrixError as exc:
+            if exc.retryable:
+                raise
+            store.set_state("extra_recent_warning", "Дополнительный список недоступен; показаны последние и ранее известные чаты")
+        except ValueError:
+            store.set_state("extra_recent_warning", "Дополнительный список не предоставлен; полнота обнаружения не подтверждена")
+        store.set_state("extra_recent_at", time.time())
+
     def request_discovery(self, automatic=False):
         if not self.service.connected():
             raise ValueError("Сначала подключите Bitrix24 с правом im")
@@ -170,13 +219,17 @@ class ChatArchive:
             if id:
                 hint = item.get("user") if item.get("type") == "user" else item.get("chat")
                 hint = hint if isinstance(hint, dict) else {}
-                values = {"auto_history": bool(automatic and not baseline)} if id not in existing else {}
+                values = self.recent_metadata(item)
+                values["source_recent_seen_at"] = time.time()
+                if id not in existing:
+                    values["auto_history"] = bool(automatic and not baseline)
                 store.upsert_chat(id, dialog, title=str(item.get("title") or hint.get("name") or f"Чат {id}"), type=str(item.get("type") or "chat"), **values)
             elif re.fullmatch(r"(?:chat|sg)?[1-9]\d*", dialog):
                 chat = await self.add_dialog(store, dialog, item)
                 id = chat["id"]
                 if id not in existing:
                     store.update_chat(id, auto_history=bool(automatic and not baseline))
+                store.update_chat(id, **self.recent_metadata(item))
             if id:
                 self.schedule_chat(store, store.chat(id), automatic)
         # Only meetings whose participant list contains this account may seed chat IDs.
@@ -190,6 +243,8 @@ class ChatArchive:
                 dialog = str(peers.get(id) or f"chat{id}")
                 store.upsert_chat(id, dialog, title=str(metadata.get("chatTitle") or f"Чат {id}"), auto_history=bool(automatic and not baseline))
                 existing.add(id)
+        if not (page.get("hasMore") or page.get("hasMorePages")):
+            await self.extra_recent(store)
         for chat in store.chats():
             self.schedule_chat(store, chat, automatic)
         if page.get("hasMore") or page.get("hasMorePages"):
@@ -242,11 +297,14 @@ class ChatArchive:
                 members = await self.service.client.call("im.chat.user.list", {"CHAT_ID": chat["id"]}, v3=False)
                 if not isinstance(members, list) or any(not positive(id) for id in members):
                     raise ValueError("Источник не предоставил состав участников")
-                names = {}
+                names, activity = {}, {}
                 for offset in range(0, len(members), 100):
                     users = await self.service.client.call("im.user.list.get", {"ID": members[offset:offset+100], "RESULT_TYPE": "array"}, v3=False)
                     names.update({positive(u.get("id")): str(u.get("name") or "") for u in sequence(users) if isinstance(u, dict)})
-                store.update_chat(chat["id"], title=str(details.get("name") or chat["title"]), participants=[{"id":positive(id),"name":names.get(positive(id),"")} for id in members],
+                    activity.update({positive(u.get("id")): u["active"] for u in sequence(users) if isinstance(u, dict) and type(u.get("active")) is bool})
+                peer = positive(chat["dialog"]) if chat["type"] == "user" else 0
+                peer_state = {"peer_active": activity[peer]} if peer in activity else {}
+                store.update_chat(chat["id"], title=str(details.get("name") or names.get(peer) or chat["title"]), participants=[{"id":positive(id),"name":names.get(positive(id),""), **({"active":activity[positive(id)]} if positive(id) in activity else {})} for id in members], **peer_state,
                                   participants_at=time.time(), participants_warning="", parent_chat_id=positive(details.get("parent_chat_id")), parent_message_id=positive(details.get("parent_message_id")))
             except (BitrixError, httpx.HTTPError, ValueError, OSError) as exc:
                 if isinstance(exc, (httpx.HTTPError, OSError)) or isinstance(exc, BitrixError) and exc.retryable:

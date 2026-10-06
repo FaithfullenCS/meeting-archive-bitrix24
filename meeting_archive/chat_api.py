@@ -9,6 +9,7 @@ from fastapi import Request
 from fastapi.responses import FileResponse
 
 from .chat_model import positive, text_html
+from .chat_sync import instant
 
 
 def register_chat_api(app, service):
@@ -31,12 +32,12 @@ def register_chat_api(app, service):
         previews = {r["id"]: r["preview"] for r in service.db.rows("SELECT c.id,(SELECT text FROM ca_messages m WHERE m.account=c.account AND m.chat=c.id ORDER BY date DESC,id DESC LIMIT 1) AS preview FROM ca_chats c WHERE c.account=?", (store.account,))}
         for item in items:
             item["preview"] = (previews.get(item["id"]) or "Сообщения ещё не сохранены")[:160]
-        return {"items": sorted(items, key=lambda c: c["count"]["last"] or "", reverse=True), "account": store.account,
+        return {"items": sorted(items, key=lambda c: (instant(c.get("source_last_message_at") or c["count"]["last"]) or 0, c.get("source_last_message_id", 0), c["id"]), reverse=True), "account": store.account,
                 **store.summary(), "total": len(items), "poll_seconds": service.settings.chat_poll_seconds,
                 "connected": service.connected(), "error": engine.error, "active": engine.active,
                 "auto_save": service.settings.chat_auto_save, "events_error": store.state("event_error", ""),
                 "events_status": ("Отключено" if not service.settings.chat_events else "Ожидается подключение аккаунта" if not service.connected() else "Быстрое получение правок и удалений разрешено для этого аккаунта" if service.db.get_state(f"chat_events:{store.portal}:{store.user_id}:consent") or service.db.get_state("chat_events:pending_consent") else "Для этого аккаунта режим ещё не разрешён. Выключите и включите сохранение правок, затем сохраните настройки."),
-                "discovery": "Последние диалоги и известные приложению чаты. Скрытые ветки могут отсутствовать."}
+                "discovery": (store.state("extra_recent_warning", "") or "Последние диалоги и известные приложению чаты, включая неактивных пользователей. Скрытые диалоги могут отсутствовать.")}
 
     @app.get("/api/chat-archive/messages")
     async def messages(chat: int = 0, q: str = "", date_from: str = "", date_to: str = "", author: str = "",
@@ -55,14 +56,16 @@ def register_chat_api(app, service):
     @app.get("/api/chat-archive/filters")
     async def filters():
         store = engine.store()
-        people = {}
-        for row in service.db.rows("SELECT author,data FROM ca_messages WHERE account=? GROUP BY author HAVING id=max(id)", (store.account,)):
+        people, message_counts, chat_counts = {}, {}, {}
+        for row in service.db.rows("SELECT author,data,count(*) AS n FROM ca_messages WHERE account=? GROUP BY author HAVING id=max(id)", (store.account,)):
             data = json.loads(row["data"])
             people[row["author"]] = data["author"] or f"Автор ID {row['author']}"
+            message_counts[row["author"]] = row["n"]
         for chat in store.chats():
             for person in chat.get("participants", []):
                 people.setdefault(person["id"], person["name"] or f"Участник ID {person['id']}")
-        return {"authors": [{"id": id, "name": name} for id, name in people.items()],
+                chat_counts[person["id"]] = chat_counts.get(person["id"], 0) + 1
+        return {"authors": [{"id": id, "name": name, "messages": message_counts.get(id, 0), "chats": chat_counts.get(id, 0)} for id, name in people.items()],
                 "types": sorted({c["type"] for c in store.chats()}),
                 "coverage": sorted({c["coverage"] for c in store.chats()})}
 

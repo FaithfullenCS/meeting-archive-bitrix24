@@ -370,7 +370,9 @@
   function applyRoute() {
     const hash = location.hash.slice(1);
     const match = /^meeting\/(\d+)$/.exec(hash);
-    const route = match ? "detail" : (hash in routes ? hash : "archive");
+    const legacyProfile = hash === "module";
+    const route = match ? "detail" : legacyProfile ? "settings" : (hash in routes ? hash : "archive");
+    if (legacyProfile) { history.replaceState(null, "", "#settings"); window.ArchiveControls?.showCategory("profile"); }
     const previous = state.route; const oldMeeting = state.meetingId;
     if (previous !== route) { closeParticipants(); closeCalendar(); }
     state.route = route; state.meetingId = match ? Number(match[1]) : null;
@@ -386,6 +388,14 @@
     if (route === "module" && !state.engines && state.csrf) loadEngines().catch(error => notify(error.message, true));
     if (route === "archive" && participantsNeedRefresh() && state.csrf) loadParticipants();
     if (state.csrf) caUI.onRoute(route).catch(error => notify(error.message, true));
+  }
+  function profileVisible() { return state.route === "settings" && !$("#settings-panel-profile").hidden; }
+  async function loadProfile() {
+    if (!state.csrf || !profileVisible()) return;
+    if (!state.hardware || state.hardwareProfile !== hardwareProfile()) await loadHardware();
+    if (!state.testMeetings || Date.now() - state.lastTestMeetingsAt > 12000) await loadTestMeetings();
+    if (!state.engines || Date.now() - state.lastEnginesAt > 12000) await loadEngines();
+    window.ArchiveControls?.refresh($("#settings-panel-profile"));
   }
   function updateSettingsForm(settings, force = false) {
     if (state.settingsReady && !force) return;
@@ -859,6 +869,7 @@
       if (state.route === "module" && (!state.hardware || state.hardwareProfile !== hardwareProfile())) await loadHardware();
       if (state.route === "module" && (!state.testMeetings || Date.now() - state.lastTestMeetingsAt > 12000)) await loadTestMeetings();
       if (state.route === "module" && (!state.engines || Date.now() - state.lastEnginesAt > 12000)) await loadEngines();
+      if (state.route === "settings" && profileVisible()) await loadProfile();
       if (initial || (state.route === "archive" && !state.filterPending && (data.chat_revision !== previousChatRevision || Date.now() - state.lastListAt > (data.catalogue?.running ? 5000 : 12000)))) await loadMeetings();
       if (state.route === "detail" && Date.now() - state.lastDetailAt > 10000) await loadDetail();
     } catch (error) {
@@ -1174,6 +1185,7 @@
   window.addEventListener("beforeunload", event => { if (state.settingsDirty) { event.preventDefault(); event.returnValue = ""; } });
   document.addEventListener("visibilitychange", () => { if (!document.hidden) bootstrap(); });
   const caUI = window.ChatArchiveUI.create({api, icon, escapeHtml, dateString, notify, action, getSettings: () => state.bootstrap?.settings || {}});
+  $("#settings-form").addEventListener("settings-category-change", event => { if (event.detail === "profile") loadProfile().catch(error => notify(error.message, true)); });
   window.ArchiveControls?.init(document, {icon});
   window.ArchiveControls?.dateRange($("#ca-period-control"), {from: $("#ca-filters").elements.date_from, to: $("#ca-filters").elements.date_to, label: "Период сообщений", icon});
   decorateStaticIcons(); renderParticipants(); renderCalendar(); applyRoute();

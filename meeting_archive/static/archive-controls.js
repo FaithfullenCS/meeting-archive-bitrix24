@@ -35,6 +35,7 @@
   function choice(source, options = {}) {
     if (!source) return null;
     if (registered.has(source)) { const current = registered.get(source); Object.assign(current.options, options); current.refresh(); return current; }
+    if (source.multiple && source.form?.id === "ca-filters") return peopleChoice(source, options);
     const multiple = source.multiple;
     const label = fieldName(source);
     const wrapper = element("div", `archive-choice${multiple ? " archive-choice-multiple" : ""}`);
@@ -99,6 +100,42 @@
     registered.set(source, control); controls.add(control); installOutside(control); control.refresh(); return control;
   }
 
+  function peopleChoice(source, options) {
+    const label = fieldName(source), participant = source.name === "participant";
+    const wrapper = element("div", "participants-field archive-people-field");
+    source.before(wrapper); wrapper.append(source); source.hidden = true; source.tabIndex = -1;
+    const value = element("div", "participants-value"), chips = element("div", "participant-chips");
+    const toggle = button("button quiet small", "", "users"), caption = element("span", ""); toggle.append(caption); toggle.insertAdjacentHTML("beforeend", svg("chevron-down"));
+    toggle.setAttribute("aria-haspopup", "dialog"); toggle.setAttribute("aria-expanded", "false"); toggle.setAttribute("aria-label", label);
+    const popup = element("div", "participants-menu"); popup.id = `archive-people-${++sequence}`; popup.hidden = true; popup.setAttribute("role", "dialog"); popup.setAttribute("aria-label", label); toggle.setAttribute("aria-controls", popup.id);
+    const heading = element("div", "participants-menu-heading"), close = button("close-button", "", "x"); close.setAttribute("aria-label", `Закрыть выбор: ${label}`); heading.append(element("strong", "", label), close);
+    const search = element("input", ""); search.type = "search"; search.autocomplete = "off"; search.placeholder = "Найти по имени"; search.setAttribute("aria-label", `Поиск: ${label}`);
+    const searchBox = element("div", "participant-search"); searchBox.append(search);
+    const hint = element("p", "participants-hint", participant ? "Показываем чаты, где есть все выбранные участники." : "Показываем сообщения любого выбранного автора.");
+    const list = element("ul", "participant-options"), status = element("div", "footnote"); list.setAttribute("aria-label", `Доступные: ${label}`); status.setAttribute("role", "status");
+    value.append(chips, toggle); popup.append(heading, searchBox, hint, list, status); wrapper.append(value, popup);
+    let timer, suppressFocus = false, fingerprint = "";
+    const control = {source, options, wrapper, toggle, popup, close(focus = false) { clearTimeout(timer); popup.hidden = true; toggle.setAttribute("aria-expanded", "false"); if (focus) { suppressFocus = true; toggle.focus(); suppressFocus = false; } }, refresh() {
+      const chosen = [...source.selectedOptions]; caption.textContent = chosen.length ? "Добавить" : participant ? "Выбрать участников" : "Выбрать авторов";
+      chips.replaceChildren(); chosen.forEach(option => { const chip = element("span", "participant-chip"), remove = button("", "", "x"); remove.setAttribute("aria-label", `Убрать участника ${option.textContent}`); remove.onclick = () => { [...source.options].find(o => o.value === option.value).selected = false; changed(source); control.refresh(); }; chip.append(element("span", "", option.textContent), remove); chips.append(chip); });
+      const q = search.value.trim().toLocaleLowerCase("ru-RU"), matches = [...source.options].filter(o => `${o.textContent} ${o.value}`.toLocaleLowerCase("ru-RU").includes(q));
+      const next = JSON.stringify(matches.map(o => [o.value, o.textContent, o.selected, o.dataset.count]));
+      if (next !== fingerprint) { fingerprint = next; list.replaceChildren(); matches.slice(0,100).forEach(option => {
+        const row = element("li", ""), item = button("", ""); item.dataset.value = option.value; item.setAttribute("aria-pressed", String(option.selected)); item.setAttribute("aria-label", `${option.selected ? "Убрать" : "Добавить"} участника ${option.textContent}`);
+        const person = element("span", "participant-person"); person.append(element("strong", "", option.textContent), element("small", "", `${participant ? "Чатов" : "Сообщений"}: ${Number(option.dataset.count) || 0}`)); item.append(person); item.insertAdjacentHTML("beforeend", svg(option.selected ? "check" : "plus"));
+        item.onclick = () => { const current = [...source.options].find(o => o.value === item.dataset.value); if (!current) return; current.selected = !current.selected; changed(source); control.refresh(); search.focus(); }; row.append(item); list.append(row);
+      }); }
+      status.textContent = matches.length ? `Найдено: ${matches.length}. Выбрано: ${chosen.length}.${matches.length > 100 ? " Уточните поиск для остальных." : ""}` : "Участники не найдены. Обновите каталог чатов.";
+    }};
+    function open(focus = false) { clearTimeout(timer); closeOthers(control); popup.hidden = false; toggle.setAttribute("aria-expanded", "true"); control.refresh(); if (focus) search.focus(); }
+    toggle.onclick = () => open(true); close.onclick = () => control.close(true);
+    wrapper.addEventListener("pointerenter", () => open()); wrapper.addEventListener("pointerleave", () => { timer = setTimeout(() => { if (!wrapper.contains(document.activeElement)) control.close(); }, 120); });
+    wrapper.addEventListener("focusin", () => { if (!suppressFocus) open(); }); wrapper.addEventListener("focusout", e => { if (e.relatedTarget && !wrapper.contains(e.relatedTarget)) control.close(); });
+    wrapper.addEventListener("keydown", e => { if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); control.close(true); } else if (["ArrowDown","ArrowUp","Home","End"].includes(e.key)) { e.preventDefault(); open(); const items = [...list.querySelectorAll("button")], i = items.indexOf(document.activeElement); const n = e.key === "Home" ? 0 : e.key === "End" ? items.length-1 : Math.max(0, Math.min(items.length-1,i+(e.key === "ArrowDown" ? 1 : -1))); items[n]?.focus(); } });
+    search.addEventListener("input", e => { e.stopPropagation(); control.refresh(); }); search.addEventListener("change", e => e.stopPropagation()); source.addEventListener("change", () => control.refresh());
+    registered.set(source, control); controls.add(control); control.refresh(); return control;
+  }
+
   const iso = date => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
   const parse = value => { const parts = String(value || "").split("-").map(Number); return parts.length === 3 && parts.every(Number.isFinite) && parts[0] > 0 ? new Date(parts[0], parts[1] - 1, parts[2]) : new Date(); };
   const dateLabel = value => value ? parse(value).toLocaleDateString("ru-RU") : "Не задана";
@@ -154,7 +191,8 @@
   function settings(root) {
     const form = root.querySelector("#settings-form"); if (!form || form.dataset.categoriesReady) return; form.dataset.categoriesReady = "true";
     const tabs = [...form.querySelectorAll("[data-settings-category]")], panels = [...form.querySelectorAll("[data-settings-panel]")];
-    function show(name) { if (!panels.some(panel => panel.dataset.settingsPanel === name)) name = "automation"; closeOthers(); tabs.forEach(tab => { const active = tab.dataset.settingsCategory === name; tab.classList.toggle("active", active); tab.setAttribute("aria-pressed", String(active)); }); panels.forEach(panel => { panel.hidden = panel.dataset.settingsPanel !== name; }); }
+    function show(name) { if (!panels.some(panel => panel.dataset.settingsPanel === name)) name = "automation"; closeOthers(); tabs.forEach(tab => { const active = tab.dataset.settingsCategory === name; tab.classList.toggle("active", active); tab.setAttribute("aria-pressed", String(active)); }); panels.forEach(panel => { panel.hidden = panel.dataset.settingsPanel !== name; }); form.dispatchEvent(new CustomEvent("settings-category-change", {bubbles:true, detail:name})); }
+    form._archiveShowCategory = show;
     tabs.forEach(tab => { const name = tab.dataset.settingsCategory; tab.addEventListener("click", () => show(name)); tab.querySelector("[data-settings-icon]").innerHTML = svg(tab.dataset.settingsIcon); tab.querySelector(".settings-category-arrow").innerHTML = svg("chevron-right"); });
     form.addEventListener("invalid", event => { const panel = event.target.closest("[data-settings-panel]"); if (panel) { show(panel.dataset.settingsPanel); requestAnimationFrame(() => (registered.get(event.target)?.toggle || event.target).focus()); } }, true);
     form.querySelectorAll("[data-help-toggle]").forEach(toggle => { toggle.innerHTML = svg("help"); toggle.addEventListener("click", () => { const content = document.getElementById(toggle.dataset.helpToggle); if (!content) return; content.hidden = !content.hidden; toggle.setAttribute("aria-expanded", String(!content.hidden)); }); });
@@ -174,5 +212,5 @@
   function refresh(root = document) { controls.forEach(control => { if (root === document || root.contains(control.wrapper)) control.refresh(); }); root.querySelector?.("#settings-form")?._archiveScopeState?.(); if (root.id === "settings-form") root._archiveScopeState?.(); }
   document.addEventListener("pointerdown", event => { controls.forEach(control => { if (!control.wrapper.contains(event.target)) control.close(); }); });
   document.addEventListener("reset", event => { setTimeout(() => refresh(event.target), 0); }, true);
-  window.ArchiveControls = {init, refresh, choice, dateRange};
+  window.ArchiveControls = {init, refresh, choice, dateRange, showCategory(name) { document.querySelector("#settings-form")?._archiveShowCategory?.(name); }};
 })();

@@ -1,9 +1,20 @@
 /* Chat archive inherits the application's approved visual tokens. */
 .ca-heading { margin-bottom: 16px; }
-.ca-filters { padding: 16px 20px; margin-bottom: 16px; }
-.ca-filter-row { display: flex; align-items: end; flex-wrap: wrap; gap: 12px; }
-.ca-filter-row label { flex: 1 1 130px; margin: 0; font-size: 12px; }
-.ca-filter-row + .ca-filter-row { margin-top: 12px; }
+.ca-filters { padding: 12px 16px; margin-bottom: 12px; }
+.ca-filter-row { display: flex; align-items: end; flex-wrap: wrap; gap: 8px 12px; }
+.ca-filter-row label { flex: 1 1 115px; margin: 0; font-size: 11px; }
+.ca-filter-row + .ca-filter-row { margin-top: 8px; }
+.ca-filter-row .archive-choice-toggle, .ca-filter-row input[type=search], .ca-filter-row .archive-date-toggle { min-height: 34px; padding-block: 5px; }
+.ca-filter-row .participants-value { min-height: 34px; padding-block: 2px; }
+.ca-filter-row .archive-people-field .button { min-height: 26px; padding: 2px 5px; }
+.ca-filter-row .participant-search input { margin: 0; }
+.archive-people-field .participant-options { max-height: 245px; }
+.ca-filters { display: grid; grid-template-columns: repeat(7,minmax(0,1fr)); gap: 8px 12px; }
+.ca-filter-row { display: contents; }
+.ca-filter-row .ca-search { grid-column: span 2; }
+.ca-people-filters > .ca-people-picker { grid-column: span 2; }
+.ca-filter-footer { grid-column: 1 / -1; }
+.ca-filter-row label, .ca-period-control { min-width: 0; align-self: end; }
 .ca-period-control { flex: 1.4 1 200px; position: relative; }
 .ca-filter-reset { align-self: end; margin-left: auto; }
 .ca-filter-note { margin: 12px 0 0; }
@@ -45,6 +56,13 @@
 .ca-chat-state .ui-icon { width: 14px; height: 14px; }
 .ca-list-note { padding: 12px 16px; margin: 0; border-top: 1px solid var(--border); }
 .ca-thread-heading { display: flex; align-items: center; gap: 12px; padding: 16px 20px; border-bottom: 1px solid var(--border); }
+.ca-thread-heading { flex-wrap: wrap; }
+.ca-thread-identity { min-width: 0; flex: 1 1 180px; }
+.ca-thread-identity h2, .ca-chat-text strong { overflow-wrap: anywhere; }
+.ca-thread-people { flex: 1 1 220px; max-width: 55%; margin-left: auto; }
+.ca-thread-people .meeting-people-list { max-height: 32px; }
+.ca-thread-people.expanded .meeting-people-list { max-height: 200px; overflow: auto; }
+.ca-inactive { font-style: italic; }
 .ca-thread-heading p { margin: 3px 0 0; }
 .ca-thread-heading details { margin-left: auto; }
 .ca-thread-heading details[open] { max-width: 40%; }
@@ -98,5 +116,7 @@
 @media (max-width: 1050px) { .ca-workspace { grid-template-columns: minmax(210px, .8fr) minmax(0, 1.5fr); } .ca-settings-columns { grid-template-columns: 1fr; gap: 24px; } .ca-settings-columns > div + div { border-left: 0; border-top: 1px solid var(--border); padding: 24px 0 0; } }
 @media (max-width: 700px) { .ca-workspace { grid-template-columns: 1fr; height: auto; } .ca-chat-list { max-height: 230px; } .ca-thread { height: 650px; } .ca-messages { padding: 12px; } .ca-message > .ca-avatar { display: none; } .ca-system { margin-left: 0; } .ca-filter-footer { align-items: start; } .ca-thread-heading details[open] { max-width: 60%; } }
 @media (max-width: 900px) { .ca-summary.summary-grid { grid-template-columns: repeat(2,minmax(0,1fr)); } }
+@media (max-width: 1250px) { .ca-filters { grid-template-columns: repeat(4,minmax(0,1fr)); } }
+@media (max-width: 850px) { .ca-filters { grid-template-columns: repeat(2,minmax(0,1fr)); } .ca-thread-people { max-width: 100%; flex-basis: 100%; } }
 @media (max-width: 500px) { .ca-summary.summary-grid { grid-template-columns: 1fr; } }
 @media (prefers-reduced-motion: reduce) { .ca-toggle input::before { transition: none; } }
