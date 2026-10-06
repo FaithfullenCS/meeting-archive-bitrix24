@@ -1,6 +1,7 @@
 """Lossless message text and conservative structured relationships; no source HTML executes."""
 from __future__ import annotations
 
+
 import hashlib
 import html
 import json
@@ -186,3 +187,13 @@ def safe_name(name):
                                        *(f"LPT{i}" for i in range(1, 10))}:
         name = "_" + name
     return name
+
+
+def chat_classification(value):
+    """Classify by source identity, never by words in a chat title."""
+    source = value.get("chat") if isinstance(value.get("chat"), dict) else value
+    entity = str(source.get("entity_type") or source.get("entityType") or "").upper()
+    type = str(source.get("type") or "").lower()
+    if entity == "TASKS_TASK" or type == "taskstask":
+        return {"group": "tasks", "task_id": positive(source.get("entity_id") or source.get("entityId")), "entity_type": "TASKS_TASK"}
+    return {}

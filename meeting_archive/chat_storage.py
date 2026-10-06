@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 
 from .chat_model import canonical, file_record, fingerprint, message_hash, normalize, positive, sequence, stamp, text_html, text_markdown
@@ -48,6 +49,7 @@ class ChatStore:
                 CREATE TABLE IF NOT EXISTS ca_files(account TEXT, chat INTEGER, id INTEGER, data TEXT,
                     state TEXT DEFAULT 'not_saved', automatic INTEGER DEFAULT 0, next_at REAL DEFAULT 0,
                     attempts INTEGER DEFAULT 0, error TEXT DEFAULT '', PRIMARY KEY(account,chat,id));
+                CREATE INDEX IF NOT EXISTS ca_file_queue ON ca_files(account,state,next_at);
                 CREATE TABLE IF NOT EXISTS ca_work(account TEXT, chat INTEGER, kind TEXT, data TEXT,
                     priority INTEGER, next_at REAL DEFAULT 0, touched REAL DEFAULT 0,
                     PRIMARY KEY(account,chat,kind));
@@ -55,6 +57,8 @@ class ChatStore:
                     PRIMARY KEY(account,id));
                 CREATE TABLE IF NOT EXISTS ca_dirty_months(account TEXT, chat INTEGER, month TEXT,
                     PRIMARY KEY(account,chat,month));
+                CREATE TABLE IF NOT EXISTS ca_activity(account TEXT,id TEXT,data TEXT,touched REAL,
+                    PRIMARY KEY(account,id));
                 UPDATE ca_files SET state='queued' WHERE state='running';
             """)
             db.connection.commit()
@@ -70,7 +74,16 @@ class ChatStore:
         self.db.set_state(self.key(suffix), canonical(data))
 
     def chat_folder(self, chat):
-        return self.folder / "chats" / f"chat-{int(chat)}"
+        id = int(chat)
+        # Keep existing folders and notebook links stable. New archives separate
+        # task chats physically; collections also index every legacy folder.
+        candidates = [self.folder / "chats" / f"chat-{id}", self.folder / "chats" / "tasks" / f"chat-{id}", self.folder / "chats" / "conversations" / f"chat-{id}"]
+        for path in candidates:
+            if path.exists():
+                return path
+        rows = self.db.rows("SELECT data FROM ca_chats WHERE account=? AND id=?", (self.account,id))
+        group = json.loads(rows[0]["data"]).get("group", "conversations") if rows else "conversations"
+        return self.folder / "chats" / ("tasks" if group == "tasks" else "conversations") / f"chat-{id}"
 
     def chats(self):
         rows = self.db.rows("""SELECT c.*,COALESCE(m.n,0) AS message_count,m.first,m.last,COALESCE(w.n,0) AS pending
@@ -88,8 +101,30 @@ class ChatStore:
         """Cheap account-wide counters, independent of the current view filters."""
         counts = self.db.rows("SELECT count(*) AS count FROM ca_chats WHERE account=?", (self.account,))[0]
         counts.update(self.db.rows("SELECT count(DISTINCT chat) AS archived,count(*) AS messages FROM ca_messages WHERE account=?", (self.account,))[0])
-        counts["pending"] = self.db.rows("SELECT count(*) AS n FROM ca_work WHERE account=?", (self.account,))[0]["n"]
+        counts["pending"] = self.db.rows("SELECT count(*) AS n FROM ca_work WHERE account=?", (self.account,))[0]["n"] + self.db.rows("SELECT count(*) AS n FROM ca_files WHERE account=? AND state IN ('queued','running')", (self.account,))[0]["n"]
         return counts
+
+    def activity(self, kind, chat=0, state="done", **values):
+        id = fingerprint([self.account,kind,chat,values.get("file_id",0)])[:24]
+        data = {"id":id,"kind":kind,"chat":chat,"state":state,"touched":time.time(),**values}
+        self.db.execute("INSERT OR REPLACE INTO ca_activity VALUES(?,?,?,?)", (self.account,id,canonical(data),data["touched"]))
+        self.db.execute("DELETE FROM ca_activity WHERE account=? AND id NOT IN (SELECT id FROM ca_activity WHERE account=? ORDER BY touched DESC LIMIT 300)", (self.account,self.account))
+        return data
+
+    def collections(self):
+        groups = {"tasks":[], "conversations":[]}
+        for row in self.db.rows("SELECT id,data FROM ca_chats WHERE account=? ORDER BY id", (self.account,)):
+            data=json.loads(row["data"])
+            group="tasks" if data.get("group")=="tasks" else "conversations"
+            relative = data.get("storage_path")
+            if relative not in {f"chats/chat-{row['id']}",f"chats/tasks/chat-{row['id']}",f"chats/conversations/chat-{row['id']}"}:
+                relative=f"chats/{group}/chat-{row['id']}"
+            groups[group].append({"id":row["id"],"title":data["title"],"task_id":data.get("task_id",0),"path":relative+"/chat.json"})
+        for group, entries in groups.items():
+            target=self.folder / "collections" / (group+".json")
+            payload=canonical({"schemaVersion":1,"group":group,"chats":entries})
+            if not target.exists() or target.read_text("utf-8")!=payload:
+                atomic_text(target,payload)
 
     def chat(self, id):
         rows = self.db.rows("SELECT * FROM ca_chats WHERE account=? AND id=?", (self.account, int(id)))
@@ -105,10 +140,13 @@ class ChatStore:
             raise ValueError("Не указан устойчивый ID чата")
         old = self.db.rows("SELECT data FROM ca_chats WHERE account=? AND id=?", (self.account, id))
         data = json.loads(old[0]["data"]) if old else {
-            "title": f"Чат {id}", "type": "chat", "participants": [], "coverage": "pending",
+            "title": f"Чат {id}", "type": "chat", "group": "conversations", "participants": [], "coverage": "pending",
             "discovery": "recent_and_known_only", "last_checked": "", "limitations": [],
             "history_since": "", "history_complete": False, "meeting_ids": [], "months": []}
         data.update(values)
+        if not data.get("storage_path"):
+            legacy = self.folder / "chats" / f"chat-{id}"
+            data["storage_path"] = f"chats/chat-{id}" if legacy.exists() else f"chats/{'tasks' if data.get('group')=='tasks' else 'conversations'}/chat-{id}"
         self.db.execute("INSERT INTO ca_chats(account,id,dialog,data) VALUES(?,?,?,?) ON CONFLICT(account,id) DO UPDATE SET dialog=excluded.dialog,data=excluded.data,dirty=1",
                         (self.account, id, str(dialog), canonical(data)))
 
@@ -120,8 +158,8 @@ class ChatStore:
 
     def enqueue(self, chat, kind, data=None, priority=10):
         self.chat(chat)
-        self.db.execute("INSERT OR IGNORE INTO ca_work(account,chat,kind,data,priority) VALUES(?,?,?,?,?)",
-                        (self.account, chat, kind, canonical(data or {"cursor": 0}), priority))
+        self.db.execute("INSERT OR IGNORE INTO ca_work(account,chat,kind,data,priority,touched) VALUES(?,?,?,?,?,?)",
+                        (self.account, chat, kind, canonical(data or {"cursor": 0}), priority, time.time()))
 
     def save_page(self, chat_id, page):
         """Durable index first. Projection must succeed before caller advances a cursor."""
@@ -275,7 +313,7 @@ class ChatStore:
             args.append(self.user_id)
         if type or participant or coverage:
             participants = {positive(i) for i in str(participant).split(",")} - {0}
-            allowed = [c["id"] for c in self.chats() if (not type or c["type"] == type) and
+            allowed = [c["id"] for c in self.chats() if (not type or (c.get("group","conversations")==type if type in {"tasks","conversations"} else c["type"]==type and (type!="chat" or c.get("group")!="tasks"))) and
                        (not participants or participants.issubset({p["id"] for p in c.get("participants", [])})) and
                        (not coverage or c["coverage"] == coverage)]
             if not allowed:
@@ -365,6 +403,7 @@ class ChatStore:
             atomic_text(folder / "versions" / f"{month}.jsonl", "".join(canonical(m) + "\n" for m in entries))
         contexts = self.db.rows("SELECT data FROM ca_context WHERE account=? AND chat=?", (self.account, chat))
         atomic_text(folder / "context/excerpts.jsonl", "".join(row["data"] + "\n" for row in contexts))
+        self.update_chat(chat, storage_path=folder.relative_to(self.folder).as_posix())
         data = self.chat(chat)
         count = self.db.rows("SELECT count(*) AS messages,min(date) AS first,max(date) AS last FROM ca_messages WHERE account=? AND chat=?", (self.account, chat))[0]
         work = self.db.rows("SELECT kind,data,priority FROM ca_work WHERE account=? AND chat=?", (self.account, chat))
@@ -377,7 +416,8 @@ class ChatStore:
         # Never overwrite an assistant/user notebook.
         (self.folder / "_notebook").mkdir(exist_ok=True)
         atomic_json(self.folder / "account.json", {"schemaVersion": 1, "portal": self.portal, "user_id": self.user_id,
-                    "chats": "chats/", "notebook": "_notebook/", "discovery": "recent_and_known_only"})
+                    "chats": "chats/", "collections":{"tasks":"collections/tasks.json","conversations":"collections/conversations.json"}, "notebook": "_notebook/", "discovery": "recent_and_known_only"})
+        self.collections()
         atomic_json(self.root / "archive.json", {"schemaVersion": 1, "kind": "chat-archive", "accounts": "<portal>/user-<ID>/account.json"})
         self.db.execute("UPDATE ca_chats SET dirty=0 WHERE account=? AND id=?", (self.account, chat))
         self.db.execute("DELETE FROM ca_dirty_months WHERE account=? AND chat=?", (self.account, chat))
@@ -385,7 +425,10 @@ class ChatStore:
     def recover(self):
         """Restore a lost index from portable files and replay unfinished projections."""
         if self.folder.exists():
-            for path in (self.folder / "chats").glob("chat-*/chat.json"):
+            paths = list((self.folder / "chats").glob("chat-*/chat.json")) + list((self.folder / "chats/tasks").glob("chat-*/chat.json")) + list((self.folder / "chats/conversations").glob("chat-*/chat.json"))
+            for path in paths:
+                if path.is_symlink() or not path.resolve().is_relative_to((self.folder / "chats").resolve()):
+                    continue
                 manifest = json.loads(path.read_text("utf-8"))
                 if manifest.get("portal") != self.portal or manifest.get("user_id") != self.user_id:
                     continue

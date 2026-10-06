@@ -236,6 +236,7 @@ def create_app(service: Service, launch_token: str | None = None, *, manage_life
     @app.get("/api/bootstrap")
     async def bootstrap():
         from .scheduling import window_status
+        from .chat_queue import queue_view
         jobs = service.db.rows("SELECT id,kind,meeting_id,state,attempts,created,error,progress,message,next_at FROM jobs ORDER BY id DESC LIMIT 100")
         windows = {"download": window_status(service.settings.download_schedule), "local": window_status(service.settings.local_schedule), "chat_attachment": window_status(service.settings.chat_attachment_schedule)}
         for job in jobs:
@@ -251,6 +252,7 @@ def create_app(service: Service, launch_token: str | None = None, *, manage_life
                 "account_name": service.db.get_state(service.identity_key()) if service.connected() else "",
                 "chat_warning": service.chat_warning, "chat_revision": service.db.get_state("chat_revision"),
                 "chat_archive": {**service.chat_archive.store().summary(), "poll_seconds": service.settings.chat_poll_seconds},
+                "chat_queue": queue_view(service.chat_archive),
                 "secret_status": {"webhook_saved": bool(saved.get("webhook")),
                                   "hf_token_saved": bool(saved.get("hf_token")),
                                   "client_secret_saved": bool(saved.get("client_secret")),

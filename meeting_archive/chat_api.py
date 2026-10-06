@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse
 
 from .chat_model import positive, text_html
 from .chat_sync import instant
+from .chat_queue import queue_view, queue_action
 
 
 def register_chat_api(app, service):
@@ -26,16 +27,17 @@ def register_chat_api(app, service):
             engine.request_discovery(False)
         participants = {positive(i) for i in participant.split(",")} - {0}
         items = store.chats()
-        items = [c for c in items if (not q or q.casefold() in c["title"].casefold() or q == str(c["id"])) and
-                 (not type or c["type"] == type) and (not coverage or c["coverage"] == coverage) and
+        items = [c for c in items if (not q or q.casefold() in " ".join([c["title"],*c.get("aliases",[])]).casefold() or q == str(c["id"])) and
+                 (not type or (c.get("group","conversations")==type if type in {"tasks","conversations"} else c["type"]==type and (type!="chat" or c.get("group")!="tasks"))) and (not coverage or c["coverage"] == coverage) and
                  (not participants or participants.issubset({p["id"] for p in c.get("participants", [])}))]
         previews = {r["id"]: r["preview"] for r in service.db.rows("SELECT c.id,(SELECT text FROM ca_messages m WHERE m.account=c.account AND m.chat=c.id ORDER BY date DESC,id DESC LIMIT 1) AS preview FROM ca_chats c WHERE c.account=?", (store.account,))}
         for item in items:
             item["preview"] = (previews.get(item["id"]) or "Сообщения ещё не сохранены")[:160]
-        return {"items": sorted(items, key=lambda c: (instant(c.get("source_last_message_at") or c["count"]["last"]) or 0, c.get("source_last_message_id", 0), c["id"]), reverse=True), "account": store.account,
+        return {"items": sorted(items, key=lambda c: (instant(c.get("source_last_message_at")) or 0, c.get("source_last_message_id", 0), c["id"]), reverse=True), "account": store.account,
                 **store.summary(), "total": len(items), "poll_seconds": service.settings.chat_poll_seconds,
                 "connected": service.connected(), "error": engine.error, "active": engine.active,
                 "auto_save": service.settings.chat_auto_save, "events_error": store.state("event_error", ""),
+                "sync":engine.status(),
                 "events_status": ("Отключено" if not service.settings.chat_events else "Ожидается подключение аккаунта" if not service.connected() else "Быстрое получение правок и удалений разрешено для этого аккаунта" if service.db.get_state(f"chat_events:{store.portal}:{store.user_id}:consent") or service.db.get_state("chat_events:pending_consent") else "Для этого аккаунта режим ещё не разрешён. Выключите и включите сохранение правок, затем сохраните настройки."),
                 "discovery": (store.state("extra_recent_warning", "") or "Последние диалоги и известные приложению чаты, включая неактивных пользователей. Скрытые диалоги могут отсутствовать.")}
 
@@ -45,13 +47,35 @@ def register_chat_api(app, service):
                        system: str = "", type: str = "", participant: str = "", coverage: str = "", around: int = 0, offset: int = 0, limit: int = 50):
         store = engine.store()
         if chat:
-            store.chat(chat)
+            current=store.chat(chat)
+            if service.connected() and not current.get("participants"):
+                store.enqueue(chat,"metadata",{"automatic":False},1)
+                service.db.execute("UPDATE ca_work SET priority=1 WHERE account=? AND chat=? AND kind='metadata'",(store.account,chat))
         if around and chat:
             offset = max(0, service.db.rows("SELECT count(*) AS n FROM ca_messages WHERE account=? AND chat=? AND id>?", (store.account, chat, around))[0]["n"] - 25)
         return await asyncio.to_thread(store.query, chat=chat, q=q, date_from=date_from, date_to=date_to,
                                        author=author, direction=direction, kind=kind, attachment=attachment,
                                        file_state=file_state, system=system, type=type, participant=participant,
                                        coverage=coverage, offset=offset, limit=limit)
+
+    @app.get("/api/chat-archive/queue")
+    async def queue(offset:int=0,limit:int=100,ids:str=""):
+        if ids:
+            selected=set(ids.split(","))
+            if len(selected)>1000:
+                raise ValueError("Слишком много заданий для одной страницы")
+            result=queue_view(engine,all_items=True)
+            result["items"]=[item for item in result["items"] if item["id"] in selected]
+            return result
+        return queue_view(engine,offset,limit)
+
+    @app.post("/api/chat-archive/queue/{id}/{operation}")
+    async def queue_operation(id:str,operation:str):
+        if operation not in {"cancel","retry"}:
+            raise ValueError("Неизвестное действие очереди")
+        async with engine.lock:
+            queue_action(engine,id,operation)
+        return {"ok":True}
 
     @app.get("/api/chat-archive/filters")
     async def filters():
@@ -151,6 +175,12 @@ def register_chat_api(app, service):
                     for path in (store.root / "archive.json", store.folder / "account.json"):
                         if path.is_file():
                             archive.write(path, path.relative_to(store.root).as_posix())
+                    for group in ("tasks","conversations"):
+                        path=store.folder / "collections" / (group+".json")
+                        if path.is_file():
+                            manifest=json.loads(path.read_text("utf-8"))
+                            manifest["chats"]=[c for c in manifest["chats"] if c["id"] in ids]
+                            archive.writestr(path.relative_to(store.root).as_posix(),json.dumps(manifest,ensure_ascii=False))
                     if all_chats:
                         notebook = store.folder / "_notebook"
                         for path in notebook.rglob("*"):

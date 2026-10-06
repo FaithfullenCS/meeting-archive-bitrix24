@@ -29,6 +29,8 @@
 .settings-chat-section .check-label { align-items: start; line-height: 1.5; }
 .settings-chat-section .check-label input { flex: none; margin-top: 3px; }
 .setting-help-heading { display: flex; align-items: center; gap: 7px; margin: 14px 0 4px; }
+.setting-help-heading .check-label { margin: 0; align-items: center; }
+.setting-help-heading .setting-help-button { align-self: center; }
 .setting-help-heading strong { font-size: 13px; }
 .setting-help-button { display: inline-grid; place-items: center; flex: none; padding: 2px; width: 24px; height: 24px; border: 0; background: transparent; color: var(--muted); border-radius: 50%; cursor: pointer; }
 .setting-help-button:hover, .setting-help-button[aria-expanded="true"] { color: var(--accent); background: var(--accent-light); }

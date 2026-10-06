@@ -376,6 +376,7 @@
     const previous = state.route; const oldMeeting = state.meetingId;
     if (previous !== route) { closeParticipants(); closeCalendar(); }
     state.route = route; state.meetingId = match ? Number(match[1]) : null;
+    document.body.dataset.route=route;
     $$(".page").forEach(page => { page.hidden = page.id !== `page-${route}`; });
     $$(".nav-item").forEach(button => { const active = button.dataset.route === (route === "detail" ? "archive" : route === "module" ? "settings" : route); button.classList.toggle("active", active); if (active) button.setAttribute("aria-current", "page"); else button.removeAttribute("aria-current"); });
     $$(".settings-tabs [data-route]").forEach(button => { const active = button.dataset.route === route; button.classList.toggle("active", active); if (active) button.setAttribute("aria-current", "page"); else button.removeAttribute("aria-current"); });
@@ -469,7 +470,7 @@
     $("#queue-automation-status").hidden = !automatic?.pending;
     if (!state.authRendered) { authTab(settings.auth_mode === "webhook" ? "webhook" : "oauth"); state.authRendered = true; }
     if (data.hardware) { state.hardware = data.hardware; renderHardware(); }
-    renderJobs(data.jobs || []); decorateJobIcons(); renderModule(data.module || {}); renderSelection(); renderTranscriptionControls(); renderModelTest();
+    renderJobs(data.jobs || []); renderChatJobs(data.chat_queue); decorateJobIcons(); renderModule(data.module || {}); renderSelection(); renderTranscriptionControls(); renderModelTest();
     if (data.hf_verified && !$("#hf-token").value && $("#hf-result").textContent === "Токен сохраняется только в защищённом хранилище Windows.") $("#hf-result").textContent = "Доступ к файлам обеих моделей ранее проверен. Токен хранится в защищённом хранилище Windows.";
     $("#transcription-profile").textContent = `${settings.engine === "gigaam" ? "GigaAM v3 RNNT" : settings.engine === "parakeet" ? "Parakeet v3 Q8" : `Whisper ${settings.model || "large-v3"}`} · ${settings.device === "cpu" ? "CPU (выбран явно)" : "GPU NVIDIA / CUDA"} · ${settings.engine === "gigaam" ? "русский профиль" : settings.language === "auto" ? "определение языка" : settings.language === "en" ? "английский" : "русский"}${settings.diarization ? " · диаризация включена" : " · диаризация выключена"}`;
   }
@@ -665,13 +666,26 @@
     if (!Array.isArray(jobs)) jobs = jobs.items || [];
     const active = jobs.filter(job => ["queued", "running"].includes(job.state));
     $("#nav-jobs").textContent = String(active.length); $("#nav-jobs").hidden = !active.length;
-    $("#jobs-summary").textContent = active.length ? `Активных задач: ${active.length}` : "Нет активных задач";
-    $("#jobs-list").innerHTML = jobs.length ? jobs.map(job => `<article class="job-item" data-job-id="${job.id}"><div><div class="job-title">${escapeHtml(kinds[job.kind] || job.kind)} ${job.schedule_wait ? '<span class="badge waiting">Ждёт окна</span>' : badge(job.state)}</div><div class="job-meta">Задача ${job.id}${job.meeting_id ? ` · Совещание ${job.meeting_id}` : ""} · ${escapeHtml(dateString(job.created))} · Попыток: ${Number(job.attempts) || 0}</div><div class="job-message">${escapeHtml(job.message || "")}</div>${job.error ? `<div class="job-error">${escapeHtml(job.error)}</div>` : ""}${job.state === "running" ? `<progress class="job-progress" max="1" ${Number(job.progress) > 0 ? `value="${Math.min(1, Number(job.progress))}"` : ""} aria-label="Прогресс задачи ${job.id}"></progress>` : ""}</div><div class="job-actions">${job.schedule_wait ? `<button class="button primary small" data-job-now="${job.id}">Запустить сейчас</button>` : ""}${job.meeting_id ? `<button class="button quiet small" data-meeting="${job.meeting_id}">Открыть</button>` : ""}${["queued", "running"].includes(job.state) ? `<button class="button secondary small" data-job-cancel="${job.id}">Отменить</button>` : ""}${["failed", "cancelled", "canceled"].includes(job.state) ? `<button class="button secondary small" data-job-retry="${job.id}">Повторить</button>` : ""}</div></article>`).join("") : '<div class="empty-state"><h2>Очередь свободна</h2><p>Здесь появятся задачи загрузки, импорта и расшифровки.</p></div>';
+    $("#jobs-summary").textContent = active.length ? `Активных задач: ${active.length}` : "Нет активных задач записей";
+    $("#jobs-list").innerHTML = jobs.length ? jobs.map(job => `<article class="job-item" data-job-id="${job.id}"><div><div class="job-title">${escapeHtml(kinds[job.kind] || job.kind)} ${job.schedule_wait ? '<span class="badge waiting">Ждёт окна</span>' : badge(job.state)}</div><div class="job-meta">Задача ${job.id}${job.meeting_id ? ` · Совещание ${job.meeting_id}` : ""} · ${escapeHtml(dateString(job.created))} · Попыток: ${Number(job.attempts) || 0}</div><div class="job-message">${escapeHtml(job.message || "")}</div>${job.error ? `<div class="job-error">${escapeHtml(job.error)}</div>` : ""}${job.state === "running" ? `<progress class="job-progress" max="1" ${Number(job.progress) > 0 ? `value="${Math.min(1, Number(job.progress))}"` : ""} aria-label="Прогресс задачи ${job.id}"></progress>` : ""}</div><div class="job-actions">${job.schedule_wait ? `<button class="button primary small" data-job-now="${job.id}">Запустить сейчас</button>` : ""}${job.meeting_id ? `<button class="button quiet small" data-meeting="${job.meeting_id}">Открыть</button>` : ""}${["queued", "running"].includes(job.state) ? `<button class="button secondary small" data-job-cancel="${job.id}">Отменить</button>` : ""}${["failed", "cancelled", "canceled"].includes(job.state) ? `<button class="button secondary small" data-job-retry="${job.id}">Повторить</button>` : ""}</div></article>`).join("") : '<div class="empty-state"><h2>Заданий записей пока нет</h2><p>Здесь появятся загрузка записей, импорт, расшифровка и установка моделей.</p></div>';
   }
   function decorateJobIcons() {
     $$('[data-job-now]').forEach(button => decorateButton(button, 'play'));
     $$('[data-job-cancel]').forEach(button => decorateButton(button, 'x'));
     $$('[data-job-retry]').forEach(button => decorateButton(button, 'refresh'));
+  }
+  function renderChatJobs(data, append=false, replace=false) {
+    if (!data || !$("#chat-jobs-list")) return;
+    if(state.chatQueueAccount && state.chatQueueAccount!==data.account) state.chatQueueItems=[];
+    state.chatQueueAccount=data.account;
+    const previous=state.chatQueueItems||[], keep=!replace && state.route==="jobs" && previous.length>100;
+    state.chatQueueItems=append ? [...previous,...data.items.filter(item=>!previous.some(old=>old.id===item.id))] : keep ? [...data.items,...previous.filter(old=>!data.items.some(item=>item.id===old.id))] : data.items;
+    state.chatQueueTotal=data.total;
+    const meetingActive=(state.bootstrap?.jobs||[]).filter(job=>["queued","running","waiting"].includes(job.state)).length;
+    $("#nav-jobs").textContent=String(meetingActive+data.pending); $("#nav-jobs").hidden=meetingActive+data.pending===0;
+    $("#chat-jobs-summary").textContent=`Ожидают или выполняются: ${data.pending} · показано ${state.chatQueueItems.length} из ${data.total}`;
+    $("#chat-jobs-list").innerHTML=state.chatQueueItems.length ? state.chatQueueItems.map(job=>`<article class="job-item" data-chat-job-id="${job.id}"><div><div class="job-title">${icon(job.kind==="file" ? "file" : "chat")} ${escapeHtml(job.label)} ${badge(job.schedule_wait ? "waiting" : job.state)}</div><div class="job-meta">${escapeHtml(job.title)}${job.chat ? " · Чат ID "+job.chat : ""}${job.filename ? " · "+escapeHtml(job.filename) : ""}${job.touched ? " · "+escapeHtml(dateString(new Date(job.touched*1000).toISOString())) : ""}</div><div class="job-message">${escapeHtml(job.message||"")}${job.pages ? ` · Страниц: ${job.pages}` : ""}${job.messages ? ` · Обработано сообщений: ${job.messages}` : ""}${job.next_at>Date.now()/1000 ? ` · Повтор не раньше ${escapeHtml(dateString(new Date(job.next_at*1000).toISOString()))}` : ""}</div>${job.error ? `<div class="job-error">${escapeHtml(job.error)}</div>` : ""}${job.state==="running" ? `<progress class="job-progress" max="1"${job.total_bytes && job.downloaded_bytes ? ` value="${Math.min(1,job.downloaded_bytes/job.total_bytes)}"` : ""} aria-label="Выполнение задания чата"></progress>` : ""}</div><div class="job-actions">${job.state==="failed" || job.state==="cancelled" ? `<button class="button secondary small" data-chat-job-action="retry" data-chat-job="${job.id}">Повторить</button>` : ""}${job.state==="queued" || job.state==="failed" ? `<button class="button quiet small" data-chat-job-action="cancel" data-chat-job="${job.id}">Отменить</button>` : ""}</div></article>`).join("") : '<div class="empty-state"><p>Заданий чатов пока нет. Здесь появятся сохранение сообщений, история и вложения.</p></div>';
+    $("#chat-jobs-more").hidden=state.chatQueueItems.length>=data.total;
   }
   function renderModule(module) {
     const jobs = Array.isArray(state.bootstrap?.jobs) ? state.bootstrap.jobs : state.bootstrap?.jobs?.items || [];
@@ -862,7 +876,8 @@
     state.busy = true;
     try {
       const previousChatRevision = state.bootstrap?.chat_revision;
-      const data = await api("/api/bootstrap"); renderBootstrap(data); if (["chat-archive","settings"].includes(state.route)) await caUI.onBootstrap(data, state.route); if (data.activation) await consumeActivation(data.activation);
+      const data = await api("/api/bootstrap"); renderBootstrap(data);
+      if(state.route==="jobs" && (state.chatQueueItems?.length||0)>100) renderChatJobs(await api(`/api/chat-archive/queue?ids=${state.chatQueueItems.map(item=>item.id).join(",")}`),false,true); if (["chat-archive","settings"].includes(state.route)) await caUI.onBootstrap(data, state.route); if (data.activation) await consumeActivation(data.activation);
       if (!state.windowAnnounced) { api("/api/desktop/ready", {method: "POST"}).then(result => { state.windowAnnounced = Boolean(result.ready); }).catch(() => {}); }
       if (state.route === "archive" && participantsNeedRefresh()) await loadParticipants();
       if (state.route === "archive" && chatsNeedRefresh()) await loadChats();
@@ -1052,6 +1067,8 @@
     await api("/api/link", { method: "POST", data: { source_id: state.meetingId, target_id: target } }); notify("Запись привязана. Исходный импорт сохранён."); await loadDetail();
   });
   $("#jobs-refresh").onclick = event => action(event.currentTarget, () => bootstrap());
+  $("#chat-jobs-more").onclick=event=>action(event.currentTarget,async()=>renderChatJobs(await api(`/api/chat-archive/queue?offset=${state.chatQueueItems?.length||0}&limit=100`),true));
+  document.addEventListener("click",event=>{ const button=event.target.closest("[data-chat-job-action]"); if(button) action(button,async()=>{ await api(`/api/chat-archive/queue/${button.dataset.chatJob}/${button.dataset.chatJobAction}`,{method:"POST"}); await bootstrap(); }); });
   function markSettingsDirty(event) { if (event?.target && !event.target.name && !event.target.closest("[data-schedule]")) return; state.settingsDirty = true; $("#settings-status").textContent = "Есть несохранённые изменения."; $(".settings-footer").classList.add("dirty"); updateCpuAcknowledgement(); updateAudioDownloadPolicy(); updateDiarization(); updateEngineControls(); updateScheduleVisibility(); }
   ["input", "change"].forEach(type => document.addEventListener(type, event => { if (event.target.form?.id === "settings-form") markSettingsDirty(event); }));
   $("#settings-revert").onclick = () => { updateSettingsForm(state.bootstrap?.settings || {}, true); notify("Несохранённые изменения отменены."); };

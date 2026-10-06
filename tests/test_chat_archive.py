@@ -14,6 +14,8 @@ from meeting_archive.app import create_app
 from meeting_archive.bitrix import BitrixClient, BitrixError
 from meeting_archive.chat_model import category, normalize, text_html
 from meeting_archive.chat_storage import ChatStore
+from meeting_archive.chat_model import chat_classification
+from meeting_archive.chat_queue import queue_view, queue_action
 from meeting_archive.service import Service
 
 
@@ -68,6 +70,183 @@ async def test_unavailable_extra_list_preserves_primary_discovery(chat_service):
     await chat_service.chat_archive.discover(store, False)
     assert store.state("inventory_ready") and store.chat(102)["source_last_message_id"] == 5
     assert store.state("extra_recent_warning") and store.query(chat=102)["total"] == 0
+
+
+async def test_new_self_message_not_starved_by_large_catalogue(chat_service, monkeypatch):
+    service, store = chat_service, chat_service.chat_archive.store()
+    service.settings.chat_auto_save = True
+    service.settings.chat_poll_seconds = 60
+    now = [time.time()]
+    monkeypatch.setattr("meeting_archive.chat_sync.time.time", lambda: now[0])
+    for key, value in {
+        "collection_policy": 2,
+        "inventory_ready": True,
+        "last_discovery": now[0],
+        "auto_since": "2026-01-01T00:00:00Z",
+        "recent_check_at": now[0],
+        "audit_at": now[0],
+        "extra_recent_at": now[0],
+    }.items():
+        store.set_state(key, value)
+    for id in range(1, 81):
+        store.upsert_chat(
+            id, "42" if id == 80 else f"chat{id}", type="user" if id == 80 else "chat", participants_at=now[0]
+        )
+        service.chat_archive.schedule_chat(store, store.chat(id), True)
+
+    async def call(method, params, **kwargs):
+        if method == "im.recent.list":
+            return {
+                "items": [
+                    {
+                        "id": 42 if id == 80 else f"chat{id}",
+                        "chat_id": id,
+                        "type": "user" if id == 80 else "chat",
+                        "message": {"id": 2 if id == 80 else 1, "date": "2026-12-01T00:00:00Z"},
+                    }
+                    for id in range(1, 81)
+                ],
+                "hasMore": False,
+            }
+        assert method == "im.dialog.messages.search"
+        return (
+            {"messages": [message(2, 80, date="2026-12-01T00:00:00Z")]} if params["CHAT_ID"] == 80 else {"messages": []}
+        )
+
+    service.client.call = call
+    for _ in range(90):
+        await service.chat_archive.step()
+        now[0] += 1
+    assert store.message(80, 2), (
+        "New self message must be checked even when a new polling cycle starts before the catalogue drains"
+    )
+
+
+async def test_history_does_not_change_order_without_remote_date(chat_service):
+    store = seed(chat_service)
+    store.upsert_chat(102, "chat102")
+    app = create_app(chat_service, launch_token="synthetic-order-stable", manage_lifecycle=False)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8765") as client:
+        await client.get("/?launch=synthetic-order-stable")
+        before = [c["id"] for c in (await client.get("/api/chat-archive")).json()["items"]]
+        store.save_page(101, {"messages": [message(1, date="2026-12-01T00:00:00Z")]})
+        after = [c["id"] for c in (await client.get("/api/chat-archive")).json()["items"]]
+    assert before == after
+
+
+def test_task_collections_new_paths_and_legacy_links(chat_service):
+    store = seed(chat_service)
+    legacy = store.folder / "chats/chat-101"
+    (legacy / "notes").mkdir(parents=True)
+    (legacy / "notes/kept.md").write_text("Synthetic existing note", "utf-8")
+    classification = chat_classification(
+        {"chat": {"type": "tasksTask", "entity_type": "TASKS_TASK", "entity_id": "900"}}
+    )
+    assert classification["task_id"] == 900
+    assert not chat_classification({"name": "TASKS_TASK in a title"})
+    store.update_chat(101, **classification)
+    store.upsert_chat(102, "chat102", **classification)
+    store.save_page(101, {"messages": [message(1)]})
+    store.save_page(102, {"messages": [message(2, 102)]})
+    assert store.chat_folder(101) == legacy and (legacy / "notes/kept.md").is_file()
+    assert store.chat_folder(102) == store.folder / "chats/tasks/chat-102"
+    index = json.loads((store.folder / "collections/tasks.json").read_text("utf-8"))
+    assert {c["id"] for c in index["chats"]} == {101, 102}
+    assert store.query(type="tasks")["total"] == 2 and store.query(type="conversations")["total"] == 0
+    for table in ("ca_chats", "ca_messages"):
+        store.db.execute(f"DELETE FROM {table} WHERE account=?", (store.account,))
+    store.recover()
+    assert store.query(type="tasks")["total"] == 2
+
+
+async def test_queue_includes_chat_files_outcomes_and_account_scoped_actions(chat_service):
+    store = seed(chat_service)
+    store.enqueue(101, "history", {"automatic": False}, 2)
+    store.save_page(
+        101, {"messages": [message(1, params={"FILE_ID": [77]})], "files": [{"id": 77, "name": "demo.txt", "size": 1}]}
+    )
+    chat_service.chat_archive.queue_file(store, 101, 77)
+    entries = queue_view(chat_service.chat_archive)["items"]
+    assert {e["kind"] for e in entries} >= {"history", "file"}
+    history = next(e for e in entries if e["kind"] == "history")
+    queue_action(chat_service.chat_archive, history["id"], "cancel")
+    assert not store.db.rows("SELECT kind FROM ca_work WHERE account=? AND kind='history'", (store.account,))
+    assert any(e["state"] == "cancelled" for e in queue_view(chat_service.chat_archive)["items"])
+    queue_action(chat_service.chat_archive, history["id"], "retry")
+    assert store.db.rows("SELECT kind FROM ca_work WHERE account=? AND kind='history'", (store.account,))
+    chat_service.settings.user_id = 43
+    with pytest.raises(ValueError, match="аккаунта"):
+        queue_action(chat_service.chat_archive, history["id"], "cancel")
+
+
+async def test_self_chat_alias_and_unchanged_heads_do_not_requeue(chat_service):
+    store = seed(chat_service)
+    service = chat_service
+    service.settings.chat_auto_save = True
+    store.set_state("inventory_ready", True)
+    store.set_state("auto_since", "2026-01-01T00:00:00Z")
+
+    async def call(method, params, **kwargs):
+        if method == "im.recent.get":
+            return []
+        return {
+            "items": [
+                {
+                    "id": 42,
+                    "chat_id": 101,
+                    "type": "user",
+                    "title": "Мои заметки",
+                    "user": {"name": "Демо владелец"},
+                    "message": {"id": 1, "date": "2026-12-01T00:00:00Z"},
+                }
+            ],
+            "hasMore": False,
+        }
+
+    service.client.call = call
+    await service.chat_archive.discover(store, True)
+    assert store.chat(101)["is_self"] and "Демо владелец" in store.chat(101)["aliases"]
+    store.db.execute("DELETE FROM ca_work WHERE account=?", (store.account,))
+    store.update_chat(101, sync_head_id=1, new_checked_at=time.time(), participants_at=time.time())
+    service.chat_archive.schedule_chat(store, store.chat(101), True)
+    assert not store.db.rows("SELECT kind FROM ca_work WHERE account=? AND kind='new'", (store.account,))
+
+
+async def test_manual_history_has_turn_under_continuous_new_work(chat_service):
+    store=seed(chat_service)
+    service=chat_service
+    service.settings.chat_auto_save=True
+    for key,value in {"collection_policy":2,"last_discovery":time.time(),"recent_check_at":time.time(),"audit_at":time.time(),"inventory_ready":True}.items():
+        store.set_state(key,value)
+    store.enqueue(101,"new",{"automatic":True},-1)
+    store.enqueue(101,"history",{"automatic":False},2)
+    kinds=[]
+    async def process(store,row):
+        kinds.append(row["kind"])
+        if row["kind"]=="history":
+            store.db.execute("DELETE FROM ca_work WHERE account=? AND kind='history'",(store.account,))
+    service.chat_archive.process_work=process
+    for _ in range(5):
+        await service.chat_archive.step()
+    assert "history" in kinds
+
+
+async def test_message_worker_recovers_from_unexpected_exception(chat_service,monkeypatch):
+    service=chat_service
+    calls=[]
+    async def step():
+        calls.append(1)
+        if len(calls)==1:
+            raise RuntimeError("synthetic transient failure")
+        service.alive=False
+    original_sleep=asyncio.sleep
+    async def sleep(seconds):
+        await original_sleep(0)
+    service.chat_archive.step=step
+    service.alive=True
+    monkeypatch.setattr("meeting_archive.chat_sync.asyncio.sleep",sleep)
+    await service.chat_archive.loop()
+    assert len(calls)==2 and "synthetic transient failure" in service.chat_archive.error
 
 
 def message(id, chat=101, **values):

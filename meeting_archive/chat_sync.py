@@ -18,7 +18,7 @@ from urllib.parse import parse_qs, urljoin, urlsplit
 import httpx
 
 from .bitrix import BitrixError
-from .chat_model import canonical, positive, safe_metadata, safe_name, sequence, stamp
+from .chat_model import canonical, chat_classification, positive, safe_metadata, safe_name, sequence, stamp
 from .chat_storage import ChatStore
 from .scheduling import window_status
 
@@ -91,6 +91,7 @@ class ChatArchive:
         message = item.get("message") if isinstance(item.get("message"), dict) else {}
         user = item.get("user") if isinstance(item.get("user"), dict) else {}
         values = {}
+        values.update(chat_classification(item))
         moment = instant(message.get("date") or item.get("date_last_activity") or item.get("date_update"))
         if moment is not None:
             values["source_last_message_at"] = datetime.fromtimestamp(moment, timezone.utc).isoformat()
@@ -154,6 +155,7 @@ class ChatArchive:
         for id in ids:
             store.chat(positive(id))
         for id in ids:
+            store.update_chat(positive(id), history_paused=False)
             kind = "period:" + date_from + ":" + date_to if start or end else "history"
             current = self.service.db.rows("SELECT data FROM ca_work WHERE account=? AND chat=? AND kind=?", (store.account, positive(id), kind))
             if current and json.loads(current[0]["data"]).get("automatic"):
@@ -168,8 +170,15 @@ class ChatArchive:
             return
         newest = self.service.db.rows("SELECT max(id) AS id FROM ca_messages WHERE account=? AND chat=?", (store.account, chat["id"]))[0]["id"] or 0
         since = "" if chat.get("auto_history") else store.state("auto_since", stamp())
-        store.enqueue(chat["id"], "new", {"cursor": 0, "stop_id": newest, "date_from": since, "automatic": True}, 0)
-        if chat.get("auto_history") and not chat.get("history_complete"):
+        head = positive(chat.get("source_last_message_id"))
+        unchanged = head and head == chat.get("sync_head_id")
+        recently_checked = time.time() - chat.get("new_checked_at", 0) < max(900, self.service.settings.chat_poll_seconds * 5)
+        if not unchanged or not recently_checked:
+            urgent = head and head != chat.get("sync_head_id") and (instant(chat.get("source_last_message_at")) or 0) >= (instant(since) or 0)
+            store.enqueue(chat["id"], "new", {"cursor": 0, "stop_id": newest, "source_head_id": head, "date_from": since, "automatic": True}, -1 if urgent else 0)
+            if urgent:
+                self.service.db.execute("UPDATE ca_work SET priority=-1 WHERE account=? AND chat=? AND kind='new'", (store.account, chat["id"]))
+        if chat.get("auto_history") and not chat.get("history_complete") and not chat.get("history_paused"):
             store.enqueue(chat["id"], "history", {"cursor": 0, "date_from": "", "automatic": automatic}, 10)
 
     async def add_dialog(self, store, dialog, hint=None):
@@ -221,6 +230,8 @@ class ChatArchive:
                 hint = hint if isinstance(hint, dict) else {}
                 values = self.recent_metadata(item)
                 values["source_recent_seen_at"] = time.time()
+                if item.get("type") == "user" and positive(item.get("id")) == store.user_id:
+                    values.update(is_self=True, aliases=list(dict.fromkeys(["Мои заметки", "Избранное", str(item.get("title") or ""), str(hint.get("name") or ""), self.service.db.get_state(self.service.identity_key()) or ""])))
                 if id not in existing:
                     values["auto_history"] = bool(automatic and not baseline)
                 store.upsert_chat(id, dialog, title=str(item.get("title") or hint.get("name") or f"Чат {id}"), type=str(item.get("type") or "chat"), **values)
@@ -304,7 +315,7 @@ class ChatArchive:
                     activity.update({positive(u.get("id")): u["active"] for u in sequence(users) if isinstance(u, dict) and type(u.get("active")) is bool})
                 peer = positive(chat["dialog"]) if chat["type"] == "user" else 0
                 peer_state = {"peer_active": activity[peer]} if peer in activity else {}
-                store.update_chat(chat["id"], title=str(details.get("name") or names.get(peer) or chat["title"]), participants=[{"id":positive(id),"name":names.get(positive(id),""), **({"active":activity[positive(id)]} if positive(id) in activity else {})} for id in members], **peer_state,
+                store.update_chat(chat["id"], title=str(details.get("name") or names.get(peer) or chat["title"]), participants=[{"id":positive(id),"name":names.get(positive(id),next((p.get("name", "") for p in chat.get("participants",[]) if p["id"]==positive(id)),"")), **({"active":activity[positive(id)]} if positive(id) in activity else {})} for id in members], **peer_state, **chat_classification(details),
                                   participants_at=time.time(), participants_warning="", parent_chat_id=positive(details.get("parent_chat_id")), parent_message_id=positive(details.get("parent_message_id")))
             except (BitrixError, httpx.HTTPError, ValueError, OSError) as exc:
                 if isinstance(exc, (httpx.HTTPError, OSError)) or isinstance(exc, BitrixError) and exc.retryable:
@@ -339,6 +350,9 @@ class ChatArchive:
             archived = {r["id"] for r in self.service.db.rows("SELECT id FROM ca_messages WHERE account=? AND chat=? AND id IN (" + ",".join("?" for _ in page_ids) + ")", (store.account, chat["id"], *page_ids))} if page_ids else set()
             selected_page["messages"] = [m for m in selected_page["messages"] if positive(m.get("id")) in archived]
         messages = await asyncio.to_thread(store.save_page, chat["id"], selected_page)
+        work.pop("error",None)
+        work["pages"]=work.get("pages",0)+1
+        work["messages"]=work.get("messages",0)+len(messages)
         ids = [positive(m.get("id")) for m in raw_messages]
         if any(not id for id in ids):
             raise ValueError("Источник вернул сообщение без ID; курсор не продвинут")
@@ -358,6 +372,8 @@ class ChatArchive:
         limitations = list(dict.fromkeys(chat.get("limitations", []) + (["История ограничена тарифом Bitrix24"] if tariff else []) +
                      (["Метод поиска недоступен; связи и граница тарифа могут отсутствовать"] if method == "get" else [])))
         update = {"last_checked": stamp(), "method": method, "limitations": limitations, "error": ""}
+        if row["kind"] == "new" and finished:
+            update.update(sync_head_id=positive(work.get("source_head_id")) or max(ids, default=0), new_checked_at=time.time())
         from .call_discovery import structured_calls
         call_ids = structured_calls(raw_messages)
         meeting_ids = set(chat.get("meeting_ids", []))
@@ -390,6 +406,13 @@ class ChatArchive:
                                     (canonical(work), time.time(), store.account, chat["id"], row["kind"]))
         await asyncio.to_thread(store.flush, chat["id"])
 
+    def status(self):
+        store=self.store()
+        return {"discovering":bool(getattr(self,"discovering",False) or store.state("discover_requested")),
+                "last_catalogue_at":store.state("last_discovery",0),
+                "next_catalogue_at":store.state("last_discovery",0)+self.service.settings.chat_poll_seconds,
+                "worker_running":bool(getattr(self,"loop_running",False)), "error":self.error}
+
     def queue_file(self, store, chat, id, *, automatic=False, missing_ok=False, manual_collection=False, history_opt_in=False):
         try:
             file = store.file(chat, id)
@@ -408,6 +431,7 @@ class ChatArchive:
             return
         data = json.loads(self.service.db.rows("SELECT data FROM ca_files WHERE account=? AND chat=? AND id=?", (store.account, chat, id))[0]["data"])
         data["download_origin"] = "manual_collection" if manual_collection else "history_opt_in" if history_opt_in else "automatic" if automatic else "manual_file"
+        data.update(queued_at=time.time(),downloaded_bytes=0)
         # Manual request promotes a queued automatic job and bypasses all gates.
         store.file_update(chat, id, state="queued", automatic=int(automatic and (file["state"] != "queued" or file["automatic"])), data=canonical(data), error="", next_at=0)
 
@@ -562,13 +586,18 @@ class ChatArchive:
                 self.request_discovery(False)
                 requested = store.state("discover_requested")
             if requested and time.time() >= store.state("discovery_retry_at", 0) and (not requested.get("automatic") or automatic):
+                self.discovering=True
                 try:
                     await self.discover(store, requested.get("automatic", False))
                     store.set_state("discovery_retry_at", 0)
+                    if not store.state("discover_requested"):
+                        store.activity("discovery", state="done")
                 except (BitrixError, httpx.HTTPError, ValueError, OSError) as exc:
                     # An inventory failure must not block already known chats.
                     self.error = self.service.vault.redact(str(exc))
                     store.set_state("discovery_retry_at", max(time.time() + 30, getattr(exc, "retry_at", 0)))
+                finally:
+                    self.discovering=False
             if automatic:
                 for kind, seconds, days, priority in (("recent_check", 86400, 7, 3), ("audit", 604800, 0, 15)):
                     if time.time() - store.state(kind + "_at", 0) >= seconds:
@@ -588,33 +617,46 @@ class ChatArchive:
                 except (BitrixError, httpx.HTTPError, ValueError, OSError) as exc:
                     store.set_state("event_error", self.service.vault.redact(str(exc)))
                 store.set_state("events_at", time.time())
-            rows = self.service.db.rows("SELECT * FROM ca_work WHERE account=? AND next_at<=? ORDER BY priority,touched,chat", (store.account, time.time()))
+            # Reserve regular turns for explicitly requested history and metadata;
+            # a continuous stream of new-message checks must not starve them.
+            self.work_turn = getattr(self, "work_turn", 0) + 1
+            background_turn = self.work_turn % 5 == 0
+            order = "CASE WHEN priority>0 THEN 0 ELSE 1 END," if background_turn else ""
+            rows = self.service.db.rows(f"SELECT * FROM ca_work WHERE account=? AND next_at<=? ORDER BY {order}priority,touched,chat", (store.account, time.time()))
             for row in rows:
                 work = json.loads(row["data"])
                 if work.get("automatic") and (not automatic or not self.selected(row["chat"])):
                     continue
                 self.active = f"Чат {row['chat']}"
+                self.current_work=(store.account,row["chat"],row["kind"])
                 try:
                     await self.process_work(store, row)
+                    left=self.service.db.rows("SELECT data FROM ca_work WHERE account=? AND chat=? AND kind=?",(store.account,row["chat"],row["kind"]))
+                    if not left:
+                        store.activity(row["kind"],row["chat"],"done",pages=work.get("pages",0)+1)
                     self.error = ""
                 except (BitrixError, httpx.HTTPError, ValueError, OSError) as exc:
                     message = self.service.vault.redact(str(exc))
-                    self.service.db.execute("UPDATE ca_work SET next_at=?,touched=? WHERE account=? AND chat=? AND kind=?",
-                                            (max(time.time() + 30, getattr(exc, "retry_at", 0)), time.time(), store.account, row["chat"], row["kind"]))
+                    work.update(error=message)
+                    self.service.db.execute("UPDATE ca_work SET data=?,next_at=?,touched=? WHERE account=? AND chat=? AND kind=?",
+                                            (canonical(work),max(time.time() + 30, getattr(exc, "retry_at", 0)), time.time(), store.account, row["chat"], row["kind"]))
                     store.update_chat(row["chat"], error=message, coverage="access_lost" if isinstance(exc, BitrixError) and exc.code in ACCESS_CODES else "error")
                     self.error = message
                 finally:
                     self.active = ""
+                    self.current_work=None
                 break  # One page per turn: fair across chats and cancellable.
 
     async def loop(self):
+        self.loop_running=True
         while self.service.alive:
             try:
                 await self.step()
-            except (BitrixError, httpx.HTTPError, ValueError, OSError) as exc:
+            except Exception as exc:
                 self.error = self.service.vault.redact(str(exc))
                 await asyncio.sleep(10)
             await asyncio.sleep(1)
+        self.loop_running=False
 
     async def download_file(self, store, file, client=None):
         chat = store.chat(file["chat"])
@@ -631,6 +673,7 @@ class ChatArchive:
         os.close(fd)
         temp = Path(name)
         digest, size = hashlib.sha256(), 0
+        progress_at=0
         try:
             for redirect in range(6):
                 async with client.http.stream("GET", url) as response:
@@ -645,6 +688,11 @@ class ChatArchive:
                     with temp.open("wb") as output:
                         async for chunk in response.aiter_bytes():
                             size += len(chunk)
+                            if time.monotonic()-progress_at>=1:
+                                progress_at=time.monotonic()
+                                progress=json.loads(self.service.db.rows("SELECT data FROM ca_files WHERE account=? AND chat=? AND id=?",(store.account,file["chat"],file["id"]))[0]["data"])
+                                progress["downloaded_bytes"]=size
+                                store.file_update(file["chat"],file["id"],data=canonical(progress))
                             if maximum and size > maximum:
                                 raise ValueError("Размер превышает лимит автоматической загрузки")
                             if shutil.disk_usage(folder).free < len(chunk) + 1024**3:
@@ -674,6 +722,7 @@ class ChatArchive:
                     contents.append(content)
                 data.update(contents=contents, path=content["path"], sha256=sha, size=size)
                 store.file_update(file["chat"], file["id"], data=canonical(data), state="saved", error="")
+                store.activity("file",file["chat"],"done",file_id=file["id"],filename=file["name"],downloaded_bytes=size,total_bytes=size)
                 await asyncio.to_thread(store.flush, file["chat"])
         finally:
             temp.unlink(missing_ok=True)
@@ -724,6 +773,6 @@ class ChatArchive:
         while self.service.alive:
             try:
                 await self.file_step()
-            except (BitrixError, httpx.HTTPError, ValueError, OSError) as exc:
+            except Exception as exc:
                 self.error = self.service.vault.redact(str(exc))
             await asyncio.sleep(1)
