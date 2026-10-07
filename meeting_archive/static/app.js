@@ -28,7 +28,7 @@
     available: "Можно скачать", not_available: "Запись не предоставлена",
     cancelled: "Отменено", canceled: "Отменено", waiting: "Ожидается", done: "Готово", tested: "Короткий тест"
   };
-  const kinds = { download: "Загрузка материалов", fetch: "Загрузка материалов", transcribe: "Локальная расшифровка", install: "Установка модуля", import: "Импорт записи", catalogue: "Обновление каталога" };
+  const kinds = { download: "Сохранение материалов совещания", fetch: "Сохранение материалов совещания", transcribe: "Локальная расшифровка", install: "Установка модуля", import: "Импорт записи", catalogue: "Обновление каталога" };
   const routes = { "chat-archive": "Архив чатов", archive: "Совещания", detail: "Совещание", jobs: "Очередь", module: "Настройки расшифровки", settings: "Настройки", connection: "Подключение Bitrix24", help: "Как пользоваться" };
   const iconPaths = {
     chat: '<path d="M21 11a8 8 0 0 1-8 8H7l-5 3V7a4 4 0 0 1 4-4h11a4 4 0 0 1 4 4zM7 8h10M7 12h6"/>',
@@ -662,12 +662,55 @@
     if (request !== state.detailRequest || id !== state.meetingId) return;
     renderDetail(detail); state.lastDetailAt = Date.now();
   }
+  function queueGroups(jobs, namespace, overview=[]) {
+    const groups = new Map(), totals = new Map(overview.map(group => [group.key, group]));
+    for (const job of jobs) {
+      const key = namespace === "chat" ? job.group_key || (job.chat ? `chat:${job.chat}` : "catalogue") : job.meeting_id ? `meeting:${job.meeting_id}` : job.kind === "install" ? "models" : "catalogue";
+      if (!groups.has(key)) groups.set(key, {key, title: job.title || (job.meeting_id ? `Совещание ${job.meeting_id}` : "Модели и каталог"),
+        meta: namespace === "chat" ? job.chat ? `${job.group === "tasks" ? `Чат задачи${job.task_id ? " №"+job.task_id : ""}` : "Чат"} · ID ${job.chat}` : "Обнаружение доступных чатов" : job.meeting_id ? `Совещание №${job.meeting_id}` : "Обслуживание приложения",
+        items: [], pending: 0, running: 0, failed: 0});
+      const group = groups.get(key); group.items.push(job);
+      group.pending += Number(["queued", "running", "waiting"].includes(job.state) || Boolean(job.will_retry));
+      group.running += Number(job.state === "running"); group.failed += Number(job.state === "failed");
+    }
+    for (const group of groups.values()) {
+      group.items.sort((a,b) => Number(b.state === "running")-Number(a.state === "running") || Number(["queued","waiting","failed"].includes(b.state))-Number(["queued","waiting","failed"].includes(a.state)));
+      const summary = totals.get(group.key);
+      group.total = summary?.total ?? group.items.length;
+      if (summary) for (const key of ["pending","running","failed"]) group[key] = summary[key];
+    }
+    return [...groups.values()].sort((a,b) => b.running-a.running || Number(b.pending>0)-Number(a.pending>0) || Number(b.failed>0)-Number(a.failed>0));
+  }
+  function renderQueueGroups(container, jobs, namespace, row, overview=[]) {
+    state.queueOpen ||= new Map();
+    $$("details.queue-group",container).forEach(group => state.queueOpen.set(group.dataset.queueGroup,group.open));
+    const focused = container.contains(document.activeElement) ? document.activeElement : null, focusAttribute = focused && [...focused.attributes].find(attr => /^(data-job-(cancel|retry|now)|data-chat-job-action)$/.test(attr.name));
+    const focusChat = focused?.dataset.chatJob;
+    container.innerHTML = queueGroups(jobs,namespace,overview).map(group => {
+      const key = `${namespace}:${group.key}`, open = state.queueOpen.get(key) ?? Boolean(group.pending || group.failed);
+      const status = group.running ? "running" : group.failed ? "failed" : group.pending ? "queued" : "done";
+      const counters = [`Работ: ${group.total}`,group.pending ? `ожидают или выполняются: ${group.pending}` : "",group.failed ? `ошибок: ${group.failed}` : "",group.items.length<group.total ? `показано: ${group.items.length}` : ""].filter(Boolean).join(" · ");
+      return `<details class="queue-group" data-queue-group="${escapeHtml(key)}"${open ? " open" : ""}><summary><span class="queue-group-icon">${icon(namespace === "chat" ? group.key === "catalogue" ? "refresh" : "chat" : group.key === "models" ? "settings" : "calendar")}</span><span class="queue-group-heading"><strong>${escapeHtml(group.title)}</strong><span>${escapeHtml(group.meta)} · ${escapeHtml(counters)}</span></span>${badge(status)}${icon("chevron-down")}</summary><div class="queue-group-items">${group.items.map(row).join("")}</div></details>`;
+    }).join("");
+    if (focusAttribute && container.contains(focused) === false) {
+      const candidate = $$(`[${focusAttribute.name}]`,container).find(button => button.getAttribute(focusAttribute.name)===focusAttribute.value && (!focusChat || button.dataset.chatJob===focusChat));
+      candidate?.focus({preventScroll:true});
+    }
+  }
+  function renderChatBackground(sync) {
+    const element = $("#queue-chat-status"); if (!element || !sync) return;
+    const title = !sync.connected ? "Чаты: требуется подключение Bitrix24" : !sync.worker_running ? "Фоновый обработчик чатов не запущен" : sync.active_chat ? "Чаты сохраняются в фоне" : sync.discovering ? "В фоне обновляется каталог чатов" : "Фоновый обработчик чатов работает";
+    const detail = !sync.connected || !sync.worker_running ? "" : sync.paused ? "Автоматизация на паузе. Ручные загрузки продолжаются." : sync.automatic ? `${sync.discovering ? "Каталог обновляется" : sync.next_catalogue_at>Date.now()/1000 ? "Следующая проверка каталога: "+escapeHtml(dateString(new Date(sync.next_catalogue_at*1000).toISOString())) : "Проверка каталога ожидает свободного прохода"}` : "Автосохранение выключено. Выбранные вручную чаты продолжают загружаться.";
+    const last = sync.last_progress?.at ? `Последнее сохранение: ${escapeHtml(dateString(new Date(sync.last_progress.at*1000).toISOString()))}${sync.last_progress.chat ? " · чат ID "+sync.last_progress.chat : ""}` : "Сохранений сообщений или файлов ещё не было.";
+    element.innerHTML = `${icon(sync.worker_running ? "refresh" : "info")}<div><strong>${title}</strong><p>${detail}${detail ? " · " : ""}${last}</p>${sync.error ? `<p class="job-error">${escapeHtml(sync.error)}</p>` : ""}<p>Закрытие окна оставляет приложение в трее. «Выход» и сон компьютера останавливают работу.</p></div>`;
+  }
   function renderJobs(jobs) {
     if (!Array.isArray(jobs)) jobs = jobs.items || [];
     const active = jobs.filter(job => ["queued", "running"].includes(job.state));
     $("#nav-jobs").textContent = String(active.length); $("#nav-jobs").hidden = !active.length;
     $("#jobs-summary").textContent = active.length ? `Активных задач: ${active.length}` : "Нет активных задач записей";
-    $("#jobs-list").innerHTML = jobs.length ? jobs.map(job => `<article class="job-item" data-job-id="${job.id}"><div><div class="job-title">${escapeHtml(kinds[job.kind] || job.kind)} ${job.schedule_wait ? '<span class="badge waiting">Ждёт окна</span>' : badge(job.state)}</div><div class="job-meta">Задача ${job.id}${job.meeting_id ? ` · Совещание ${job.meeting_id}` : ""} · ${escapeHtml(dateString(job.created))} · Попыток: ${Number(job.attempts) || 0}</div><div class="job-message">${escapeHtml(job.message || "")}</div>${job.error ? `<div class="job-error">${escapeHtml(job.error)}</div>` : ""}${job.state === "running" ? `<progress class="job-progress" max="1" ${Number(job.progress) > 0 ? `value="${Math.min(1, Number(job.progress))}"` : ""} aria-label="Прогресс задачи ${job.id}"></progress>` : ""}</div><div class="job-actions">${job.schedule_wait ? `<button class="button primary small" data-job-now="${job.id}">Запустить сейчас</button>` : ""}${job.meeting_id ? `<button class="button quiet small" data-meeting="${job.meeting_id}">Открыть</button>` : ""}${["queued", "running"].includes(job.state) ? `<button class="button secondary small" data-job-cancel="${job.id}">Отменить</button>` : ""}${["failed", "cancelled", "canceled"].includes(job.state) ? `<button class="button secondary small" data-job-retry="${job.id}">Повторить</button>` : ""}</div></article>`).join("") : '<div class="empty-state"><h2>Заданий записей пока нет</h2><p>Здесь появятся загрузка записей, импорт, расшифровка и установка моделей.</p></div>';
+    if (jobs.length) renderQueueGroups($("#jobs-list"),jobs,"meeting",job => `<article class="job-item" data-job-id="${job.id}"><div><div class="job-title">${escapeHtml(kinds[job.kind] || job.kind)} ${job.schedule_wait ? '<span class="badge waiting">Ждёт окна</span>' : badge(job.state)}</div><div class="job-meta">Задача ${job.id}${job.meeting_id ? ` · Совещание ${job.meeting_id}` : ""} · ${escapeHtml(dateString(job.created))} · Попыток: ${Number(job.attempts) || 0}</div><div class="job-message">${escapeHtml(job.message || "")}</div>${job.error ? `<div class="job-error">${escapeHtml(job.error)}</div>` : ""}${job.state === "running" ? `<progress class="job-progress" max="1" ${Number(job.progress) > 0 ? `value="${Math.min(1, Number(job.progress))}"` : ""} aria-label="Прогресс задачи ${job.id}"></progress>` : ""}</div><div class="job-actions">${job.schedule_wait ? `<button class="button primary small" data-job-now="${job.id}">Запустить сейчас</button>` : ""}${job.meeting_id ? `<button class="button quiet small" data-meeting="${job.meeting_id}">Открыть</button>` : ""}${["queued", "running"].includes(job.state) ? `<button class="button secondary small" data-job-cancel="${job.id}">Отменить</button>` : ""}${["failed", "cancelled", "canceled"].includes(job.state) ? `<button class="button secondary small" data-job-retry="${job.id}">Повторить</button>` : ""}</div></article>`);
+    else $("#jobs-list").innerHTML = '<div class="empty-state"><h2>Заданий записей пока нет</h2><p>Здесь появятся загрузка записей, импорт, расшифровка и установка моделей.</p></div>';
   }
   function decorateJobIcons() {
     $$('[data-job-now]').forEach(button => decorateButton(button, 'play'));
@@ -676,16 +719,18 @@
   }
   function renderChatJobs(data, append=false, replace=false) {
     if (!data || !$("#chat-jobs-list")) return;
-    if(state.chatQueueAccount && state.chatQueueAccount!==data.account) state.chatQueueItems=[];
+    if(state.chatQueueAccount && state.chatQueueAccount!==data.account) { state.chatQueueItems=[]; for(const key of state.queueOpen?.keys() || []) if(key.startsWith("chat:")) state.queueOpen.delete(key); }
     state.chatQueueAccount=data.account;
     const previous=state.chatQueueItems||[], keep=!replace && state.route==="jobs" && previous.length>100;
     state.chatQueueItems=append ? [...previous,...data.items.filter(item=>!previous.some(old=>old.id===item.id))] : keep ? [...data.items,...previous.filter(old=>!data.items.some(item=>item.id===old.id))] : data.items;
     state.chatQueueTotal=data.total;
     const meetingActive=(state.bootstrap?.jobs||[]).filter(job=>["queued","running","waiting"].includes(job.state)).length;
     $("#nav-jobs").textContent=String(meetingActive+data.pending); $("#nav-jobs").hidden=meetingActive+data.pending===0;
-    $("#chat-jobs-summary").textContent=`Ожидают или выполняются: ${data.pending} · показано ${state.chatQueueItems.length} из ${data.total}`;
-    $("#chat-jobs-list").innerHTML=state.chatQueueItems.length ? state.chatQueueItems.map(job=>`<article class="job-item" data-chat-job-id="${job.id}"><div><div class="job-title">${icon(job.kind==="file" ? "file" : "chat")} ${escapeHtml(job.label)} ${badge(job.schedule_wait ? "waiting" : job.state)}</div><div class="job-meta">${escapeHtml(job.title)}${job.chat ? " · Чат ID "+job.chat : ""}${job.filename ? " · "+escapeHtml(job.filename) : ""}${job.touched ? " · "+escapeHtml(dateString(new Date(job.touched*1000).toISOString())) : ""}</div><div class="job-message">${escapeHtml(job.message||"")}${job.pages ? ` · Страниц: ${job.pages}` : ""}${job.messages ? ` · Обработано сообщений: ${job.messages}` : ""}${job.next_at>Date.now()/1000 ? ` · Повтор не раньше ${escapeHtml(dateString(new Date(job.next_at*1000).toISOString()))}` : ""}</div>${job.error ? `<div class="job-error">${escapeHtml(job.error)}</div>` : ""}${job.state==="running" ? `<progress class="job-progress" max="1"${job.total_bytes && job.downloaded_bytes ? ` value="${Math.min(1,job.downloaded_bytes/job.total_bytes)}"` : ""} aria-label="Выполнение задания чата"></progress>` : ""}</div><div class="job-actions">${job.state==="failed" || job.state==="cancelled" ? `<button class="button secondary small" data-chat-job-action="retry" data-chat-job="${job.id}">Повторить</button>` : ""}${job.state==="queued" || job.state==="failed" ? `<button class="button quiet small" data-chat-job-action="cancel" data-chat-job="${job.id}">Отменить</button>` : ""}</div></article>`).join("") : '<div class="empty-state"><p>Заданий чатов пока нет. Здесь появятся сохранение сообщений, история и вложения.</p></div>';
+    $("#chat-jobs-summary").textContent=`Ожидают или выполняются: ${data.pending}${data.failed ? " · Ошибок: "+data.failed : ""} · показано работ ${state.chatQueueItems.length} из ${data.total}`;
+    if (state.chatQueueItems.length) renderQueueGroups($("#chat-jobs-list"),state.chatQueueItems,"chat",job => `<article class="job-item" data-chat-job-id="${job.id}"><div><div class="job-title">${icon(job.kind==="file" ? "file" : "chat")} ${escapeHtml(job.label)} ${badge(job.schedule_wait ? "waiting" : job.state)}</div><div class="job-meta">${escapeHtml(job.title)}${job.chat ? " · Чат ID "+job.chat : ""}${job.filename ? " · "+escapeHtml(job.filename) : ""}${job.automatic === true ? " · Автоматически" : job.automatic === false && job.kind!=="metadata" ? " · По вашему выбору" : ""}${job.touched ? " · "+escapeHtml(dateString(new Date(job.touched*1000).toISOString())) : ""}</div><div class="job-message">${escapeHtml(job.message||"")}${job.pages ? ` · Страниц: ${job.pages}` : ""}${job.messages ? ` · Обработано сообщений: ${job.messages}` : ""}${job.next_at>Date.now()/1000 ? ` · Повтор не раньше ${escapeHtml(dateString(new Date(job.next_at*1000).toISOString()))}` : ""}</div>${job.error ? `<div class="job-error">${escapeHtml(job.error)}</div>` : ""}${job.state==="running" ? `<progress class="job-progress" max="1"${job.total_bytes && job.downloaded_bytes ? ` value="${Math.min(1,job.downloaded_bytes/job.total_bytes)}"` : ""} aria-label="Выполнение задания чата"></progress>` : ""}</div><div class="job-actions">${job.state==="failed" || job.state==="cancelled" ? `<button class="button secondary small" data-chat-job-action="retry" data-chat-job="${job.id}">Повторить</button>` : ""}${job.state==="queued" || job.state==="failed" ? `<button class="button quiet small" data-chat-job-action="cancel" data-chat-job="${job.id}">Отменить</button>` : ""}</div></article>`, data.groups || []);
+    else $("#chat-jobs-list").innerHTML = '<div class="empty-state"><p>Заданий чатов пока нет. Здесь появятся сохранение сообщений, история и вложения.</p></div>';
     $("#chat-jobs-more").hidden=state.chatQueueItems.length>=data.total;
+    renderChatBackground(data.sync);
   }
   function renderModule(module) {
     const jobs = Array.isArray(state.bootstrap?.jobs) ? state.bootstrap.jobs : state.bootstrap?.jobs?.items || [];

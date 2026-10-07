@@ -26,6 +26,21 @@ ACCESS_CODES = {"ACCESS_ERROR", "ACCESS_DENIED", "CHAT_NOT_FOUND", "DIALOG_ID_IN
 UNSUPPORTED_CODES = {"METHOD_NOT_FOUND", "ERROR_METHOD_NOT_FOUND", "NOT_IMPLEMENTED", "UNKNOWN_METHOD"}
 
 
+async def durable_io(function, *args):
+    """Cancellation must drain disk work before Service.stop closes SQLite.
+
+    Cancelling to_thread's await does not stop its native thread. Keep the chat
+    lock and let an already started local write/recovery finish on shutdown.
+    Network waits remain immediately cancellable.
+    """
+    task = asyncio.create_task(asyncio.to_thread(function, *args))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await task
+        raise
+
+
 def iso_day(value, end=False):
     if not value:
         return ""
@@ -322,7 +337,7 @@ class ChatArchive:
                     raise
                 store.update_chat(chat["id"], participants_at=time.time(), participants_warning=self.service.vault.redact(str(exc)))
             self.service.db.execute("DELETE FROM ca_work WHERE account=? AND chat=? AND kind=?", (store.account, chat["id"], row["kind"]))
-            await asyncio.to_thread(store.flush, chat["id"])
+            await durable_io(store.flush, chat["id"])
             return
         page, method = await self.fetch_page(chat, work)
         raw_messages = page["messages"]
@@ -349,7 +364,7 @@ class ChatArchive:
             page_ids = [positive(m.get("id")) for m in selected_page["messages"]]
             archived = {r["id"] for r in self.service.db.rows("SELECT id FROM ca_messages WHERE account=? AND chat=? AND id IN (" + ",".join("?" for _ in page_ids) + ")", (store.account, chat["id"], *page_ids))} if page_ids else set()
             selected_page["messages"] = [m for m in selected_page["messages"] if positive(m.get("id")) in archived]
-        messages = await asyncio.to_thread(store.save_page, chat["id"], selected_page)
+        messages = await durable_io(store.save_page, chat["id"], selected_page)
         work.pop("error",None)
         work["pages"]=work.get("pages",0)+1
         work["messages"]=work.get("messages",0)+len(messages)
@@ -404,14 +419,26 @@ class ChatArchive:
             work["cursor"] = cursor
             self.service.db.execute("UPDATE ca_work SET data=?,touched=?,next_at=0 WHERE account=? AND chat=? AND kind=?",
                                     (canonical(work), time.time(), store.account, chat["id"], row["kind"]))
-        await asyncio.to_thread(store.flush, chat["id"])
+        await durable_io(store.flush, chat["id"])
+        store.set_state("last_progress", {"at": time.time(), "chat": chat["id"], "kind": row["kind"],
+                                          "pages": work["pages"], "messages": work["messages"]})
+        return {"pages": work["pages"], "messages": work["messages"], "automatic": bool(work.get("automatic"))}
 
     def status(self):
-        store=self.store()
-        return {"discovering":bool(getattr(self,"discovering",False) or store.state("discover_requested")),
-                "last_catalogue_at":store.state("last_discovery",0),
-                "next_catalogue_at":store.state("last_discovery",0)+self.service.settings.chat_poll_seconds,
-                "worker_running":bool(getattr(self,"loop_running",False)), "error":self.error}
+        store = self.store()
+        work = getattr(self, "current_work", None)
+        current = work if work and work[0] == store.account else None
+        last = store.state("last_discovery", 0)
+        running = bool(self.service.alive and getattr(self, "loop_running", False))
+        automatic = self.service.settings.chat_auto_save and not self.service.settings.paused
+        return {"discovering": bool(getattr(self, "discovering", False) or store.state("discover_requested")),
+                "last_catalogue_at": last,
+                "next_catalogue_at": max(last + self.service.settings.chat_poll_seconds, store.state("discovery_retry_at", 0)),
+                "worker_running": running, "file_worker_running": bool(getattr(self, "file_loop_running", False)),
+                "last_cycle_at": getattr(self, "last_cycle_at", 0), "last_progress": store.state("last_progress", {}),
+                "active_chat": current[1] if current else 0, "active_kind": current[2] if current else "",
+                "connected": self.service.connected(), "automatic": automatic,
+                "paused": self.service.settings.paused, "error": self.error}
 
     def queue_file(self, store, chat, id, *, automatic=False, missing_ok=False, manual_collection=False, history_opt_in=False):
         try:
@@ -557,7 +584,7 @@ class ChatArchive:
             store = self.store()
             s = self.service.settings
             if store.account not in self.recovered:
-                await asyncio.to_thread(store.recover)
+                await durable_io(store.recover)
                 self.recovered.add(store.account)
             if store.state("collection_policy", 0) < 2:
                 # Upgrade the earlier automatic-full-history policy without
@@ -630,10 +657,10 @@ class ChatArchive:
                 self.active = f"Чат {row['chat']}"
                 self.current_work=(store.account,row["chat"],row["kind"])
                 try:
-                    await self.process_work(store, row)
+                    result = await self.process_work(store, row)
                     left=self.service.db.rows("SELECT data FROM ca_work WHERE account=? AND chat=? AND kind=?",(store.account,row["chat"],row["kind"]))
                     if not left:
-                        store.activity(row["kind"],row["chat"],"done",pages=work.get("pages",0)+1)
+                        store.activity(row["kind"], row["chat"], "done", **(result or {}))
                     self.error = ""
                 except (BitrixError, httpx.HTTPError, ValueError, OSError) as exc:
                     message = self.service.vault.redact(str(exc))
@@ -648,15 +675,20 @@ class ChatArchive:
                 break  # One page per turn: fair across chats and cancellable.
 
     async def loop(self):
-        self.loop_running=True
-        while self.service.alive:
-            try:
-                await self.step()
-            except Exception as exc:
-                self.error = self.service.vault.redact(str(exc))
-                await asyncio.sleep(10)
-            await asyncio.sleep(1)
-        self.loop_running=False
+        self.loop_running = True
+        try:
+            while self.service.alive:
+                self.last_cycle_at = time.time()
+                try:
+                    await self.step()
+                except Exception as exc:
+                    self.error = self.service.vault.redact(str(exc))
+                    await asyncio.sleep(10)
+                await asyncio.sleep(1)
+        finally:
+            self.loop_running = False
+            self.active = ""
+            self.current_work = None
 
     async def download_file(self, store, file, client=None):
         chat = store.chat(file["chat"])
@@ -723,7 +755,8 @@ class ChatArchive:
                 data.update(contents=contents, path=content["path"], sha256=sha, size=size)
                 store.file_update(file["chat"], file["id"], data=canonical(data), state="saved", error="")
                 store.activity("file",file["chat"],"done",file_id=file["id"],filename=file["name"],downloaded_bytes=size,total_bytes=size)
-                await asyncio.to_thread(store.flush, file["chat"])
+                await durable_io(store.flush, file["chat"])
+                store.set_state("last_progress", {"at": time.time(), "chat": file["chat"], "kind": "file"})
         finally:
             temp.unlink(missing_ok=True)
 
@@ -770,9 +803,13 @@ class ChatArchive:
                 break
 
     async def file_loop(self):
-        while self.service.alive:
-            try:
-                await self.file_step()
-            except Exception as exc:
-                self.error = self.service.vault.redact(str(exc))
-            await asyncio.sleep(1)
+        self.file_loop_running = True
+        try:
+            while self.service.alive:
+                try:
+                    await self.file_step()
+                except Exception as exc:
+                    self.error = self.service.vault.redact(str(exc))
+                await asyncio.sleep(1)
+        finally:
+            self.file_loop_running = False

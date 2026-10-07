@@ -30,12 +30,15 @@ def queue_view(engine, offset=0, limit=100, *, all_items=False):
 
     def item(kind, chat, state, **values):
         id = fingerprint([store.account, kind, chat, values.get("file_id", 0)])[:24]
+        details = chats.get(chat, {})
         return {
             "id": id,
             "kind": kind,
             "chat": chat,
             "state": state,
-            "title": chats.get(chat, {}).get("title", "Каталог чатов"),
+            "title": details.get("title") or (f"Чат ID {chat}" if chat else "Каталог чатов"),
+            "group_key": f"chat:{chat}" if chat else "catalogue",
+            "group": details.get("group", "conversations"), "task_id": details.get("task_id", 0),
             "label": LABELS.get(kind, "Выбранный период"),
             **values,
         }
@@ -52,6 +55,8 @@ def queue_view(engine, offset=0, limit=100, *, all_items=False):
         data = json.loads(row["data"])
         running = getattr(engine, "current_work", None) == (store.account, row["chat"], row["kind"])
         state = "running" if running else "failed" if data.get("error") else "queued"
+        waiting = bool(data.get("automatic") and
+                       (not engine.service.settings.chat_auto_save or engine.service.settings.paused or not engine.selected(row["chat"])))
         value = item(
             row["kind"],
             row["chat"],
@@ -62,6 +67,10 @@ def queue_view(engine, offset=0, limit=100, *, all_items=False):
             error=data.get("error", ""),
             pages=data.get("pages", 0),
             messages=data.get("messages", 0),
+            schedule_wait=waiting,
+            message="Автоматизация на паузе" if waiting and engine.service.settings.paused else
+                    "Автосохранение выключено или чат исключён" if waiting else "",
+            will_retry=True,
         )
         entries[value["id"]] = value
     for row in store.db.rows(
@@ -96,6 +105,7 @@ def queue_view(engine, offset=0, limit=100, *, all_items=False):
             else "",
             downloaded_bytes=data.get("downloaded_bytes", 0),
             total_bytes=data.get("size", 0),
+            will_retry=row["state"] == "queued",
         )
         entries[value["id"]] = value
     if store.state("discover_requested"):
@@ -120,12 +130,25 @@ def queue_view(engine, offset=0, limit=100, *, all_items=False):
     )
     offset = max(0, offset)
     limit = max(1, min(200, limit))
+    groups = {}
+    for value in values:
+        group = groups.setdefault(value["group_key"], {
+            "key": value["group_key"], "title": value["title"], "chat": value["chat"],
+            "group": value["group"], "task_id": value["task_id"],
+            "total": 0, "pending": 0, "running": 0, "failed": 0,
+        })
+        group["total"] += 1
+        group["pending"] += value["state"] in {"queued", "running"} or value.get("will_retry", False)
+        group["running"] += value["state"] == "running"
+        group["failed"] += value["state"] == "failed"
     return {
         "items": values if all_items else values[offset : offset + limit],
         "account": store.account,
         "total": len(values),
         "offset": offset,
-        "pending": sum(e["state"] in {"queued", "running", "failed"} for e in values),
+        "pending": sum(g["pending"] for g in groups.values()),
+        "failed": sum(g["failed"] for g in groups.values()),
+        "groups": list(groups.values()), "sync": engine.status(),
     }
 
 

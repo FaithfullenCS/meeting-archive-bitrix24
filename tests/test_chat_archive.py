@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import asyncio
 import time
+import threading
 from datetime import datetime, timezone, timedelta
 from dataclasses import replace
 from pathlib import Path
@@ -270,6 +271,224 @@ def seed(service, id=101):
     store = service.chat_archive.store()
     store.upsert_chat(id, f"chat{id}", title="Синтетическая беседа", participants=[{"id": 42, "name": "Участник"}], participants_at=time.time())
     return store
+
+
+def background_inventory(service, monkeypatch):
+    """Run the real application/message/file lifecycle, with no UI or real I/O."""
+    async def idle(*args):
+        await asyncio.Future()
+
+    for name in ("job_loop", "scheduler", "discover_resources", "refresh_identity"):
+        monkeypatch.setattr(service, name, idle)
+    store = seed(service)
+    for key, value in {"collection_policy": 2, "inventory_ready": True,
+                       "last_discovery": time.time(), "extra_recent_at": time.time(),
+                       "recent_check_at": time.time(), "audit_at": time.time(),
+                       "auto_since": "2026-01-01T00:00:00Z"}.items():
+        store.set_state(key, value)
+    return store
+
+
+async def wait_background(predicate, timeout=8):
+    async with asyncio.timeout(timeout):
+        while not predicate():
+            await asyncio.sleep(.02)
+
+
+@pytest.mark.parametrize("paused", [False, True])
+async def test_manual_history_runs_in_application_lifespan_without_ui(chat_service, monkeypatch, paused):
+    service = chat_service
+    store = background_inventory(service, monkeypatch)
+    service.settings.chat_auto_save = False
+    service.settings.paused = paused
+    cursors = []
+
+    async def call(method, params, **kwargs):
+        assert method == "im.dialog.messages.search"
+        cursor = params.get("LAST_ID", 0)
+        cursors.append(cursor)
+        return {"messages": [message(i) for i in (range(205, 5, -1) if not cursor else range(5, 0, -1))]}
+
+    service.client.call = call
+    service.chat_archive.request_history([101])
+    app = create_app(service, manage_lifecycle=True)
+    # No HTTP client, bootstrap, catalogue, chat selection or desktop-ready call.
+    async with app.router.lifespan_context(app):
+        await wait_background(lambda: store.chat(101).get("history_complete"))
+        assert cursors == [0, 6]
+        assert store.query(chat=101)["total"] == 205
+        assert (store.chat_folder(101) / "messages/2026-09.md").is_file()
+        assert service.chat_archive.status()["worker_running"]
+        await wait_background(lambda: store.state("last_progress", {}).get("messages") == 205)
+        finished = next(e for e in queue_view(service.chat_archive)["items"] if e["kind"] == "history")
+        assert finished["state"] == "done" and finished["messages"] == 205 and finished["pages"] == 2
+    assert not service.chat_archive.loop_running
+
+
+async def test_new_message_polled_in_background_without_ui(chat_service, monkeypatch):
+    service = chat_service
+    store = background_inventory(service, monkeypatch)
+    service.settings.chat_auto_save = True
+    service.settings.chat_poll_seconds = 300
+    store.update_chat(101, sync_head_id=1, source_last_message_id=1, new_checked_at=time.time())
+    moment = [time.time()]
+    monkeypatch.setattr("meeting_archive.chat_sync.time.time", lambda: moment[0])
+    methods = []
+
+    async def call(method, params, **kwargs):
+        methods.append(method)
+        if method == "im.recent.list":
+            return {"items": [{"id": "chat101", "chat_id": 101, "type": "chat",
+                               "message": {"id": 2, "date": "2026-12-01T00:00:00Z"}}], "hasMore": False}
+        assert method == "im.dialog.messages.search"
+        return {"messages": [message(2, date="2026-12-01T00:00:00Z")]}
+
+    service.client.call = call
+    app = create_app(service, manage_lifecycle=True)
+    async with app.router.lifespan_context(app):
+        await wait_background(lambda: getattr(service.chat_archive, "loop_running", False))
+        assert not methods
+        moment[0] += 301
+        await wait_background(lambda: store.message(101, 2) is not None)
+        assert methods == ["im.recent.list", "im.dialog.messages.search"]
+
+
+async def test_history_resumes_after_process_restart_without_ui(chat_service, monkeypatch):
+    service = chat_service
+    store = background_inventory(service, monkeypatch)
+    service.settings.chat_auto_save = False
+    service.settings.save(service.home)
+    page_two = asyncio.Event()
+    cursors = []
+
+    async def call(method, params, **kwargs):
+        assert method == "im.dialog.messages.search"
+        cursor = params.get("LAST_ID", 0)
+        cursors.append(cursor)
+        if cursor:
+            page_two.set()
+            await asyncio.Future()  # Simulate exit while a network request is pending.
+        return {"messages": [message(i) for i in range(205, 5, -1)]}
+
+    service.client.call = call
+    service.chat_archive.request_history([101])
+    app = create_app(service, manage_lifecycle=True)
+    async with app.router.lifespan_context(app):
+        await asyncio.wait_for(page_two.wait(), 8)
+        assert store.query(chat=101)["total"] == 200
+    client = BitrixClient(service.settings, service.vault, transport=httpx.MockTransport(lambda r: httpx.Response(200)))
+    restarted = Service(service.home, vault=service.vault, client=client)
+    client.settings = restarted.settings
+    resumed_store = background_inventory(restarted, monkeypatch)
+
+    async def resume(method, params, **kwargs):
+        assert method == "im.dialog.messages.search"
+        cursors.append(params.get("LAST_ID", 0))
+        return {"messages": [message(i) for i in range(5, 0, -1)]}
+
+    client.call = resume
+    app = create_app(restarted, manage_lifecycle=True)
+    async with app.router.lifespan_context(app):
+        await wait_background(lambda: resumed_store.chat(101).get("history_complete"))
+        assert resumed_store.query(chat=101)["total"] == 205
+        assert cursors == [0, 6, 6]
+
+
+async def test_manual_attachment_download_runs_without_ui(chat_service, monkeypatch):
+    service = chat_service
+    store = background_inventory(service, monkeypatch)
+    service.settings.chat_auto_save = False
+    service.settings.paused = True
+    content = b"synthetic file"
+    store.save_page(101, {"messages": [message(1, fileIds=[77])],
+                          "files": [{"id": 77, "name": "background.txt", "size": len(content)}]})
+
+    async def call(method, params, **kwargs):
+        assert method == "im.v2.File.download"
+        return {"downloadUrl": "https://synthetic.bitrix24.ru/background.txt"}
+
+    service.client.call = call
+    service.chat_archive.queue_file(store, 101, 77)
+    app = create_app(service, manage_lifecycle=True)
+    async with app.router.lifespan_context(app):
+        await wait_background(lambda: store.file(101, 77)["state"] == "saved")
+        await wait_background(lambda: store.state("last_progress", {}).get("kind") == "file")
+        file = store.file(101, 77)
+        assert (store.chat_folder(101) / file["path"]).read_bytes() == content
+    assert not service.chat_archive.file_loop_running
+
+
+async def test_shutdown_drains_inflight_chat_write_before_closing_database(chat_service, monkeypatch):
+    service = chat_service
+    store = background_inventory(service, monkeypatch)
+    folder = store.chat_folder(101)
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
+    original = ChatStore.save_page
+
+    def slow_write(self, *args):
+        started.set()
+        assert release.wait(5), "Test must release the synthetic disk write"
+        result = original(self, *args)
+        finished.set()
+        return result
+
+    monkeypatch.setattr(ChatStore, "save_page", slow_write)
+    async def call(method, params, **kwargs):
+        assert method == "im.dialog.messages.search"
+        return {"messages": [message(1)]}
+
+    service.client.call = call
+    service.chat_archive.request_history([101])
+    await service.start()
+    stopping = None
+    try:
+        await wait_background(started.is_set)
+        stopping = asyncio.create_task(service.stop())
+        await asyncio.sleep(.05)
+        assert not stopping.done(), "Shutdown must wait for the native disk thread, not just cancel its await"
+        assert service.db.rows("SELECT count(*) AS n FROM ca_chats")[0]["n"] == 1
+    finally:
+        release.set()
+        await (stopping if stopping else service.stop())
+    assert finished.is_set()
+    assert (folder / "messages/2026-09.jsonl").is_file()
+
+
+def test_queue_group_totals_include_unloaded_files_and_waiting_reason(chat_service):
+    service = chat_service
+    store = seed(service)
+    store.update_chat(101, group="tasks", task_id=900)
+    service.settings.paused = True
+    store.enqueue(101, "history", {"automatic": False}, 2)
+    store.enqueue(101, "new", {"automatic": True}, 0)
+    store.save_page(101, {"messages": [message(1, fileIds=list(range(1, 6)))],
+                          "files": [{"id": i, "name": f"demo-{i}.txt"} for i in range(1, 6)]})
+    for id in range(1, 6):
+        service.chat_archive.queue_file(store, 101, id)
+    store.activity("audit", 101, "failed", error="Synthetic old outcome")
+    view = queue_view(service.chat_archive, limit=2)
+    assert len(view["items"]) == 2 and view["total"] == 8
+    assert view["pending"] == 7 and view["failed"] == 1
+    assert view["groups"] == [{"key": "chat:101", "title": "Синтетическая беседа", "chat": 101,
+                               "group": "tasks", "task_id": 900, "total": 8, "pending": 7, "failed": 1, "running": 0}]
+    entries = queue_view(service.chat_archive, all_items=True)["items"]
+    new = next(e for e in entries if e["kind"] == "new")
+    manual = next(e for e in entries if e["kind"] == "history")
+    assert new["schedule_wait"] and new["message"] == "Автоматизация на паузе"
+    assert not manual["schedule_wait"]
+
+
+async def test_bootstrap_queue_names_meeting_and_does_not_export_payload(chat_service):
+    service = chat_service
+    row = service.db.upsert(service.settings.portal, {"callId": "synthetic-call", "overview": {"topic": "Demo meeting"}})
+    service.db.enqueue("fetch", row["id"], {"automatic": False, "test_internal_field": "SYNTHETIC_PRIVATE"})
+    app = create_app(service, launch_token="synthetic-queue-names", manage_lifecycle=False)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8765") as client:
+        await client.get("/?launch=synthetic-queue-names")
+        response = await client.get("/api/bootstrap")
+    assert response.status_code == 200
+    assert response.json()["jobs"][0]["title"] == "Demo meeting"
+    assert "SYNTHETIC_PRIVATE" not in response.text and "meeting_metadata" not in response.json()["jobs"][0]
 
 
 def test_portable_identity_versions_and_cross_month_context(chat_service):

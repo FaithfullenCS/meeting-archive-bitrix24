@@ -56,8 +56,10 @@ window.ChatArchiveUI = {
       $("#ca-metric-auto").textContent=result.auto_save ? "Включено" : "Выключено";
       $("#ca-metric-poll").textContent=`Новые сообщения · раз в ${Math.max(1,Math.round((result.poll_seconds || getSettings().chat_poll_seconds || 300)/60))} мин.`;
       const pending=Number(result.pending ?? result.pending_total ?? 0);
+      const sync=result.sync;
       $("#ca-metric-loading").textContent=result.active ? "В работе" : pending ? "В очереди" : "Нет задач";
-      $("#ca-sync-status").textContent=result.active || (pending ? `Ожидают: ${pending}` : "Старая история — по выбору");
+      const last=sync?.last_progress?.at ? `Сохранено: ${dateString(new Date(sync.last_progress.at*1000).toISOString())}` : "";
+      $("#ca-sync-status").textContent=sync && !sync.worker_running ? "Фоновый обработчик не запущен" : [result.active || (pending ? `Работ: ${pending}` : "Старая история — по выбору"),last].filter(Boolean).join(" · ");
     }
     function renderHeading() {
       const chat = s.chats.find(c => c.id === s.chat);

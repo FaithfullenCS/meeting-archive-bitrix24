@@ -237,10 +237,15 @@ def create_app(service: Service, launch_token: str | None = None, *, manage_life
     async def bootstrap():
         from .scheduling import window_status
         from .chat_queue import queue_view
-        jobs = service.db.rows("SELECT id,kind,meeting_id,state,attempts,created,error,progress,message,next_at FROM jobs ORDER BY id DESC LIMIT 100")
+        jobs = service.db.rows("""SELECT j.id,j.kind,j.meeting_id,j.state,j.attempts,j.created,j.error,j.progress,j.message,j.next_at,
+                                   j.payload,m.metadata AS meeting_metadata
+                                   FROM jobs j LEFT JOIN meetings m ON m.id=j.meeting_id
+                                   ORDER BY j.id DESC LIMIT 100""")
         windows = {"download": window_status(service.settings.download_schedule), "local": window_status(service.settings.local_schedule), "chat_attachment": window_status(service.settings.chat_attachment_schedule)}
         for job in jobs:
-            payload = json.loads(service.db.rows("SELECT payload FROM jobs WHERE id=?", (job["id"],))[0]["payload"])
+            payload = json.loads(job.pop("payload"))
+            metadata = json.loads(job.pop("meeting_metadata") or "{}")
+            job["title"] = (metadata.get("overview") or {}).get("topic") or metadata.get("chatTitle") or (f"Совещание {job['meeting_id']}" if job["meeting_id"] else "Модели и обработка звука")
             job["automatic"] = bool(payload.get("automatic"))
             window = windows["local" if job["kind"] == "transcribe" else "download"]
             if job["state"] == "queued" and job["automatic"] and not window["allowed"]:
@@ -251,7 +256,8 @@ def create_app(service: Service, launch_token: str | None = None, *, manage_life
                 "notification_error": service.notifications.error,
                 "account_name": service.db.get_state(service.identity_key()) if service.connected() else "",
                 "chat_warning": service.chat_warning, "chat_revision": service.db.get_state("chat_revision"),
-                "chat_archive": {**service.chat_archive.store().summary(), "poll_seconds": service.settings.chat_poll_seconds},
+                "chat_archive": {**service.chat_archive.store().summary(), "poll_seconds": service.settings.chat_poll_seconds,
+                                 "sync": service.chat_archive.status()},
                 "chat_queue": queue_view(service.chat_archive),
                 "secret_status": {"webhook_saved": bool(saved.get("webhook")),
                                   "hf_token_saved": bool(saved.get("hf_token")),

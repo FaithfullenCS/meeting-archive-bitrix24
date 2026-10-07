@@ -174,6 +174,22 @@ tbody tr:hover { background: var(--soft); }
 .link-import { display: flex; gap: 12px; flex-wrap: wrap; align-items: end; border-top: 1px solid var(--border); margin-top: 17px; padding-top: 18px; }
 .link-import p { flex-basis: 100%; }
 .jobs-list { display: grid; }
+.notice.queue-background { display: flex; align-items: flex-start; justify-content: flex-start; gap: 12px; margin: 0 0 18px; }
+.queue-background > .ui-icon { flex: 0 0 auto; margin-top: 3px; }
+.queue-background p { margin: 4px 0 0; font-size: 12px; }
+.queue-group { border-bottom: 1px solid var(--border); }
+.queue-group:last-child { border-bottom: 0; }
+.queue-group > summary { display: flex; align-items: center; gap: 14px; padding: 17px 0; cursor: pointer; list-style: none; }
+.queue-group > summary::-webkit-details-marker { display: none; }
+.queue-group-heading { display: grid; flex: 1; min-width: 0; gap: 3px; }
+.queue-group-heading strong { font-size: 14px; overflow-wrap: anywhere; }
+.queue-group-heading > span { color: var(--muted); font-size: 11px; }
+.queue-group-icon { display: flex; align-items: center; justify-content: center; width: 36px; height: 36px; flex: 0 0 auto; background: var(--accent-light); color: var(--accent); border-radius: 8px; }
+.queue-group > summary > .ui-icon:last-child { flex: 0 0 auto; transition: transform .15s; }
+.queue-group[open] > summary > .ui-icon:last-child { transform: rotate(180deg); }
+.queue-group-items { padding-left: 50px; }
+.queue-group-items .job-item { padding: 14px 0; }
+@media (max-width: 700px) { .queue-group-items { padding-left: 0; } .queue-group > summary { gap: 8px; } .job-actions { flex-wrap: wrap; } }
 .job-item { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 18px; padding: 20px 0; border-bottom: 1px solid var(--border); }
 .job-item:last-child { border: 0; }
 .job-title { display: flex; gap: 12px; align-items: center; font-size: 13px; font-weight: 600; margin-bottom: 6px; }

@@ -148,4 +148,5 @@ class Database:
         self.execute("INSERT OR REPLACE INTO state(key,value) VALUES(?,?)", (key, value))
 
     def close(self):
-        self.connection.close()
+        with self.lock:
+            self.connection.close()
