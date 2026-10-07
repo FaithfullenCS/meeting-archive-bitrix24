@@ -1,4 +1,7 @@
 /* Chat archive inherits the application's approved visual tokens. */
+.ca-delete-selected { margin: 0 16px 10px; }
+.ca-thread-footer { gap: 8px; }
+.ca-file-delete { min-width: 30px; padding: 6px; }
 .ca-heading { margin-bottom: 16px; }
 .ca-filters { padding: 12px 16px; margin-bottom: 12px; }
 .ca-filter-row { display: flex; align-items: end; flex-wrap: wrap; gap: 8px 12px; }

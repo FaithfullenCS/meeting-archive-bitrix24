@@ -17,6 +17,7 @@ from meeting_archive.chat_model import category, normalize, text_html
 from meeting_archive.chat_storage import ChatStore
 from meeting_archive.chat_model import chat_classification
 from meeting_archive.chat_queue import queue_view, queue_action
+from meeting_archive.chat_cleanup import material_plan, remove_materials
 from meeting_archive.service import Service
 
 
@@ -271,6 +272,128 @@ def seed(service, id=101):
     store = service.chat_archive.store()
     store.upsert_chat(id, f"chat{id}", title="Синтетическая беседа", participants=[{"id": 42, "name": "Участник"}], participants_at=time.time())
     return store
+
+
+def cleanup_seed(service):
+    store = seed(service)
+    service.settings.chat_download_documents = True
+    service.settings.chat_auto_save = True
+    store.set_state("collection_policy", 5)
+    store.set_state("auto_since", "2020-01-01T00:00:00Z")
+    store.save_page(101, {"messages": [message(1, fileIds=[77])], "files": [{"id": 77, "name": "demo.txt", "size": 9}]})
+    folder = store.chat_folder(101)
+    saved = folder / "attachments/file-77/hash_demo.txt"
+    saved.parent.mkdir(parents=True, exist_ok=True)
+    saved.write_bytes(b"synthetic")
+    data = store.file(101, 77)
+    data.update(path=saved.relative_to(folder).as_posix(), contents=[{"path": saved.relative_to(folder).as_posix(), "sha256": "synthetic", "size": 9}])
+    store.file_update(101, 77, state="saved", data=json.dumps(data))
+    (folder / "notes/keep.md").write_text("Synthetic note", "utf-8")
+    store.flush(101)
+    return store, folder
+
+
+async def test_chat_message_removal_clears_index_and_does_not_refetch_old(chat_service):
+    store, folder = cleanup_seed(chat_service)
+    store.save_page(101, {"messages": [message(1, fileIds=[77], text="Changed synthetic") ]})
+    store.enqueue(101, "history", {"automatic": False}, 2)
+    export = chat_service.home / "exports" / (store.account + ".zip")
+    export.parent.mkdir()
+    export.write_bytes(b"synthetic export")
+    plan = material_plan(chat_service.chat_archive, [101], ["messages"])
+    remove_materials(chat_service.chat_archive, chat_service.home, plan["ids"], plan["targets"], plan["token"])
+    assert not store.query(chat=101)["total"] and not store.versions(101, 1)
+    assert not (folder / "messages").exists() and not (folder / "versions").exists()
+    assert (folder / "notes/keep.md").read_text("utf-8") == "Synthetic note"
+    assert (folder / "attachments/file-77/hash_demo.txt").exists() and not export.exists()
+    assert not store.chat(101)["manual_history_requested"] and store.chat(101)["message_delete_after"]
+    chat_service.chat_archive.schedule_chat(store, store.chat(101), True)
+    queued = json.loads(store.db.rows("SELECT data FROM ca_work WHERE account=? AND kind='new'", (store.account,))[0]["data"])
+    assert queued["date_from"] == store.chat(101)["message_delete_after"]
+    async def call(method, params, **kwargs):
+        return {"messages": [message(1)]}
+    chat_service.client.call = call
+    row = store.db.rows("SELECT * FROM ca_work WHERE account=? AND kind='new'", (store.account,))[0]
+    await chat_service.chat_archive.process_work(store, row)
+    assert not store.query(chat=101)["total"]
+    chat_service.chat_archive.request_history([101])
+    assert not store.chat(101)["message_delete_after"]
+
+
+def test_chat_attachment_removal_suppresses_automatic_until_manual_download(chat_service):
+    store, folder = cleanup_seed(chat_service)
+    plan = material_plan(chat_service.chat_archive, [101], ["attachments/file-77"])
+    remove_materials(chat_service.chat_archive, chat_service.home, plan["ids"], plan["targets"], plan["token"])
+    assert store.query(chat=101)["total"] == 1 and not (folder / "attachments/file-77").exists()
+    file = store.file(101, 77)
+    assert file["locally_deleted"] and not file.get("path") and not file.get("contents")
+    chat_service.chat_archive.queue_file(store, 101, 77, automatic=True, history_opt_in=True)
+    assert store.file(101, 77)["state"] == "not_saved"
+    store.save_page(101, {"messages": [message(1, fileIds=[77])], "files": [{"id": 77, "name": "demo.txt"}]})
+    assert store.file(101, 77)["locally_deleted"]
+    chat_service.chat_archive.queue_file(store, 101, 77)
+    assert store.file(101, 77)["state"] == "queued" and not store.file(101, 77).get("locally_deleted")
+
+
+def test_chat_removal_stale_preview_and_account_scope(chat_service):
+    store, folder = cleanup_seed(chat_service)
+    plan = material_plan(chat_service.chat_archive, [101], ["messages"])
+    store.save_page(101, {"messages": [message(2)]})
+    with pytest.raises(ValueError, match="изменился"):
+        remove_materials(chat_service.chat_archive, chat_service.home, plan["ids"], plan["targets"], plan["token"])
+    assert store.query(chat=101)["total"] == 2 and (folder / "messages/2026-09.md").exists()
+    chat_service.settings.user_id = 43
+    with pytest.raises(ValueError):
+        material_plan(chat_service.chat_archive, [101], ["messages"])
+
+
+def test_chat_interrupted_delete_recovers_without_resurrection(chat_service, monkeypatch):
+    import meeting_archive.chat_cleanup as cleanup
+    store, folder = cleanup_seed(chat_service)
+    plan = material_plan(chat_service.chat_archive, [101], ["messages"])
+    original = cleanup.remove_selection
+    def fail(*args, **kwargs):
+        if args[0] == folder:
+            raise OSError("Synthetic interrupted deletion")
+        return original(*args, **kwargs)
+    monkeypatch.setattr(cleanup, "remove_selection", fail)
+    with pytest.raises(OSError):
+        remove_materials(chat_service.chat_archive, chat_service.home, plan["ids"], plan["targets"], plan["token"])
+    assert (folder / ".delete-pending.json").exists()
+    monkeypatch.setattr(cleanup, "remove_selection", original)
+    # Recovery also works when the index is lost before the next start.
+    store.db.execute("DELETE FROM ca_chats WHERE account=?", (store.account,))
+    store.recover()
+    assert not store.query(chat=101)["total"] and not (folder / ".delete-pending.json").exists()
+    assert (folder / "notes/keep.md").exists()
+
+
+async def test_chat_remove_api_requires_session_csrf_confirmation_and_fresh_plan(chat_service):
+    store, folder = cleanup_seed(chat_service)
+    app = create_app(chat_service, launch_token="synthetic-remove", manage_lifecycle=False)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app, raise_app_exceptions=False), base_url="http://127.0.0.1:8765") as client:
+        assert (await client.post("/api/chat-archive/materials/plan", json={"ids": [101]})).status_code == 401
+        await client.get("/?launch=synthetic-remove")
+        csrf = (await client.get("/api/bootstrap")).json()["csrf"]
+        assert (await client.post("/api/chat-archive/materials/plan", json={"ids": [101]})).status_code == 403
+        headers = {"X-CSRF-Token": csrf}
+        plan = (await client.post("/api/chat-archive/materials/plan", json={"ids": [101], "targets": ["notes"]}, headers=headers)).json()
+        assert {c["target"] for c in plan["choices"]} >= {"messages", "notes", "attachments"}
+        request = {"ids": plan["ids"], "targets": plan["targets"], "token": plan["token"]}
+        assert (await client.post("/api/chat-archive/materials/remove", json=request, headers=headers)).status_code == 400
+        response = await client.post("/api/chat-archive/materials/remove", json={**request, "confirm": True}, headers=headers)
+        assert response.status_code == 200
+    assert store.query(chat=101)["total"] == 1 and not (folder / "notes/keep.md").exists()
+
+
+def test_chat_cleanup_rejects_traversal_and_running_download(chat_service):
+    store, folder = cleanup_seed(chat_service)
+    with pytest.raises(ValueError):
+        material_plan(chat_service.chat_archive, [101], ["attachments/../notes"])
+    store.file_update(101, 77, state="running")
+    with pytest.raises(ValueError, match="завершения"):
+        material_plan(chat_service.chat_archive, [101], ["attachments"])
+    assert (folder / "notes/keep.md").exists()
 
 
 def background_inventory(service, monkeypatch):

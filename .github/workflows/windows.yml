@@ -52,6 +52,8 @@ jobs:
         run: .venv/Scripts/python.exe -X utf8 scripts/smoke_downloaded_runtime.py
       - name: Smoke test packaged executable and local server
         run: .venv/Scripts/python.exe -X utf8 scripts/smoke_windows.py
+      - name: Verify native uninstaller preview and preserved defaults
+        run: .venv/Scripts/python.exe -X utf8 scripts/smoke_uninstaller.py
       - name: Verify program update, activation, preservation and rollback
         run: .venv/Scripts/python.exe -X utf8 scripts/smoke_updates.py
       - name: Mark desktop libraries before actual GUI acceptance

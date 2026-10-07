@@ -39,6 +39,10 @@ class Service:
     def __init__(self, home: Path, *, vault=None, client=None):
         self.home = home.resolve()
         self.home.mkdir(parents=True, exist_ok=True)
+        from .settings import atomic_json
+        marker = self.home / ".meeting-archive-profile.json"
+        if not marker.exists():
+            atomic_json(marker, {"schemaVersion": 1, "product": "MeetingArchive"})
         self.settings = Settings.load(home)
         self.vault = vault or Vault(home)
         self.db = Database(home / "archive.sqlite")

@@ -1,6 +1,6 @@
 "use strict";
 window.ChatArchiveUI = {
-  create({api, icon, escapeHtml: esc, dateString, notify, action, getSettings}) {
+  create({api, icon, escapeHtml: esc, dateString, notify, action, getSettings, openMaterialDelete}) {
     const $ = selector => document.querySelector(selector);
     const form = $("#ca-filters");
     const s = {account: "", chats: [], chat: 0, items: [], total: 0, offset: 0, nextOffset: 0, request: 0, last: 0, busy: false, optionsLoaded: false, selected: new Set(), chatOffset: 0, visible: [], pageItems: [], anchor: 0, messageBusy: false, peopleExpanded: false};
@@ -31,6 +31,7 @@ window.ChatArchiveUI = {
       const n=s.selected.size, count=s.pageItems.filter(c=>s.selected.has(c.id)).length;
       $("#ca-selection-label").textContent=n ? `Выбрано: ${n}` : "Выбрать страницу";
       $("#ca-save-selected").disabled=!n;
+      $("#ca-delete-selected").disabled=!n;
       const check=$("#ca-select-page"); check.checked=Boolean(s.pageItems.length && count===s.pageItems.length);
       check.indeterminate=count>0 && count<s.pageItems.length; check.disabled=!s.pageItems.length;
     }
@@ -63,6 +64,7 @@ window.ChatArchiveUI = {
     }
     function renderHeading() {
       const chat = s.chats.find(c => c.id === s.chat);
+      $("#ca-delete-current").disabled=!chat;
       if (!chat) {
         $("#ca-thread-heading").innerHTML = `<h2>${s.items.length || values().q ? "Поиск по архиву" : "Выберите чат"}</h2>`;
         $("#ca-coverage").hidden = true;
@@ -78,7 +80,7 @@ window.ChatArchiveUI = {
     function renderMessage(m) {
       const name = m.author || (m.system ? "Bitrix24" : `Автор ID ${m.author_id}`);
       const links = (m.relations || []).map(link => `<div class="ca-relation ${link.kind}"><div class="ca-relation-title">${icon(link.kind === "forward" ? "forward" : "reply")}<strong>${link.kind === "forward" ? "Переслано от" : link.kind === "reply" ? "Ответ" : "Цитата"} ${esc(link.author || (link.author_id ? `ID ${link.author_id}` : "· автор не предоставлен"))}</strong></div><small class="muted">Чат ${link.chat_id} · сообщение ${link.message_id}${link.date ? " · " + esc(dateString(link.date)) : ""}</small>${link.excerpt ? `<p>${esc(link.excerpt)}</p>` : ""}<button type="button" class="ca-source-link" data-ca-source="${link.message_id}" data-source-chat="${link.chat_id}" data-owner-chat="${m.chat_id}">К исходному</button></div>`).join("");
-      const attachments = (m.files || []).map(f => `<div class="ca-file">${icon(fileIcons[f.category] || "file")}<div class="ca-file-info"><strong>${esc(f.name)}</strong><small>${f.size ? `${(f.size/1024).toLocaleString("ru",{maximumFractionDigits:1})} КБ · ` : ""}${esc(files[f.state] || f.state)}${f.error ? " · " + esc(f.error) : ""}</small></div>${f.path ? `<a class="button secondary" href="/api/chat-archive/chats/${m.chat_id}/files/${f.id}">Открыть</a>` : ""}<button type="button" class="button ${f.state === "saved" ? "quiet" : "secondary"}" data-ca-file="${f.id}" data-file-chat="${m.chat_id}"${["queued","running"].includes(f.state) ? " disabled" : ""}>${icon("download")}<span>${f.state === "saved" ? "Обновить файл" : "Скачать"}</span></button></div>`).join("");
+      const attachments = (m.files || []).map(f => `<div class="ca-file">${icon(fileIcons[f.category] || "file")}<div class="ca-file-info"><strong>${esc(f.name)}</strong><small>${f.size ? `${(f.size/1024).toLocaleString("ru",{maximumFractionDigits:1})} КБ · ` : ""}${esc(files[f.state] || f.state)}${f.error ? " · " + esc(f.error) : ""}</small></div>${f.path ? `<a class="button secondary" href="/api/chat-archive/chats/${m.chat_id}/files/${f.id}">Открыть</a>` : ""}${f.path || f.contents?.length ? `<button type="button" class="button quiet ca-file-delete" data-ca-remove-file="${f.id}" data-file-chat="${m.chat_id}" aria-label="Удалить сохранённый файл ${esc(f.name)}">${icon("trash")}</button>` : ""}<button type="button" class="button ${f.state === "saved" ? "quiet" : "secondary"}" data-ca-file="${f.id}" data-file-chat="${m.chat_id}"${["queued","running"].includes(f.state) ? " disabled" : ""}>${icon("download")}<span>${f.state === "saved" ? "Обновить файл" : "Скачать"}</span></button></div>`).join("");
       const counters = m.reactions?.reactionCounters || {};
       const reactions = Object.keys(counters).length ? `<div class="ca-reactions">Реакции: ${Object.entries(counters).map(([type,count]) => `${esc(type)} · ${Number(count)}`).join(" · ")}</div>` : "";
       const body = `${links}<div class="ca-body">${m.html || esc(m.text).replace(/\n/g,"<br>")}</div>${attachments}${reactions}`;
@@ -181,8 +183,12 @@ window.ChatArchiveUI = {
       notify(`Вся доступная история поставлена в очередь: ${result.queued} чатов. Вложения — по сохранённым настройкам.`);
       s.selected.clear(); renderChats(); await refresh(false,true);
     });
+    $("#ca-delete-selected").onclick=e=>action(e.currentTarget,()=>openMaterialDelete([...s.selected],"chat"));
+    $("#ca-delete-current").onclick=e=>action(e.currentTarget,()=>openMaterialDelete([s.chat],"chat"));
     $("#ca-messages").addEventListener("click", e=> {
       const file=e.target.closest("[data-ca-file]"), source=e.target.closest("[data-ca-source]"), chat=e.target.closest("[data-ca-chat]");
+      const remove=e.target.closest("[data-ca-remove-file]");
+      if(remove) action(remove,()=>openMaterialDelete([Number(remove.dataset.fileChat)],"chat",["attachments/file-"+remove.dataset.caRemoveFile]));
       if(file) action(file,async()=>{ await api(`/api/chat-archive/chats/${file.dataset.fileChat}/files/${file.dataset.caFile}/download`,{method:"POST"}); notify("Вложение поставлено в очередь."); await loadMessages(); });
       if(chat) { const owner=chat.closest("article"); const id=Number(owner?.id.split("-").pop()) || 0; resetForContext(); choose(chat.dataset.caChat,id).catch(e=>showError(e.message)); }
       if(source) action(source,async()=>{
@@ -208,10 +214,11 @@ window.ChatArchiveUI = {
         }).catch(error=>{box.textContent=error.message;});
       }
     },true);
-    for (const [id,name] of [["ca-refresh","refresh"],["ca-export","download"],["ca-save-selected","download"]]) {
+    for (const [id,name] of [["ca-refresh","refresh"],["ca-export","download"],["ca-save-selected","download"],["ca-delete-current","trash"],["ca-delete-selected","trash"]]) {
       const button=$("#"+id); button.innerHTML=icon(name)+`<span>${esc(button.textContent)}</span>`;
     }
     return {
+      async refreshAfterRemoval() { s.selected.clear(); s.last=0; await refresh(true,true); },
       async onRoute(route) { if(route === "chat-archive" || route === "settings") await refresh(route === "chat-archive"); },
       async onBootstrap(data,route) { if (["chat-archive","settings"].includes(route) && Date.now()-s.last>7000) await refresh(route === "chat-archive"); },
       settingsReset(settings) { s.optionsLoaded=false; populateSettings(); for (const [selector,key] of [["#ca-selected-chats","chat_selected_ids"],["#ca-excluded-chats","chat_excluded_ids"]]) for(const option of $(selector).options) option.selected=(settings[key]||[]).includes(Number(option.value)); window.ArchiveControls?.refresh($("#settings-form")); },

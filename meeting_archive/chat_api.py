@@ -16,6 +16,23 @@ from .chat_queue import queue_view, queue_action
 def register_chat_api(app, service):
     engine = service.chat_archive
 
+    @app.post("/api/chat-archive/materials/plan")
+    async def materials_plan(request: Request):
+        from .chat_cleanup import material_plan
+        data = await request.json()
+        async with service.auth_lock, engine.lock:
+            return await asyncio.to_thread(material_plan, engine, data.get("ids"), data.get("targets"), choices=True)
+
+    @app.post("/api/chat-archive/materials/remove")
+    async def materials_remove(request: Request):
+        from .chat_cleanup import remove_materials
+        from .chat_sync import durable_io
+        data = await request.json()
+        if data.get("confirm") is not True:
+            raise ValueError("Подтвердите удаление материалов чатов")
+        async with service.auth_lock, engine.lock:
+            return await durable_io(remove_materials, engine, service.home, data.get("ids"), data.get("targets"), data.get("token"))
+
     @app.get("/api/chat-archive")
     async def catalogue(q: str = "", type: str = "", participant: str = "", coverage: str = ""):
         store = engine.store()

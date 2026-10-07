@@ -65,6 +65,10 @@ def manual_history_complete(chat):
                 chat.get("manual_history_origin") in MANUAL_HISTORY_ORIGINS)
 
 
+def auto_since_for(store, chat):
+    return max((store.state("auto_since", stamp()), chat.get("message_delete_after") or ""), key=lambda v: instant(v) or 0)
+
+
 def related_materials(page, chat):
     """Retain only files and source excerpts related to the selected messages."""
     messages = [normalize(raw, chat) for raw in page["messages"]]
@@ -205,7 +209,7 @@ class ChatArchive:
             store.chat(positive(id))
         for id in ids:
             store.update_chat(positive(id), history_paused=False,
-                              **({"manual_history_requested": True, "manual_history_origin": "request"} if not start and not end else {}))
+                              **({"manual_history_requested": True, "manual_history_origin": "request", "message_delete_after": ""} if not start and not end else {}))
             kind = "period:" + date_from + ":" + date_to if start or end else "history"
             current = self.service.db.rows("SELECT data FROM ca_work WHERE account=? AND chat=? AND kind=?", (store.account, positive(id), kind))
             if current and json.loads(current[0]["data"]).get("automatic"):
@@ -219,7 +223,7 @@ class ChatArchive:
         if not automatic or not self.selected(chat["id"]):
             return
         newest = self.service.db.rows("SELECT max(id) AS id FROM ca_messages WHERE account=? AND chat=?", (store.account, chat["id"]))[0]["id"] or 0
-        since = "" if manual_history_complete(chat) and newest else store.state("auto_since", stamp())
+        since = "" if manual_history_complete(chat) and newest else auto_since_for(store, chat)
         head = positive(chat.get("source_last_message_id"))
         unchanged = head and head == chat.get("sync_head_id")
         recently_checked = time.time() - chat.get("new_checked_at", 0) < max(900, self.service.settings.chat_poll_seconds * 5)
@@ -374,7 +378,7 @@ class ChatArchive:
         if not manual_history_complete(chat) and (row["kind"] == "new" or
                 row["kind"] in {"recent_check", "audit"} and work.get("automatic")):
             # A stale queue/portable manifest must not bypass the current policy.
-            cutoff = store.state("auto_since", stamp())
+            cutoff = auto_since_for(store, chat)
             if not work.get("date_from") or (instant(work["date_from"]) or 0) < (instant(cutoff) or 0):
                 work.update(date_from=cutoff, cursor=0, pages=0, messages=0)
         page, method = await self.fetch_page(chat, work)
@@ -498,6 +502,9 @@ class ChatArchive:
                 return
             raise
         s = self.service.settings
+        restore_collection = manual_collection and (collection_kind == "history" or collection_kind.startswith("period:"))
+        if (file.get("locally_deleted") or file.get("auto_suppressed")) and automatic and not restore_collection:
+            return
         manual_collection = manual_collection or file.get("download_origin") == "manual_collection" and file["state"] == "queued"
         if automatic and (not manual_collection and not self.selected(chat) or not getattr(s, "chat_download_" + file["category"])):
             return
@@ -512,6 +519,9 @@ class ChatArchive:
             return
         data = json.loads(self.service.db.rows("SELECT data FROM ca_files WHERE account=? AND chat=? AND id=?", (store.account, chat, id))[0]["data"])
         data["download_origin"] = "manual_collection" if manual_collection else "history_opt_in" if history_opt_in else "automatic" if automatic else "manual_file"
+        if not automatic or restore_collection:
+            data.pop("locally_deleted", None)
+            data.pop("auto_suppressed", None)
         if manual_collection:
             data["collection_kind"] = collection_kind
         data.update(queued_at=time.time(),downloaded_bytes=0)
@@ -581,8 +591,9 @@ class ChatArchive:
             known = db.rows("SELECT data FROM ca_chats WHERE account=? AND id=?", (store.account, chat_id))
             previous = store.message(chat_id, message_id) if known else None
             full_history = bool(known and manual_history_complete(json.loads(known[0]["data"])))
+            cutoff = auto_since_for(store, json.loads(known[0]["data"]) if known else {})
             collect_new = self.service.settings.chat_auto_save and (full_history or
-                          (instant(raw.get("date")) or 0) >= (instant(store.state("auto_since", stamp())) or time.time()))
+                          (instant(raw.get("date")) or 0) >= (instant(cutoff) or time.time()))
             journal = safe_metadata(event) if chat_id and self.selected(chat_id) and (collect_new or previous) else {"eventId": id, "type": str(event.get("type") or ""), "chatId": chat_id, "skipped": True}
             db.execute("INSERT OR IGNORE INTO ca_events VALUES(?,?,?)", (store.account, id, canonical(journal)))
             if chat_id and self.selected(chat_id):
@@ -742,6 +753,9 @@ class ChatArchive:
             if store.account not in self.recovered:
                 await durable_io(store.recover)
                 self.recovered.add(store.account)
+            elif store.state("cleanup_pending", False):
+                from .chat_cleanup import recover_pending
+                await durable_io(recover_pending, store)
             await self.upgrade_collection_policy(store)
             automatic = s.chat_auto_save and not s.paused
             prefix = f"chat_events:{store.portal}:{store.user_id}:"
@@ -785,7 +799,7 @@ class ChatArchive:
                                 if not manual_history_complete(chat):
                                     if not self.has_current_messages(store, chat["id"]):
                                         continue
-                                    bounds.append(store.state("auto_since", stamp()))
+                                    bounds.append(auto_since_for(store, chat))
                                 start = max(bounds, key=lambda value: instant(value) or 0)
                                 store.enqueue(chat["id"], kind, {"cursor": 0, "date_from": start, "automatic": True}, priority)
                         store.set_state(kind + "_at", time.time())
@@ -917,6 +931,8 @@ class ChatArchive:
             return
         async with self.file_lock:
             store = self.store()
+            if store.state("cleanup_pending", False):
+                return
             s = self.service.settings
             rows = self.service.db.rows("SELECT * FROM ca_files WHERE account=? AND state='queued' AND next_at<=? ORDER BY automatic,id", (store.account, time.time()))
             for row in rows:
@@ -940,6 +956,11 @@ class ChatArchive:
                         # stable. Streaming uses no bearer token and holds no sync lock.
                         if store.account != self.store().account:
                             return
+                        fresh = self.service.db.rows("SELECT * FROM ca_files WHERE account=? AND chat=? AND id=?", (store.account, file["chat"], file["id"]))
+                        if not fresh or fresh[0]["state"] != "queued":
+                            continue
+                        row = fresh[0]
+                        file = {**json.loads(row["data"]), **{k: v for k, v in row.items() if k != "data"}}
                         client = copy.copy(self.service.client)
                         client.settings = replace(self.service.settings)
                         file["maximum"] = s.chat_max_file_mb * 1024**2

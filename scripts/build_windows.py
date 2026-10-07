@@ -21,7 +21,7 @@ def source_hashes(root: Path) -> dict[str, str]:
                  if path.is_file() and path.suffix in {".py", ".js", ".css", ".html", ".lock", ".png", ".ico", ".svg", ".ps1"})
     paths.extend(path for path in (root / "skills").rglob("*")
                  if path.is_file() and path.suffix in {".md", ".yaml"})
-    paths.extend([root / "uninstall.cmd", root / "scripts/reset-profile.ps1"])
+    paths.extend([root / "uninstall.cmd", root / "scripts/reset-profile.ps1", root / "scripts/uninstall-ui.ps1"])
     return {path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in sorted(paths)}
 
@@ -102,6 +102,7 @@ def main() -> None:
         shutil.copy2(root / "docs" / name, distribution / "docs" / name)
     (distribution / "scripts").mkdir(exist_ok=True)
     shutil.copy2(root / "scripts/reset-profile.ps1", distribution / "scripts/reset-profile.ps1")
+    shutil.copy2(root / "scripts/uninstall-ui.ps1", distribution / "scripts/uninstall-ui.ps1")
     shutil.copy2(root / "uninstall.cmd", distribution / "uninstall.cmd")
     (distribution / "build-info.json").write_text(json.dumps(
         {"version": tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"],

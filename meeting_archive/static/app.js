@@ -859,8 +859,11 @@
   }
   const sizeText = bytes => {
     const value = Number(bytes || 0); if (!value) return "0 Б";
+    if(value<1024) return `${value} Б`;
+    if(value<1024**2) return `${(value/1024).toLocaleString("ru-RU",{maximumFractionDigits:1})} КБ`;
     return value < 1024 ** 3 ? `${(value / 1024 ** 2).toLocaleString("ru-RU", { maximumFractionDigits: 1 })} МБ` : `${(value / 1024 ** 3).toLocaleString("ru-RU", { maximumFractionDigits: 2 })} ГБ`;
   };
+  const countText = (n,one,few,many) => `${n} ${n%10===1 && n%100!==11 ? one : n%10>=2 && n%10<=4 && !(n%100>=12 && n%100<=14) ? few : many}`;
   async function refreshMaterialPlan() {
     const selection = state.materialDelete; if (!selection) return;
     const targets = $$("#materials-choices input:checked").map(input => input.value), request = ++selection.request;
@@ -869,19 +872,25 @@
     if (!targets.length) {selection.plan = null; $("#materials-summary").textContent = "Выберите материалы для удаления."; return;}
     $("#materials-summary").textContent = "Проверяем выбранные файлы…";
     try {
-      const plan = await api("/api/materials/plan", {method:"POST", data:{ids:selection.ids, targets}});
+      const plan = await api(selection.endpoint+"/plan", {method:"POST", data:{ids:selection.ids, targets}});
       if (state.materialDelete !== selection || selection.request !== request) return;
-      selection.plan = plan; $("#materials-summary").textContent = `${plan.meetings} совещаний · ${plan.files} файлов · ${sizeText(plan.bytes)}. Удаление с компьютера нельзя отменить.`;
-      $("#materials-delete").disabled = !plan.files;
+      selection.plan = plan; $("#materials-summary").textContent = `${selection.type === "chat" ? countText(plan.chats,"чат","чата","чатов")+" · "+countText(plan.messages,"сообщение","сообщения","сообщений") : countText(plan.meetings,"совещание","совещания","совещаний")} · ${countText(plan.files,"файл","файла","файлов")} · ${sizeText(plan.bytes)}. Удаление с компьютера нельзя отменить.`;
+      $("#materials-delete").disabled = !plan.files && !plan.messages;
     } catch (error) {if (selection.request === request) $("#materials-summary").textContent = error.message;}
   }
-  async function openMaterialDelete(ids = null) {
-    const plan = await api("/api/materials/plan", {method:"POST", data:{ids}});
-    if (!plan.files) {notify("В выбранных совещаниях нет сохранённых материалов."); return;}
-    const choices = plan.choices || []; state.materialDelete = {ids:plan.ids, choices, plan:null, request:0};
-    $("#materials-choices").innerHTML = choices.map(choice => `<label class="check-label material-choice"><input type="checkbox" value="${escapeHtml(choice.target)}" checked><span><strong>${escapeHtml(choice.label)}</strong><small>${choice.files} файлов · ${sizeText(choice.bytes)}</small></span></label>`).join("");
+  async function openMaterialDelete(ids = null, type = "meeting", requestedTargets = null) {
+    const endpoint=type === "chat" ? "/api/chat-archive/materials" : "/api/materials";
+    const plan = await api(endpoint+"/plan", {method:"POST", data:{ids}});
+    const choices=plan.choices || [];
+    if (!choices.length) {notify("Нет сохранённых материалов для удаления."); return;}
+    state.materialDelete = {ids:plan.ids, choices, plan:null, request:0, endpoint, type};
+    $("#materials-title").textContent=type === "chat" ? "Удалить материалы чатов" : "Удалить сохранённые материалы";
+    $("#materials-description").textContent=type === "chat" ? "Чаты останутся в каталоге. Удалённая переписка восстанавливается только по ручному запросу; новые сообщения продолжают сохраняться. Удалённые файлы не скачиваются автоматически заново. Заметки выбираются отдельно." : "Совещания останутся в каталоге. Выберите, что удалить: записи, тексты, отдельные запуски или заметки.";
+    const selected = requestedTargets || (type === "chat" ? ["messages","attachments"] : choices.map(c=>c.target));
+    $("#materials-choices").innerHTML = choices.map(choice => `<label class="check-label material-choice"><input type="checkbox" value="${escapeHtml(choice.target)}"${selected.includes(choice.target) ? " checked" : ""}><span><strong>${escapeHtml(choice.label)}</strong><small>${choice.messages ? countText(choice.messages,"сообщение","сообщения","сообщений")+" · " : ""}${countText(choice.files,"файл","файла","файлов")} · ${sizeText(choice.bytes)}</small></span></label>`).join("");
     $("#materials-dialog").showModal(); await refreshMaterialPlan();
   }
+
   function meetingTargetId(value) {return /^\d+$/.test(String(value || "")) ? Number(value) : 0;}
   function renderMeetingTargets(picker) {
     const chosen = picker.dataset.selected || "";
@@ -1084,12 +1093,18 @@
   $("#materials-choices").onchange = refreshMaterialPlan;
   $("#materials-all").onchange = () => {$$("#materials-choices input").forEach(input => {input.checked = $("#materials-all").checked;}); refreshMaterialPlan();};
   $("#materials-delete").onclick = event => action(event.currentTarget, async () => {
-    const plan = state.materialDelete?.plan; if (!plan?.files) return;
-    if (!(await confirmAction("Удалить выбранные материалы?", `${plan.meetings} совещаний · ${plan.files} файлов · ${sizeText(plan.bytes)}.\nЗаписи, тексты и отмеченные заметки будут удалены с компьютера. Совещания останутся в каталоге. Для восстановления понадобятся оригиналы или повторное скачивание.`, "Удалить материалы", true))) return;
-    await api("/api/materials/remove", {method:"POST", data:{ids:plan.ids, targets:plan.targets, token:plan.token, confirm:true}});
-    $("#materials-dialog").close(); state.materialDelete = null; notify("Выбранные материалы удалены. Совещания сохранены в каталоге.");
-    await loadMeetings(); await bootstrap(); if (state.route === "detail") await loadDetail();
+    const selection=state.materialDelete, plan=selection?.plan;
+    if (!plan || (!plan.files && !plan.messages)) return;
+    const chat=selection.type === "chat";
+    const summary=chat ? `${plan.chats} чатов · ${plan.messages} сообщений · ${plan.files} файлов · ${sizeText(plan.bytes)}.\nВыбранные материалы будут удалены с компьютера. В Bitrix24 сообщения и файлы сохранятся. Для восстановления нужен ручной запрос.` : `${plan.meetings} совещаний · ${plan.files} файлов · ${sizeText(plan.bytes)}.\nЗаписи, тексты и отмеченные заметки будут удалены с компьютера. Совещания останутся в каталоге.`;
+    if (!(await confirmAction("Удалить выбранные материалы?",summary,"Удалить материалы",true))) return;
+    await api(selection.endpoint+"/remove", {method:"POST",data:{ids:plan.ids,targets:plan.targets,token:plan.token,confirm:true}});
+    $("#materials-dialog").close(); state.materialDelete=null; notify("Выбранные материалы удалены с компьютера.");
+    await bootstrap();
+    if(chat) await caUI.refreshAfterRemoval(); else {await loadMeetings(); if(state.route === "detail") await loadDetail();}
   });
+  $("#chat-archive-delete").onclick=event=>action(event.currentTarget,()=>openMaterialDelete(null,"chat"));
+
   $("#removable-models").onchange = renderModelRemoval;
   $("#models-delete").onclick = event => action(event.currentTarget, async () => {
     const packages = $$("#removable-models input:checked").map(input => ({engine:input.dataset.engine, model:input.value}));
@@ -1246,7 +1261,7 @@
   window.addEventListener("hashchange", applyRoute);
   window.addEventListener("beforeunload", event => { if (state.settingsDirty) { event.preventDefault(); event.returnValue = ""; } });
   document.addEventListener("visibilitychange", () => { if (!document.hidden) bootstrap(); });
-  const caUI = window.ChatArchiveUI.create({api, icon, escapeHtml, dateString, notify, action, getSettings: () => state.bootstrap?.settings || {}});
+  const caUI = window.ChatArchiveUI.create({api, icon, escapeHtml, dateString, notify, action, getSettings: () => state.bootstrap?.settings || {}, openMaterialDelete});
   $("#settings-form").addEventListener("settings-category-change", event => { if (event.detail === "profile") loadProfile().catch(error => notify(error.message, true)); });
   window.ArchiveControls?.init(document, {icon});
   window.ArchiveControls?.dateRange($("#ca-period-control"), {from: $("#ca-filters").elements.date_from, to: $("#ca-filters").elements.date_to, label: "Период сообщений", icon});

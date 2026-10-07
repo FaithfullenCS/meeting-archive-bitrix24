@@ -230,7 +230,7 @@ class ChatStore:
                     if old:
                         previous = json.loads(old["data"])
                         changed = file["source"] != previous.get("source", {})
-                        file.update({key: previous[key] for key in ("path", "sha256", "contents", "download_origin") if key in previous})
+                        file.update({key: previous[key] for key in ("path", "sha256", "contents", "download_origin", "collection_kind", "locally_deleted", "auto_suppressed") if key in previous})
                     con.execute("INSERT INTO ca_files(account,chat,id,data) VALUES(?,?,?,?) ON CONFLICT(account,chat,id) DO UPDATE SET data=excluded.data",
                                 (self.account, chat_id, file["id"], canonical(file)))
                     if changed:
@@ -353,6 +353,8 @@ class ChatStore:
 
     def flush(self, chat):
         folder = self.chat_folder(chat)
+        if (folder / ".delete-pending.json").exists():
+            raise ValueError("Удаление материалов ещё не завершено; запись архива временно остановлена")
         months = {}
         dirty = [r["month"] for r in self.db.rows("SELECT month FROM ca_dirty_months WHERE account=? AND chat=?", (self.account, chat))]
         manifest_path = folder / "chat.json"
@@ -423,6 +425,8 @@ class ChatStore:
         self.db.execute("DELETE FROM ca_dirty_months WHERE account=? AND chat=?", (self.account, chat))
 
     def recover(self):
+        from .chat_cleanup import recover_pending
+        recover_pending(self)
         """Restore a lost index from portable files and replay unfinished projections."""
         if self.folder.exists():
             paths = list((self.folder / "chats").glob("chat-*/chat.json")) + list((self.folder / "chats/tasks").glob("chat-*/chat.json")) + list((self.folder / "chats/conversations").glob("chat-*/chat.json"))
