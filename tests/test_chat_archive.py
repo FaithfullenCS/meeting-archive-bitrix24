@@ -80,7 +80,7 @@ async def test_new_self_message_not_starved_by_large_catalogue(chat_service, mon
     now = [time.time()]
     monkeypatch.setattr("meeting_archive.chat_sync.time.time", lambda: now[0])
     for key, value in {
-        "collection_policy": 2,
+        "collection_policy": 3,
         "inventory_ready": True,
         "last_discovery": now[0],
         "auto_since": "2026-01-01T00:00:00Z",
@@ -217,7 +217,7 @@ async def test_manual_history_has_turn_under_continuous_new_work(chat_service):
     store=seed(chat_service)
     service=chat_service
     service.settings.chat_auto_save=True
-    for key,value in {"collection_policy":2,"last_discovery":time.time(),"recent_check_at":time.time(),"audit_at":time.time(),"inventory_ready":True}.items():
+    for key,value in {"collection_policy":3,"last_discovery":time.time(),"recent_check_at":time.time(),"audit_at":time.time(),"inventory_ready":True}.items():
         store.set_state(key,value)
     store.enqueue(101,"new",{"automatic":True},-1)
     store.enqueue(101,"history",{"automatic":False},2)
@@ -281,7 +281,7 @@ def background_inventory(service, monkeypatch):
     for name in ("job_loop", "scheduler", "discover_resources", "refresh_identity"):
         monkeypatch.setattr(service, name, idle)
     store = seed(service)
-    for key, value in {"collection_policy": 2, "inventory_ready": True,
+    for key, value in {"collection_policy": 3, "inventory_ready": True,
                        "last_discovery": time.time(), "extra_recent_at": time.time(),
                        "recent_check_at": time.time(), "audit_at": time.time(),
                        "auto_since": "2026-01-01T00:00:00Z"}.items():
@@ -765,7 +765,7 @@ async def test_slow_file_does_not_hold_message_sync_lock(chat_service):
     await service.client.http.aclose()
     service.client.http=httpx.AsyncClient(transport=httpx.MockTransport(lambda request:httpx.Response(200,stream=SlowStream())))
     async def call(method,params,**kwargs):
-        return {"downloadUrl":"https://synthetic.bitrix24.ru/file"} if method=="im.v2.File.download" else {"messages":[message(2)]}
+        return {"downloadUrl":"https://synthetic.bitrix24.ru/file"} if method=="im.v2.File.download" else {"messages":[message(2,date="2099-01-01T00:00:00Z")]}
     service.client.call=call
     service.chat_archive.queue_file(store,101,77)
     file_task=asyncio.create_task(service.chat_archive.file_step())
@@ -914,11 +914,26 @@ async def test_inventory_baseline_new_chats_and_existing_cutoff(chat_service):
     service.chat_archive.request_discovery()
     for _ in range(8):
         await service.chat_archive.step()
-    assert store.chat(102)["auto_history"] and store.chat(102)["history_complete"]
-    assert not store.chat(102)["history_since"]
+    assert not store.chat(102).get("auto_history") and not store.chat(102)["history_complete"]
+    assert store.query(chat=102)["total"] == 1 and store.query(chat=101)["total"] == 1
+    assert all(params.get("DATE_FROM") for method, params in calls if method == "im.dialog.messages.search")
+    assert not service.db.rows("SELECT kind FROM ca_work WHERE account=? AND kind='history'", (store.account,))
+    # A later explicit full-history request grants access to the old messages.
+    service.chat_archive.request_history([102])
+    for _ in range(3):
+        await service.chat_archive.step()
+    assert store.chat(102)["history_complete"] and store.chat(102)["manual_history_requested"]
     assert store.query(chat=102)["total"] == 3 and store.query(chat=101)["total"] == 1
-    assert all(params.get("DATE_FROM") for method, params in calls if method == "im.dialog.messages.search" and params["CHAT_ID"] == 101)
-    assert all(not params.get("DATE_FROM") for method, params in calls if method == "im.dialog.messages.search" and params["CHAT_ID"] == 102)
+
+
+def test_legacy_auto_history_flag_cannot_unbound_new_message_job(chat_service):
+    store = seed(chat_service)
+    store.set_state("auto_since", "2026-10-01T00:00:00Z")
+    store.update_chat(101, auto_history=True)
+    chat_service.chat_archive.schedule_chat(store, store.chat(101), True)
+    rows = store.db.rows("SELECT kind,data FROM ca_work WHERE account=? AND chat=?", (store.account, 101))
+    assert [r["kind"] for r in rows] == ["new"]
+    assert json.loads(rows[0]["data"])["date_from"] == "2026-10-01T00:00:00Z"
 
 
 async def test_short_inventory_pages_restart_and_no_implicit_history(chat_service):
@@ -954,7 +969,7 @@ async def test_upgrade_keeps_manual_history_cancels_old_automatic(chat_service):
     for _ in range(4):
         await service.chat_archive.step()
     assert not store.query(chat=101)["total"] and store.query(chat=102)["total"] == 1
-    assert store.state("collection_policy") == 2
+    assert store.state("collection_policy") == 3
 
 
 async def test_manual_history_download_types_and_explicit_size_limit(chat_service):
@@ -1015,16 +1030,139 @@ async def test_event_new_chat_history_and_disabled_collection_no_content(chat_se
     await service.chat_archive.events(store)
     assert not store.query(chat=102)["total"] and "Synthetic unsaved" not in (store.folder / "events.jsonl").read_text("utf-8")
     service.settings.chat_auto_save = True
-    event.update(eventId=2, data={"chat": {"id": 103}, "message": message(1, 103)})
+    event.update(eventId=2, data={"chat": {"id": 103}, "message": message(1, 103, text="Old unseen event")})
     await service.chat_archive.events(store)
-    assert store.chat(103)["auto_history"] and store.query(chat=103)["total"] == 1
-    assert service.db.rows("SELECT kind FROM ca_work WHERE account=? AND chat=? AND kind='history'", (store.account, 103))
+    assert not store.query(chat=103)["total"]
+    assert "Old unseen event" not in (store.folder / "events.jsonl").read_text("utf-8")
+    event.update(eventId=3, data={"chat": {"id": 103}, "message": message(2, 103, date="2099-01-01T00:00:00Z")})
+    await service.chat_archive.events(store)
+    assert not store.chat(103).get("auto_history") and store.query(chat=103)["total"] == 1
+    assert not service.db.rows("SELECT kind FROM ca_work WHERE account=? AND chat=? AND kind='history'", (store.account, 103))
+
+
+async def test_v2_policy_upgrade_preserves_manual_jobs_and_files(chat_service):
+    service = chat_service
+    store = seed(service)
+    service.settings.chat_download_documents = True
+    store.set_state("collection_policy", 2)
+    cutoff = "2026-10-01T00:00:00Z"
+    store.set_state("auto_since", cutoff)
+    store.update_chat(101, auto_history=True, coverage="backfilling")
+    store.upsert_chat(102, "chat102", participants_at=time.time())
+    store.enqueue(101, "history", {"automatic": True, "cursor": 200}, 10)
+    store.enqueue(101, "new", {"automatic": True, "cursor": 200, "date_from": "", "pages": 2, "messages": 400}, 0)
+    store.enqueue(102, "history", {"automatic": False, "cursor": 61}, 2)
+    store.upsert_chat(104, "chat104", participants_at=time.time())
+    store.enqueue(104, "new", {"automatic": True, "cursor": 55, "date_from": cutoff}, 0)
+    store.save_page(101, {"messages": [message(1, fileIds=[77, 79, 80, 81, 82]),
+                                      message(2, date="2026-10-02T00:00:00Z", fileIds=[78])],
+                          "files": [{"id": i, "name": f"demo-{i}.txt"} for i in range(77, 83)]})
+    for id in (77, 78, 82):
+        service.chat_archive.queue_file(store, 101, id, automatic=True)
+    service.chat_archive.queue_file(store, 101, 79, automatic=True, manual_collection=True)
+    service.chat_archive.queue_file(store, 101, 80, automatic=True, history_opt_in=True)
+    service.chat_archive.queue_file(store, 101, 81)
+    store.file_update(101, 82, state="saved")
+    note = store.chat_folder(101) / "notes/synthetic.md"
+    note.write_text("Synthetic note must remain", "utf-8")
+    store.flush(101)
+    other = ChatStore(service.db, service.settings.chat_archive_root, service.settings.portal, 43)
+    other.upsert_chat(201, "chat201", auto_history=True)
+    other.enqueue(201, "history", {"automatic": True})
+
+    await service.chat_archive.upgrade_collection_policy(store)
+    assert store.state("collection_policy") == 3 and store.state("auto_since") == cutoff
+    work = service.db.rows("SELECT chat,kind,data FROM ca_work WHERE account=?", (store.account,))
+    assert not any(r["chat"] == 101 and r["kind"] == "history" for r in work)
+    manual = next(r for r in work if r["chat"] == 102)
+    assert json.loads(manual["data"])["cursor"] == 61 and store.chat(102)["manual_history_requested"]
+    new = next(r for r in work if r["chat"] == 101)
+    assert json.loads(new["data"])["date_from"] == cutoff and json.loads(new["data"])["cursor"] == 0
+    assert json.loads(new["data"])["messages"] == 0 and json.loads(new["data"])["pages"] == 0
+    assert json.loads(next(r for r in work if r["chat"] == 104)["data"])["cursor"] == 55
+    assert store.file(101, 77)["state"] == "not_saved"
+    service.chat_archive.queue_file(store, 101, 77, automatic=True)
+    assert store.file(101, 77)["state"] == "not_saved"  # A later audit cannot requeue the accidental old file.
+    assert all(store.file(101, id)["state"] == "queued" for id in (78, 79, 80, 81))
+    assert store.file(101, 82)["state"] == "saved" and store.query(chat=101)["total"] == 2
+    assert note.read_text("utf-8") == "Synthetic note must remain"
+    manifest = json.loads((store.chat_folder(101) / "chat.json").read_text("utf-8"))
+    assert not any(w["kind"] == "history" for w in manifest["work"])
+    assert other.chat(201)["auto_history"] and other.db.rows("SELECT kind FROM ca_work WHERE account=?", (other.account,))
+
+
+@pytest.mark.parametrize("automatic", [True, False])
+async def test_stale_new_job_fallback_does_not_read_all_older_pages(chat_service, automatic):
+    store = seed(chat_service)
+    store.set_state("auto_since", "2026-10-01T00:00:00Z")
+    store.update_chat(101, auto_history=True)  # Legacy flag grants no permission.
+    store.enqueue(101, "new", {"automatic": automatic, "date_from": "", "cursor": 0})
+    calls = []
+
+    async def call(method, params, **kwargs):
+        calls.append(method)
+        if method == "im.dialog.messages.search":
+            assert params["DATE_FROM"] == "2026-10-01T00:00:00Z"
+            raise BitrixError("Synthetic fallback", code="METHOD_NOT_FOUND")
+        assert method == "im.dialog.messages.get"
+        items = [message(i, date="2026-10-02T00:00:00Z" if i>40 else "2020-01-01T00:00:00Z") for i in range(50, 0, -1)]
+        items[0].update(fileIds=[98], reply={"id": 999, "text": "Needed old source"})
+        items[-1].update(fileIds=[99], reply={"id": 998})
+        return {"chat_id": 101, "messages": items,
+                "additionalMessages": [message(999, text="Needed old source", fileIds=[97]), message(998, text="Unrelated old source")],
+                "files": [{"id": i, "name": f"demo-{i}.txt"} for i in (97, 98, 99)]}
+
+    chat_service.client.call = call
+    await chat_service.chat_archive.process_work(store, store.db.rows("SELECT * FROM ca_work WHERE account=?", (store.account,))[0])
+    assert calls == ["im.dialog.messages.search", "im.dialog.messages.get"]
+    assert store.query(chat=101)["total"] == 10
+    assert {f["id"] for f in store.files(101)} == {97, 98}
+    context = store.db.rows("SELECT id FROM ca_context WHERE account=? AND chat=?", (store.account, 101))
+    assert {m["id"] for m in context} == {999}
+    assert not store.db.rows("SELECT kind FROM ca_work WHERE account=?", (store.account,))
+
+
+def test_manual_full_history_is_explicit_and_survives_portable_recovery(chat_service):
+    store = seed(chat_service)
+    store.upsert_chat(102, "chat102", participants_at=time.time())
+    store.set_state("auto_since", "2026-10-01T00:00:00Z")
+    chat_service.chat_archive.request_history([101], "2026-09-01", "2026-09-30")
+    assert not store.chat(101).get("manual_history_requested")
+    chat_service.chat_archive.request_history([102])
+    store.save_page(102, {"messages": [message(1, 102)]})
+    store.update_chat(102, history_complete=True)
+    store.flush(102)
+    for table in ("ca_chats", "ca_work", "ca_messages"):
+        store.db.execute(f"DELETE FROM {table} WHERE account=? AND {'id' if table=='ca_chats' else 'chat'}=102", (store.account,))
+    store.recover()
+    assert store.chat(102)["manual_history_requested"]
+    chat_service.chat_archive.schedule_chat(store, store.chat(102), True)
+    queued = store.db.rows("SELECT data FROM ca_work WHERE account=? AND chat=102 AND kind='new'", (store.account,))[0]
+    assert not json.loads(queued["data"])["date_from"]
+
+
+async def test_automatic_audit_cannot_expand_into_unrequested_old_period(chat_service):
+    store = seed(chat_service)
+    cutoff = "2026-10-01T00:00:00Z"
+    store.set_state("auto_since", cutoff)
+    store.save_page(101, {"messages": [message(1), message(2, date="2026-10-02T00:00:00Z")]})
+    store.enqueue(101, "audit", {"automatic": True, "date_from": "2020-01-01T00:00:00Z"})
+
+    async def call(method, params, **kwargs):
+        assert method == "im.dialog.messages.search" and params["DATE_FROM"] == cutoff
+        return {"messages": [message(1, text="Old edit must not be fetched into this audit"),
+                              message(2, date="2026-10-02T00:00:00Z", text="New saved edit")]}
+
+    chat_service.client.call = call
+    await chat_service.chat_archive.process_work(store, store.db.rows("SELECT * FROM ca_work WHERE account=?", (store.account,))[0])
+    assert store.message(101, 1)["text"] == "Сообщение 1" and not store.versions(101, 1)
+    assert store.message(101, 2)["text"] == "New saved edit" and len(store.versions(101, 2)) == 1
 
 
 async def test_metadata_limit_retains_work_and_manual_request_takes_priority(chat_service):
     service = chat_service
     store = seed(service)
-    store.set_state("collection_policy", 2)
+    store.set_state("collection_policy", 3)
     store.set_state("last_discovery", time.time())
     store.enqueue(101, "metadata", {}, 4)
     store.upsert_chat(102, "chat102", participants_at=time.time())

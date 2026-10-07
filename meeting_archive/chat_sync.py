@@ -18,12 +18,13 @@ from urllib.parse import parse_qs, urljoin, urlsplit
 import httpx
 
 from .bitrix import BitrixError
-from .chat_model import canonical, chat_classification, positive, safe_metadata, safe_name, sequence, stamp
+from .chat_model import canonical, chat_classification, normalize, positive, safe_metadata, safe_name, sequence, stamp
 from .chat_storage import ChatStore
 from .scheduling import window_status
 
 ACCESS_CODES = {"ACCESS_ERROR", "ACCESS_DENIED", "CHAT_NOT_FOUND", "DIALOG_ID_INVALID"}
 UNSUPPORTED_CODES = {"METHOD_NOT_FOUND", "ERROR_METHOD_NOT_FOUND", "NOT_IMPLEMENTED", "UNKNOWN_METHOD"}
+COLLECTION_POLICY = 3
 
 
 async def durable_io(function, *args):
@@ -56,6 +57,33 @@ def instant(value):
         return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
     except (ValueError, TypeError, OverflowError):
         return None
+
+
+def manual_history_complete(chat):
+    return bool(chat.get("manual_history_requested") and chat.get("history_complete"))
+
+
+def related_materials(page, chat):
+    """Retain only files and source excerpts related to the selected messages."""
+    messages = [normalize(raw, chat) for raw in page["messages"]]
+    wanted = {(link["chat_id"], link["message_id"]) for m in messages for link in m["relations"]}
+    files = {id for m in messages for id in m["file_ids"]}
+    pending = [(raw, normalize(raw, positive(raw.get("chatId") or raw.get("chat_id")) or chat))
+               for raw in sequence(page.get("additionalMessages")) if isinstance(raw, dict)]
+    kept = set()
+    while True:
+        found = False
+        for _, m in pending:
+            key = (m["chat_id"], m["id"])
+            if key in wanted and key not in kept:
+                kept.add(key)
+                wanted.update((link["chat_id"], link["message_id"]) for link in m["relations"])
+                files.update(m["file_ids"])
+                found = True
+        if not found:
+            break
+    return {**page, "additionalMessages": [raw for raw, m in pending if (m["chat_id"], m["id"]) in kept],
+            "files": [raw for raw in sequence(page.get("files")) if isinstance(raw, dict) and positive(raw.get("id") or raw.get("fileId")) in files]}
 
 
 def validate_chat_settings(values, settings, home):
@@ -100,6 +128,10 @@ class ChatArchive:
     def selected(self, id):
         s = self.service.settings
         return id not in s.chat_excluded_ids and (s.chat_scope == "all" or id in s.chat_selected_ids)
+
+    def has_current_messages(self, store, chat):
+        return bool(self.service.db.rows("SELECT 1 FROM ca_messages WHERE account=? AND chat=? AND julianday(date)>=julianday(?) LIMIT 1",
+                                        (store.account, chat, store.state("auto_since", stamp()))))
 
     @staticmethod
     def recent_metadata(item):
@@ -170,7 +202,8 @@ class ChatArchive:
         for id in ids:
             store.chat(positive(id))
         for id in ids:
-            store.update_chat(positive(id), history_paused=False)
+            store.update_chat(positive(id), history_paused=False,
+                              **({"manual_history_requested": True} if not start and not end else {}))
             kind = "period:" + date_from + ":" + date_to if start or end else "history"
             current = self.service.db.rows("SELECT data FROM ca_work WHERE account=? AND chat=? AND kind=?", (store.account, positive(id), kind))
             if current and json.loads(current[0]["data"]).get("automatic"):
@@ -184,7 +217,7 @@ class ChatArchive:
         if not automatic or not self.selected(chat["id"]):
             return
         newest = self.service.db.rows("SELECT max(id) AS id FROM ca_messages WHERE account=? AND chat=?", (store.account, chat["id"]))[0]["id"] or 0
-        since = "" if chat.get("auto_history") else store.state("auto_since", stamp())
+        since = "" if manual_history_complete(chat) and newest else store.state("auto_since", stamp())
         head = positive(chat.get("source_last_message_id"))
         unchanged = head and head == chat.get("sync_head_id")
         recently_checked = time.time() - chat.get("new_checked_at", 0) < max(900, self.service.settings.chat_poll_seconds * 5)
@@ -193,8 +226,6 @@ class ChatArchive:
             store.enqueue(chat["id"], "new", {"cursor": 0, "stop_id": newest, "source_head_id": head, "date_from": since, "automatic": True}, -1 if urgent else 0)
             if urgent:
                 self.service.db.execute("UPDATE ca_work SET priority=-1 WHERE account=? AND chat=? AND kind='new'", (store.account, chat["id"]))
-        if chat.get("auto_history") and not chat.get("history_complete") and not chat.get("history_paused"):
-            store.enqueue(chat["id"], "history", {"cursor": 0, "date_from": "", "automatic": automatic}, 10)
 
     async def add_dialog(self, store, dialog, hint=None):
         result = await self.service.client.call("im.dialog.get", {"DIALOG_ID": str(dialog)}, v3=False)
@@ -230,7 +261,6 @@ class ChatArchive:
 
     async def discover(self, store, automatic):
         offset = store.state("discovery_offset", 0)
-        baseline = (store.state("discover_requested") or {}).get("baseline", not store.state("inventory_ready", False))
         automatic = self.service.settings.chat_auto_save and not self.service.settings.paused
         existing = {chat["id"] for chat in store.chats()}
         page = await self.service.client.call("im.recent.list", {"OFFSET": offset, "LIMIT": 200,
@@ -248,13 +278,13 @@ class ChatArchive:
                 if item.get("type") == "user" and positive(item.get("id")) == store.user_id:
                     values.update(is_self=True, aliases=list(dict.fromkeys(["Мои заметки", "Избранное", str(item.get("title") or ""), str(hint.get("name") or ""), self.service.db.get_state(self.service.identity_key()) or ""])))
                 if id not in existing:
-                    values["auto_history"] = bool(automatic and not baseline)
+                    values["auto_history"] = False
                 store.upsert_chat(id, dialog, title=str(item.get("title") or hint.get("name") or f"Чат {id}"), type=str(item.get("type") or "chat"), **values)
             elif re.fullmatch(r"(?:chat|sg)?[1-9]\d*", dialog):
                 chat = await self.add_dialog(store, dialog, item)
                 id = chat["id"]
                 if id not in existing:
-                    store.update_chat(id, auto_history=bool(automatic and not baseline))
+                    store.update_chat(id, auto_history=False)
                 store.update_chat(id, **self.recent_metadata(item))
             if id:
                 self.schedule_chat(store, store.chat(id), automatic)
@@ -267,7 +297,7 @@ class ChatArchive:
             participant_ids = {positive(p.get("userId") or p.get("user_id") or p.get("id")) if isinstance(p, dict) else positive(p) for p in metadata.get("participants", [])}
             if id and id not in existing and store.user_id in participant_ids:
                 dialog = str(peers.get(id) or f"chat{id}")
-                store.upsert_chat(id, dialog, title=str(metadata.get("chatTitle") or f"Чат {id}"), auto_history=bool(automatic and not baseline))
+                store.upsert_chat(id, dialog, title=str(metadata.get("chatTitle") or f"Чат {id}"), auto_history=False)
                 existing.add(id)
         if not (page.get("hasMore") or page.get("hasMorePages")):
             await self.extra_recent(store)
@@ -339,6 +369,12 @@ class ChatArchive:
             self.service.db.execute("DELETE FROM ca_work WHERE account=? AND chat=? AND kind=?", (store.account, chat["id"], row["kind"]))
             await durable_io(store.flush, chat["id"])
             return
+        if not manual_history_complete(chat) and (row["kind"] == "new" or
+                row["kind"] in {"recent_check", "audit"} and work.get("automatic")):
+            # A stale queue/portable manifest must not bypass the current policy.
+            cutoff = store.state("auto_since", stamp())
+            if not work.get("date_from") or (instant(work["date_from"]) or 0) < (instant(cutoff) or 0):
+                work.update(date_from=cutoff, cursor=0, pages=0, messages=0)
         page, method = await self.fetch_page(chat, work)
         raw_messages = page["messages"]
         # get treats a missing/deleted anchor as an empty result. Restart a bounded
@@ -364,6 +400,8 @@ class ChatArchive:
             page_ids = [positive(m.get("id")) for m in selected_page["messages"]]
             archived = {r["id"] for r in self.service.db.rows("SELECT id FROM ca_messages WHERE account=? AND chat=? AND id IN (" + ",".join("?" for _ in page_ids) + ")", (store.account, chat["id"], *page_ids))} if page_ids else set()
             selected_page["messages"] = [m for m in selected_page["messages"] if positive(m.get("id")) in archived]
+        if work.get("date_from") or work.get("date_to") or row["kind"] in {"recent_check", "audit"}:
+            selected_page = related_materials(selected_page, chat["id"])
         messages = await durable_io(store.save_page, chat["id"], selected_page)
         work.pop("error",None)
         work["pages"]=work.get("pages",0)+1
@@ -377,7 +415,7 @@ class ChatArchive:
         limit = 50 if method == "get" else 200
         stop = bool(work.get("stop_id") and any(id <= work["stop_id"] for id in ids))
         below_date = bool(work.get("date_from") and any(instant(m.get("date")) is not None and instant(m["date"]) < instant(work["date_from"]) for m in raw_messages))
-        finished = not ids or len(ids) < limit or stop or (method == "get" and below_date) or (row["kind"] == "new" and chat.get("auto_history") and not work.get("stop_id"))
+        finished = not ids or len(ids) < limit or stop or (method == "get" and below_date)
         if method == "get" and work.get("anchor_restart") and not ids and work.get("cursor"):
             # Repeated empty cursor does not prove completeness.
             raise ValueError("Граница истории не подтверждена после повторного прохода; повторите сверку")
@@ -440,6 +478,13 @@ class ChatArchive:
                 "connected": self.service.connected(), "automatic": automatic,
                 "paused": self.service.settings.paused, "error": self.error}
 
+    def automatic_file_allowed(self, store, chat, id, origin):
+        if origin in {"manual_collection", "history_opt_in", "manual_file"} or manual_history_complete(store.chat(chat)):
+            return True
+        return bool(self.service.db.rows("""SELECT 1 FROM ca_messages m,json_each(m.data,'$.file_ids') f
+            WHERE m.account=? AND m.chat=? AND f.value=? AND julianday(m.date)>=julianday(?) LIMIT 1""",
+            (store.account, chat, id, store.state("auto_since", stamp()))))
+
     def queue_file(self, store, chat, id, *, automatic=False, missing_ok=False, manual_collection=False, history_opt_in=False):
         try:
             file = store.file(chat, id)
@@ -452,6 +497,9 @@ class ChatArchive:
         if automatic and (not manual_collection and not self.selected(chat) or not getattr(s, "chat_download_" + file["category"])):
             return
         if file["state"] == "running" or automatic and file["state"] == "saved":
+            return
+        origin = "manual_collection" if manual_collection else "history_opt_in" if history_opt_in else "automatic"
+        if automatic and store.state("collection_policy", 0) >= COLLECTION_POLICY and not self.automatic_file_allowed(store, chat, id, origin):
             return
         if automatic and s.chat_max_file_mb and file["size"] > s.chat_max_file_mb * 1024**2:
             store.file_update(chat, id, state="size_limited", error=f"Размер файла превышает лимит {s.chat_max_file_mb} МБ. Текст сохранён; файл можно скачать вручную.")
@@ -468,6 +516,8 @@ class ChatArchive:
         if self.service.connected():
             if s.chat_auto_save and not old.chat_auto_save:
                 store.set_state("auto_since", stamp())
+                # Queued checks from the previous enabled period must be rebased.
+                self.service.db.execute("DELETE FROM ca_work WHERE account=? AND kind='new' AND json_extract(data,'$.automatic')=1", (store.account,))
             if s.chat_auto_save and (not old.chat_auto_save or old.chat_archive_root != s.chat_archive_root or
                                     old.chat_scope != s.chat_scope or old.chat_selected_ids != s.chat_selected_ids or
                                     old.chat_excluded_ids != s.chat_excluded_ids or old.chat_history_since != s.chat_history_since):
@@ -491,6 +541,8 @@ class ChatArchive:
 
     async def events(self, store):
         db, client = self.service.db, self.service.client
+        if self.service.settings.chat_auto_save and not store.state("auto_since"):
+            store.set_state("auto_since", stamp())
         prefix = f"chat_events:{store.portal}:{store.user_id}:"
         if not db.get_state(prefix + "subscribed"):
             await client.call("im.v2.Event.subscribe", {}, v3=False)
@@ -518,17 +570,18 @@ class ChatArchive:
             chat_id = positive(chat_raw.get("id") or raw.get("chatId") or data.get("chatId"))
             # Excluded/unknown chats retain only an acknowledgment marker, never their content.
             message_id = positive(raw.get("id") or data.get("messageId"))
-            already_archived = bool(db.rows("SELECT id FROM ca_messages WHERE account=? AND chat=? AND id=?", (store.account, chat_id, message_id)))
-            journal = safe_metadata(event) if chat_id and self.selected(chat_id) and (self.service.settings.chat_auto_save or already_archived) else {"eventId": id, "type": str(event.get("type") or ""), "chatId": chat_id, "skipped": True}
+            known = db.rows("SELECT data FROM ca_chats WHERE account=? AND id=?", (store.account, chat_id))
+            previous = store.message(chat_id, message_id) if known else None
+            full_history = bool(known and manual_history_complete(json.loads(known[0]["data"])))
+            collect_new = self.service.settings.chat_auto_save and (full_history or
+                          (instant(raw.get("date")) or 0) >= (instant(store.state("auto_since", stamp())) or time.time()))
+            journal = safe_metadata(event) if chat_id and self.selected(chat_id) and (collect_new or previous) else {"eventId": id, "type": str(event.get("type") or ""), "chatId": chat_id, "skipped": True}
             db.execute("INSERT OR IGNORE INTO ca_events VALUES(?,?,?)", (store.account, id, canonical(journal)))
             if chat_id and self.selected(chat_id):
                 if not db.rows("SELECT id FROM ca_chats WHERE account=? AND id=?", (store.account, chat_id)):
                     store.upsert_chat(chat_id, f"chat{chat_id}", title=str(chat_raw.get("name") or f"Чат {chat_id}"),
-                                      auto_history=bool(self.service.settings.chat_auto_save and store.state("inventory_ready", False)))
-                previous = store.message(chat_id, message_id)
+                                      auto_history=False)
                 deleted = event.get("type") == "ONIMV2MESSAGEDELETE"
-                collect_new = self.service.settings.chat_auto_save and (store.chat(chat_id).get("auto_history") or
-                              event.get("type") == "ONIMV2MESSAGEADD" or (instant(raw.get("date")) or 0) >= (instant(store.state("auto_since", stamp())) or time.time()))
                 if message_id and (previous or collect_new) and (deleted or "text" in raw or event.get("type") in {"ONIMV2REACTIONCHANGE", "ONIMV2MESSAGEREACTIONCHANGE"}):
                     # Reduced event payloads must not erase fields omitted by the source.
                     merged = {"id": message_id, "chatId": chat_id}
@@ -577,6 +630,71 @@ class ChatArchive:
         db.set_state(prefix + "offset", str(page["nextOffset"]))
         db.set_state(prefix + "last", str(time.time()))
 
+    async def upgrade_collection_policy(self, store):
+        """Cancel implicit backfills while keeping explicit work and saved data."""
+        policy = store.state("collection_policy", 0)
+        if policy >= COLLECTION_POLICY:
+            return
+        db = self.service.db
+        if policy < 2 or not store.state("auto_since"):
+            store.set_state("auto_since", stamp())
+        cutoff = store.state("auto_since")
+        chats = {r["id"]: json.loads(r["data"]) for r in db.rows("SELECT id,data FROM ca_chats WHERE account=?", (store.account,))}
+        work = db.rows("SELECT chat,kind,data FROM ca_work WHERE account=?", (store.account,))
+        manual = {r["chat"] for r in work if r["kind"] == "history" and not json.loads(r["data"]).get("automatic")}
+        manual.update(r["chat"] for r in db.rows("""SELECT json_extract(data,'$.chat') AS chat FROM ca_activity
+            WHERE account=? AND json_extract(data,'$.kind')='history' AND json_extract(data,'$.state')='done'
+            AND json_type(data,'$.automatic')='false'""", (store.account,)))
+        dirty = set()
+        for id, chat in chats.items():
+            confirmed = bool(chat.get("manual_history_requested") or id in manual or
+                             policy >= 2 and chat.get("history_complete") and not chat.get("auto_history"))
+            if chat.get("auto_history") or confirmed and not chat.get("manual_history_requested"):
+                store.update_chat(id, auto_history=False, manual_history_requested=confirmed)
+                dirty.add(id)
+            chat["manual_history_requested"] = confirmed
+        for row in work:
+            data = json.loads(row["data"])
+            if not data.get("automatic"):
+                continue
+            if row["kind"] == "history":
+                db.execute("DELETE FROM ca_work WHERE account=? AND chat=? AND kind='history'", (store.account, row["chat"]))
+                store.activity("history", row["chat"], "cancelled", message="Старая история сохраняется только по ручному выбору")
+                if not chats[row["chat"]].get("history_complete"):
+                    store.update_chat(row["chat"], coverage="pending")
+                dirty.add(row["chat"])
+            elif row["kind"] in {"new", "recent_check", "audit"} and not manual_history_complete(chats[row["chat"]]):
+                if row["kind"] != "new" and not self.has_current_messages(store, row["chat"]):
+                    db.execute("DELETE FROM ca_work WHERE account=? AND chat=? AND kind=?", (store.account, row["chat"], row["kind"]))
+                    store.activity(row["kind"], row["chat"], "cancelled", message="Проверяются только сохранённые новые сообщения")
+                    dirty.add(row["chat"])
+                    continue
+                if policy >= 2 and data.get("date_from") and (instant(data["date_from"]) or 0) >= (instant(cutoff) or 0):
+                    continue  # Already bounded: retain the page cursor and retry state.
+                data.update(cursor=0, date_from=cutoff, pages=0, messages=0)
+                data.pop("error", None)
+                db.execute("UPDATE ca_work SET data=?,next_at=0 WHERE account=? AND chat=? AND kind=?",
+                           (canonical(data), store.account, row["chat"], row["kind"]))
+                dirty.add(row["chat"])
+        # Files already explicitly requested (including the history checkbox)
+        # remain queued. Only accidental older automatic files are withdrawn.
+        newer_files = {(r["chat"], r["id"]) for r in db.rows("""SELECT DISTINCT m.chat,CAST(f.value AS INTEGER) AS id
+            FROM ca_messages m,json_each(m.data,'$.file_ids') f
+            WHERE m.account=? AND julianday(m.date)>=julianday(?)""", (store.account, cutoff))}
+        for row in db.rows("SELECT chat,id,data FROM ca_files WHERE account=? AND automatic=1 AND state IN ('queued','error','size_limited')", (store.account,)):
+            origin = json.loads(row["data"]).get("download_origin", "automatic")
+            if origin not in {"manual_collection", "history_opt_in"} and not manual_history_complete(chats[row["chat"]]) and (row["chat"], row["id"]) not in newer_files:
+                store.file_update(row["chat"], row["id"], state="not_saved", automatic=0, error="", next_at=0)
+                dirty.add(row["chat"])
+        for id in dirty:
+            if (store.chat_folder(id) / "chat.json").exists():
+                await durable_io(store.flush, id)
+        if policy < 2:
+            store.set_state("inventory_ready", False)
+            store.set_state("discover_requested", None)
+            store.set_state("last_discovery", 0)
+        store.set_state("collection_policy", COLLECTION_POLICY)
+
     async def step(self):
         if not self.service.connected():
             return
@@ -586,16 +704,7 @@ class ChatArchive:
             if store.account not in self.recovered:
                 await durable_io(store.recover)
                 self.recovered.add(store.account)
-            if store.state("collection_policy", 0) < 2:
-                # Upgrade the earlier automatic-full-history policy without
-                # deleting saved content or explicitly requested history jobs.
-                self.service.db.execute("DELETE FROM ca_work WHERE account=? AND json_extract(data,'$.automatic')=1", (store.account,))
-                self.service.db.execute("UPDATE ca_files SET state='not_saved',automatic=0 WHERE account=? AND state='queued' AND automatic=1 AND COALESCE(json_extract(data,'$.download_origin'),'') NOT IN ('manual_collection','history_opt_in')", (store.account,))
-                store.set_state("collection_policy", 2)
-                store.set_state("auto_since", stamp())
-                store.set_state("inventory_ready", False)
-                store.set_state("discover_requested", None)
-                store.set_state("last_discovery", 0)
+            await self.upgrade_collection_policy(store)
             automatic = s.chat_auto_save and not s.paused
             prefix = f"chat_events:{store.portal}:{store.user_id}:"
             if automatic and not store.state("auto_since"):
@@ -634,7 +743,12 @@ class ChatArchive:
                                 if not first:
                                     continue
                                 recent = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat() if days else first
-                                start = max((first, recent), key=lambda value: instant(value) or 0)
+                                bounds = [first, recent]
+                                if not manual_history_complete(chat):
+                                    if not self.has_current_messages(store, chat["id"]):
+                                        continue
+                                    bounds.append(store.state("auto_since", stamp()))
+                                start = max(bounds, key=lambda value: instant(value) or 0)
                                 store.enqueue(chat["id"], kind, {"cursor": 0, "date_from": start, "automatic": True}, priority)
                         store.set_state(kind + "_at", time.time())
             if s.chat_events and self.service.db.get_state(prefix + "consent") and not s.paused and time.time() - store.state("events_at", 0) >= 15:
@@ -770,8 +884,11 @@ class ChatArchive:
             for row in rows:
                 file = {**json.loads(row["data"]), **{k: v for k, v in row.items() if k != "data"}}
                 if file["automatic"]:
-                    if store.state("collection_policy", 0) < 2 and file.get("download_origin") not in {"manual_collection", "history_opt_in"}:
+                    if store.state("collection_policy", 0) < COLLECTION_POLICY and file.get("download_origin") not in {"manual_collection", "history_opt_in"}:
                         continue  # Wait for the message loop's durable upgrade.
+                    if not self.automatic_file_allowed(store, file["chat"], file["id"], file.get("download_origin", "automatic")):
+                        store.file_update(file["chat"], file["id"], state="not_saved", automatic=0, error="", next_at=0)
+                        continue
                     manual_collection = file.get("download_origin") == "manual_collection"
                     independent = file.get("download_origin") in {"manual_collection", "history_opt_in"}
                     if (not independent and not s.chat_auto_save) or (not manual_collection and not self.selected(file["chat"])) or not getattr(s, "chat_download_" + file["category"]):
