@@ -24,7 +24,8 @@ from .scheduling import window_status
 
 ACCESS_CODES = {"ACCESS_ERROR", "ACCESS_DENIED", "CHAT_NOT_FOUND", "DIALOG_ID_INVALID"}
 UNSUPPORTED_CODES = {"METHOD_NOT_FOUND", "ERROR_METHOD_NOT_FOUND", "NOT_IMPLEMENTED", "UNKNOWN_METHOD"}
-COLLECTION_POLICY = 3
+COLLECTION_POLICY = 4
+MANUAL_HISTORY_ORIGINS = {"request", "manual_job", "baseline_v2"}
 
 
 async def durable_io(function, *args):
@@ -60,7 +61,8 @@ def instant(value):
 
 
 def manual_history_complete(chat):
-    return bool(chat.get("manual_history_requested") and chat.get("history_complete"))
+    return bool(chat.get("manual_history_requested") is True and chat.get("history_complete") is True and
+                chat.get("manual_history_origin") in MANUAL_HISTORY_ORIGINS)
 
 
 def related_materials(page, chat):
@@ -203,7 +205,7 @@ class ChatArchive:
             store.chat(positive(id))
         for id in ids:
             store.update_chat(positive(id), history_paused=False,
-                              **({"manual_history_requested": True} if not start and not end else {}))
+                              **({"manual_history_requested": True, "manual_history_origin": "request"} if not start and not end else {}))
             kind = "period:" + date_from + ":" + date_to if start or end else "history"
             current = self.service.db.rows("SELECT data FROM ca_work WHERE account=? AND chat=? AND kind=?", (store.account, positive(id), kind))
             if current and json.loads(current[0]["data"]).get("automatic"):
@@ -647,12 +649,21 @@ class ChatArchive:
             AND json_type(data,'$.automatic')='false'""", (store.account,)))
         dirty = set()
         for id, chat in chats.items():
-            confirmed = bool(chat.get("manual_history_requested") or id in manual or
-                             policy >= 2 and chat.get("history_complete") and not chat.get("auto_history"))
-            if chat.get("auto_history") or confirmed and not chat.get("manual_history_requested"):
-                store.update_chat(id, auto_history=False, manual_history_requested=confirmed)
+            origin = chat.get("manual_history_origin", "")
+            if chat.get("manual_history_requested") is True and origin in MANUAL_HISTORY_ORIGINS:
+                confirmed = True
+            elif id in manual:
+                confirmed, origin = True, "manual_job"
+            elif policy == 2 and "manual_history_requested" not in chat and chat.get("history_complete") is True and chat.get("auto_history") is False:
+                # In policy 2 an explicitly false flag never scheduled automatic
+                # history. Absence of the flag (older formats) proves nothing.
+                confirmed, origin = True, "baseline_v2"
+            else:
+                confirmed, origin = False, ""
+            if chat.get("auto_history") or chat.get("manual_history_requested", False) != confirmed or chat.get("manual_history_origin", "") != origin:
+                store.update_chat(id, auto_history=False, manual_history_requested=confirmed, manual_history_origin=origin)
                 dirty.add(id)
-            chat["manual_history_requested"] = confirmed
+            chat.update(manual_history_requested=confirmed, manual_history_origin=origin)
         for row in work:
             data = json.loads(row["data"])
             if not data.get("automatic"):

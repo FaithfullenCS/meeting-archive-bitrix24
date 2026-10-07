@@ -192,7 +192,7 @@ def queue_action(engine, id, action):
         store.db.execute("DELETE FROM ca_work WHERE account=? AND chat=? AND kind=?", (store.account, chat, kind))
         store.enqueue(chat, kind, payload, 2)
         if kind == "history":
-            store.update_chat(chat, history_paused=False, manual_history_requested=True)
+            store.update_chat(chat, history_paused=False, manual_history_requested=True, manual_history_origin="request")
     else:
         store.db.execute("DELETE FROM ca_work WHERE account=? AND chat=? AND kind=?", (store.account, chat, kind))
         if kind == "history":
