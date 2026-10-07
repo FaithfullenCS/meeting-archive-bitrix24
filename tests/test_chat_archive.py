@@ -80,7 +80,7 @@ async def test_new_self_message_not_starved_by_large_catalogue(chat_service, mon
     now = [time.time()]
     monkeypatch.setattr("meeting_archive.chat_sync.time.time", lambda: now[0])
     for key, value in {
-        "collection_policy": 4,
+        "collection_policy": 5,
         "inventory_ready": True,
         "last_discovery": now[0],
         "auto_since": "2026-01-01T00:00:00Z",
@@ -217,7 +217,7 @@ async def test_manual_history_has_turn_under_continuous_new_work(chat_service):
     store=seed(chat_service)
     service=chat_service
     service.settings.chat_auto_save=True
-    for key,value in {"collection_policy":4,"last_discovery":time.time(),"recent_check_at":time.time(),"audit_at":time.time(),"inventory_ready":True}.items():
+    for key,value in {"collection_policy":5,"last_discovery":time.time(),"recent_check_at":time.time(),"audit_at":time.time(),"inventory_ready":True}.items():
         store.set_state(key,value)
     store.enqueue(101,"new",{"automatic":True},-1)
     store.enqueue(101,"history",{"automatic":False},2)
@@ -281,7 +281,7 @@ def background_inventory(service, monkeypatch):
     for name in ("job_loop", "scheduler", "discover_resources", "refresh_identity"):
         monkeypatch.setattr(service, name, idle)
     store = seed(service)
-    for key, value in {"collection_policy": 4, "inventory_ready": True,
+    for key, value in {"collection_policy": 5, "inventory_ready": True,
                        "last_discovery": time.time(), "extra_recent_at": time.time(),
                        "recent_check_at": time.time(), "audit_at": time.time(),
                        "auto_since": "2026-01-01T00:00:00Z"}.items():
@@ -585,7 +585,7 @@ async def test_latest_pages_all_chats_before_history_and_idempotent_backfill(cha
 async def test_projection_failure_keeps_cursor_recovery_and_no_duplicate(chat_service, monkeypatch):
     service = chat_service
     store = seed(service)
-    store.enqueue(101,"history",{"cursor":0})
+    store.enqueue(101,"history",{"cursor":0,"automatic":False},2)
     async def call(*args, **kwargs):
         return {"messages":[message(i) for i in range(1,201)]}
     service.client.call=call
@@ -608,7 +608,7 @@ async def test_projection_failure_keeps_cursor_recovery_and_no_duplicate(chat_se
 
 async def test_tariff_limit_and_access_failure_not_empty_archive(chat_service):
     store = seed(chat_service)
-    store.enqueue(101,"history")
+    store.enqueue(101,"history",{"automatic":False},2)
     async def tariff(*args,**kwargs):
         return {"messages":[message(1)],"tariffRestrictions":{"isHistoryLimitExceeded":True}}
     chat_service.client.call=tariff
@@ -960,7 +960,7 @@ async def test_upgrade_keeps_manual_history_cancels_old_automatic(chat_service):
     store = seed(service)
     store.upsert_chat(102, "chat102", participants_at=time.time())
     store.enqueue(101, "history", {"automatic": True})
-    store.enqueue(102, "history", {"automatic": False})
+    store.enqueue(102, "history", {"automatic": False}, 2)
     async def call(method, params, **kwargs):
         if method == "im.recent.get":
             return []
@@ -969,7 +969,7 @@ async def test_upgrade_keeps_manual_history_cancels_old_automatic(chat_service):
     for _ in range(4):
         await service.chat_archive.step()
     assert not store.query(chat=101)["total"] and store.query(chat=102)["total"] == 1
-    assert store.state("collection_policy") == 4
+    assert store.state("collection_policy") == 5
 
 
 async def test_manual_history_download_types_and_explicit_size_limit(chat_service):
@@ -1059,7 +1059,7 @@ async def test_v2_policy_upgrade_preserves_manual_jobs_and_files(chat_service):
                           "files": [{"id": i, "name": f"demo-{i}.txt"} for i in range(77, 83)]})
     for id in (77, 78, 82):
         service.chat_archive.queue_file(store, 101, id, automatic=True)
-    service.chat_archive.queue_file(store, 101, 79, automatic=True, manual_collection=True)
+    service.chat_archive.queue_file(store, 101, 79, automatic=True, manual_collection=True, collection_kind="period:2026-09-01:2026-09-30")
     service.chat_archive.queue_file(store, 101, 80, automatic=True, history_opt_in=True)
     service.chat_archive.queue_file(store, 101, 81)
     store.file_update(101, 82, state="saved")
@@ -1071,7 +1071,7 @@ async def test_v2_policy_upgrade_preserves_manual_jobs_and_files(chat_service):
     other.enqueue(201, "history", {"automatic": True})
 
     await service.chat_archive.upgrade_collection_policy(store)
-    assert store.state("collection_policy") == 4 and store.state("auto_since") == cutoff
+    assert store.state("collection_policy") == 5 and store.state("auto_since") == cutoff
     work = service.db.rows("SELECT chat,kind,data FROM ca_work WHERE account=?", (store.account,))
     assert not any(r["chat"] == 101 and r["kind"] == "history" for r in work)
     manual = next(r for r in work if r["chat"] == 102)
@@ -1099,7 +1099,7 @@ async def test_legacy_completeness_does_not_invent_manual_consent(chat_service, 
     store.update_chat(101, history_complete=True)
     store.upsert_chat(102, "chat102", auto_history=False, history_complete=True)
     store.upsert_chat(103, "chat103", auto_history=True, history_complete=True)
-    store.activity("history", 103, "done", automatic=False)
+    store.activity("history", 103, "done", automatic=False, priority=2)
     if policy == 3:
         # Earlier migration guesses carry no reliable origin; do not trust them.
         store.update_chat(101, auto_history=False, manual_history_requested=True)
@@ -1108,12 +1108,54 @@ async def test_legacy_completeness_does_not_invent_manual_consent(chat_service, 
     assert not store.chat(101).get("manual_history_requested")
     assert not store.chat(101).get("manual_history_origin")
     assert bool(store.chat(102).get("manual_history_requested")) == (policy == 2)
-    assert store.chat(103)["manual_history_requested"] and store.chat(103)["manual_history_origin"] == "manual_job"
+    assert store.chat(103)["manual_history_requested"] and store.chat(103)["manual_history_origin"] == "manual_job_v2"
     for id in (101, 102, 103):
         store.save_page(id, {"messages": [message(1, id)]})
         chat_service.chat_archive.schedule_chat(store, store.chat(id), True)
         data = json.loads(store.db.rows("SELECT data FROM ca_work WHERE account=? AND chat=? AND kind='new'", (store.account, id))[0]["data"])
         assert bool(data["date_from"]) == (id == 101 or id == 102 and policy == 3)
+
+
+@pytest.mark.parametrize("policy", [2, 3, 4])
+async def test_first_release_catalogue_jobs_are_not_manual_history(chat_service, policy):
+    service = chat_service
+    store = seed(service)
+    store.set_state("collection_policy", policy)
+    store.set_state("auto_since", "2026-10-01T00:00:00Z")
+    store.set_state("last_discovery", time.time())
+    service.settings.chat_download_documents = True
+    # v0.2.29 queued these after a catalogue refresh, without selecting history.
+    store.enqueue(101, "history", {"automatic": False, "cursor": 51}, 10)
+    store.enqueue(101, "new", {"automatic": False, "date_from": ""}, 0)
+    store.save_page(101, {"messages": [message(1, fileIds=[77])], "files": [{"id": 77, "name": "legacy.txt"}]})
+    service.chat_archive.queue_file(store, 101, 77, automatic=True, manual_collection=True)
+    if policy >= 3:
+        store.update_chat(101, auto_history=False, manual_history_requested=True,
+                          manual_history_origin="manual_job" if policy == 4 else "")
+    store.upsert_chat(102, "chat102", participants_at=time.time())
+    store.enqueue(102, "history", {"automatic": False, "cursor": 61}, 2)
+    store.upsert_chat(103, "chat103", participants_at=time.time())
+    store.enqueue(103, "history", {"automatic": False, "cursor": 55}, 10)
+    service.chat_archive.request_history([103])  # Explicit selection resolves an old row collision.
+
+    await service.chat_archive.upgrade_collection_policy(store)
+    assert not store.chat(101).get("manual_history_requested")
+    assert not store.db.rows("SELECT kind FROM ca_work WHERE account=? AND chat=101 AND kind='history'", (store.account,))
+    new = json.loads(store.db.rows("SELECT data FROM ca_work WHERE account=? AND chat=101 AND kind='new'", (store.account,))[0]["data"])
+    assert new["automatic"] is True and new["date_from"] == "2026-10-01T00:00:00Z"
+    assert store.file(101, 77)["state"] == "not_saved" and store.query(chat=101)["total"] == 1
+    assert store.chat(102)["manual_history_origin"] == "manual_job_v2"
+    assert store.chat(103)["manual_history_origin"] == "request"
+    service.chat_archive.recovered.add(store.account)
+    seen = []
+    async def call(method, params, **kwargs):
+        assert method == "im.dialog.messages.search" and params["CHAT_ID"] in {102, 103}
+        seen.append(params["CHAT_ID"])
+        return {"messages": [message(1, params["CHAT_ID"])]}
+    service.client.call = call
+    for _ in range(2):
+        await service.chat_archive.step()
+    assert seen == [102, 103]  # Automation off cannot run the old catalogue check.
 
 
 @pytest.mark.parametrize("automatic", [True, False])
@@ -1187,7 +1229,7 @@ async def test_automatic_audit_cannot_expand_into_unrequested_old_period(chat_se
 async def test_metadata_limit_retains_work_and_manual_request_takes_priority(chat_service):
     service = chat_service
     store = seed(service)
-    store.set_state("collection_policy", 4)
+    store.set_state("collection_policy", 5)
     store.set_state("last_discovery", time.time())
     store.enqueue(101, "metadata", {}, 4)
     store.upsert_chat(102, "chat102", participants_at=time.time())

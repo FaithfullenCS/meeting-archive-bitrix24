@@ -24,8 +24,8 @@ from .scheduling import window_status
 
 ACCESS_CODES = {"ACCESS_ERROR", "ACCESS_DENIED", "CHAT_NOT_FOUND", "DIALOG_ID_INVALID"}
 UNSUPPORTED_CODES = {"METHOD_NOT_FOUND", "ERROR_METHOD_NOT_FOUND", "NOT_IMPLEMENTED", "UNKNOWN_METHOD"}
-COLLECTION_POLICY = 4
-MANUAL_HISTORY_ORIGINS = {"request", "manual_job", "baseline_v2"}
+COLLECTION_POLICY = 5
+MANUAL_HISTORY_ORIGINS = {"request", "manual_job_v2", "baseline_v2"}
 
 
 async def durable_io(function, *args):
@@ -452,7 +452,7 @@ class ChatArchive:
         manual_collection = not work.get("automatic", False)
         for message in messages:
             for file_id in message["file_ids"]:
-                self.queue_file(store, chat["id"], file_id, automatic=True, missing_ok=True, manual_collection=manual_collection)
+                self.queue_file(store, chat["id"], file_id, automatic=True, missing_ok=True, manual_collection=manual_collection, collection_kind=row["kind"])
         if finished:
             self.service.db.execute("DELETE FROM ca_work WHERE account=? AND chat=? AND kind=?", (store.account, chat["id"], row["kind"]))
         else:
@@ -462,7 +462,8 @@ class ChatArchive:
         await durable_io(store.flush, chat["id"])
         store.set_state("last_progress", {"at": time.time(), "chat": chat["id"], "kind": row["kind"],
                                           "pages": work["pages"], "messages": work["messages"]})
-        return {"pages": work["pages"], "messages": work["messages"], "automatic": bool(work.get("automatic"))}
+        return {"pages": work["pages"], "messages": work["messages"], "automatic": bool(work.get("automatic")),
+                "priority": row["priority"], "manual_history_origin": chat.get("manual_history_origin", "")}
 
     def status(self):
         store = self.store()
@@ -480,14 +481,16 @@ class ChatArchive:
                 "connected": self.service.connected(), "automatic": automatic,
                 "paused": self.service.settings.paused, "error": self.error}
 
-    def automatic_file_allowed(self, store, chat, id, origin):
-        if origin in {"manual_collection", "history_opt_in", "manual_file"} or manual_history_complete(store.chat(chat)):
+    def automatic_file_allowed(self, store, chat, id, origin, collection_kind=""):
+        details = store.chat(chat)
+        requested = details.get("manual_history_requested") is True and details.get("manual_history_origin") in MANUAL_HISTORY_ORIGINS
+        if origin in {"history_opt_in", "manual_file"} or origin == "manual_collection" and (requested or collection_kind.startswith("period:")) or manual_history_complete(details):
             return True
         return bool(self.service.db.rows("""SELECT 1 FROM ca_messages m,json_each(m.data,'$.file_ids') f
             WHERE m.account=? AND m.chat=? AND f.value=? AND julianday(m.date)>=julianday(?) LIMIT 1""",
             (store.account, chat, id, store.state("auto_since", stamp()))))
 
-    def queue_file(self, store, chat, id, *, automatic=False, missing_ok=False, manual_collection=False, history_opt_in=False):
+    def queue_file(self, store, chat, id, *, automatic=False, missing_ok=False, manual_collection=False, history_opt_in=False, collection_kind=""):
         try:
             file = store.file(chat, id)
         except ValueError:
@@ -501,13 +504,16 @@ class ChatArchive:
         if file["state"] == "running" or automatic and file["state"] == "saved":
             return
         origin = "manual_collection" if manual_collection else "history_opt_in" if history_opt_in else "automatic"
-        if automatic and store.state("collection_policy", 0) >= COLLECTION_POLICY and not self.automatic_file_allowed(store, chat, id, origin):
+        collection_kind = collection_kind or file.get("collection_kind", "")
+        if automatic and store.state("collection_policy", 0) >= COLLECTION_POLICY and not self.automatic_file_allowed(store, chat, id, origin, collection_kind):
             return
         if automatic and s.chat_max_file_mb and file["size"] > s.chat_max_file_mb * 1024**2:
             store.file_update(chat, id, state="size_limited", error=f"Размер файла превышает лимит {s.chat_max_file_mb} МБ. Текст сохранён; файл можно скачать вручную.")
             return
         data = json.loads(self.service.db.rows("SELECT data FROM ca_files WHERE account=? AND chat=? AND id=?", (store.account, chat, id))[0]["data"])
         data["download_origin"] = "manual_collection" if manual_collection else "history_opt_in" if history_opt_in else "automatic" if automatic else "manual_file"
+        if manual_collection:
+            data["collection_kind"] = collection_kind
         data.update(queued_at=time.time(),downloaded_bytes=0)
         # Manual request promotes a queued automatic job and bypasses all gates.
         store.file_update(chat, id, state="queued", automatic=int(automatic and (file["state"] != "queued" or file["automatic"])), data=canonical(data), error="", next_at=0)
@@ -642,18 +648,25 @@ class ChatArchive:
             store.set_state("auto_since", stamp())
         cutoff = store.state("auto_since")
         chats = {r["id"]: json.loads(r["data"]) for r in db.rows("SELECT id,data FROM ca_chats WHERE account=?", (store.account,))}
-        work = db.rows("SELECT chat,kind,data FROM ca_work WHERE account=?", (store.account,))
-        manual = {r["chat"] for r in work if r["kind"] == "history" and not json.loads(r["data"]).get("automatic")}
-        manual.update(r["chat"] for r in db.rows("""SELECT json_extract(data,'$.chat') AS chat FROM ca_activity
+        work = db.rows("SELECT chat,kind,data,priority FROM ca_work WHERE account=?", (store.account,))
+        # v0.2.29 catalogue refresh also produced automatic=False, priority=10.
+        # Only modern manual priority=2 or explicit origin proves the request.
+        manual = {r["chat"] for r in work if r["kind"] == "history" and json.loads(r["data"]).get("automatic") is False and r["priority"] == 2}
+        outcomes = db.rows("""SELECT data FROM ca_activity
             WHERE account=? AND json_extract(data,'$.kind')='history' AND json_extract(data,'$.state')='done'
-            AND json_type(data,'$.automatic')='false'""", (store.account,)))
+            AND json_type(data,'$.automatic')='false'""", (store.account,))
+        for row in outcomes:
+            data = json.loads(row["data"])
+            prior = chats.get(data["chat"], {})
+            if data.get("priority") == 2 or data.get("manual_history_origin") in MANUAL_HISTORY_ORIGINS or policy == 2 and type(prior.get("auto_history")) is bool:
+                manual.add(data["chat"])
         dirty = set()
         for id, chat in chats.items():
             origin = chat.get("manual_history_origin", "")
             if chat.get("manual_history_requested") is True and origin in MANUAL_HISTORY_ORIGINS:
                 confirmed = True
             elif id in manual:
-                confirmed, origin = True, "manual_job"
+                confirmed, origin = True, "manual_job_v2"
             elif policy == 2 and "manual_history_requested" not in chat and chat.get("history_complete") is True and chat.get("auto_history") is False:
                 # In policy 2 an explicitly false flag never scheduled automatic
                 # history. Absence of the flag (older formats) proves nothing.
@@ -666,6 +679,17 @@ class ChatArchive:
             chat.update(manual_history_requested=confirmed, manual_history_origin=origin)
         for row in work:
             data = json.loads(row["data"])
+            if row["kind"] == "history" and not (chats[row["chat"]].get("manual_history_requested") and chats[row["chat"]].get("manual_history_origin") in MANUAL_HISTORY_ORIGINS):
+                db.execute("DELETE FROM ca_work WHERE account=? AND chat=? AND kind='history'", (store.account, row["chat"]))
+                store.activity("history", row["chat"], "cancelled", message="Подтвердите старую историю кнопкой «Сохранить выбранные»")
+                if not chats[row["chat"]].get("history_complete"):
+                    store.update_chat(row["chat"], coverage="pending")
+                dirty.add(row["chat"])
+                continue
+            if row["kind"] == "new" and data.get("automatic") is False and row["priority"] != 2:
+                data["automatic"] = True  # Old catalogue checks are not manual downloads.
+                db.execute("UPDATE ca_work SET data=? WHERE account=? AND chat=? AND kind='new'", (canonical(data), store.account, row["chat"]))
+                dirty.add(row["chat"])
             if not data.get("automatic"):
                 continue
             if row["kind"] == "history":
@@ -693,8 +717,11 @@ class ChatArchive:
             FROM ca_messages m,json_each(m.data,'$.file_ids') f
             WHERE m.account=? AND julianday(m.date)>=julianday(?)""", (store.account, cutoff))}
         for row in db.rows("SELECT chat,id,data FROM ca_files WHERE account=? AND automatic=1 AND state IN ('queued','error','size_limited')", (store.account,)):
-            origin = json.loads(row["data"]).get("download_origin", "automatic")
-            if origin not in {"manual_collection", "history_opt_in"} and not manual_history_complete(chats[row["chat"]]) and (row["chat"], row["id"]) not in newer_files:
+            file = json.loads(row["data"])
+            origin = file.get("download_origin", "automatic")
+            requested = chats[row["chat"]].get("manual_history_requested") and chats[row["chat"]].get("manual_history_origin") in MANUAL_HISTORY_ORIGINS
+            explicit = origin in {"manual_file", "history_opt_in"} or origin == "manual_collection" and (requested or file.get("collection_kind", "").startswith("period:"))
+            if not explicit and not manual_history_complete(chats[row["chat"]]) and (row["chat"], row["id"]) not in newer_files:
                 store.file_update(row["chat"], row["id"], state="not_saved", automatic=0, error="", next_at=0)
                 dirty.add(row["chat"])
         for id in dirty:
@@ -895,9 +922,9 @@ class ChatArchive:
             for row in rows:
                 file = {**json.loads(row["data"]), **{k: v for k, v in row.items() if k != "data"}}
                 if file["automatic"]:
-                    if store.state("collection_policy", 0) < COLLECTION_POLICY and file.get("download_origin") not in {"manual_collection", "history_opt_in"}:
+                    if store.state("collection_policy", 0) < COLLECTION_POLICY and file.get("download_origin") != "history_opt_in":
                         continue  # Wait for the message loop's durable upgrade.
-                    if not self.automatic_file_allowed(store, file["chat"], file["id"], file.get("download_origin", "automatic")):
+                    if not self.automatic_file_allowed(store, file["chat"], file["id"], file.get("download_origin", "automatic"), file.get("collection_kind", "")):
                         store.file_update(file["chat"], file["id"], state="not_saved", automatic=0, error="", next_at=0)
                         continue
                     manual_collection = file.get("download_origin") == "manual_collection"
