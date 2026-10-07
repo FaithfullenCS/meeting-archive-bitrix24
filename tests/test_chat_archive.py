@@ -296,6 +296,14 @@ def cleanup_seed(service):
 async def test_chat_message_removal_clears_index_and_does_not_refetch_old(chat_service):
     store, folder = cleanup_seed(chat_service)
     store.save_page(101, {"messages": [message(1, fileIds=[77], text="Changed synthetic") ]})
+    for event_id, event in enumerate([
+        {"data": {"chat": {"id": 101}, "message": {"text": "Synthetic removed"}}},
+        {"data": {"message": {"chatId": 101, "text": "Synthetic removed"}}},
+        {"data": {"chatId": 101, "message": {"text": "Synthetic removed"}}},
+        {"chatId": 101, "skipped": True},
+        {"data": {"chatId": 102, "message": {"text": "Synthetic preserved"}}},
+    ], 1):
+        store.db.execute("INSERT INTO ca_events VALUES(?,?,?)", (store.account, event_id, json.dumps(event)))
     store.enqueue(101, "history", {"automatic": False}, 2)
     export = chat_service.home / "exports" / (store.account + ".zip")
     export.parent.mkdir()
@@ -306,6 +314,10 @@ async def test_chat_message_removal_clears_index_and_does_not_refetch_old(chat_s
     assert not (folder / "messages").exists() and not (folder / "versions").exists()
     assert (folder / "notes/keep.md").read_text("utf-8") == "Synthetic note"
     assert (folder / "attachments/file-77/hash_demo.txt").exists() and not export.exists()
+    events = store.db.rows("SELECT id FROM ca_events WHERE account=?", (store.account,))
+    assert [r["id"] for r in events] == [5]
+    journal = (store.folder / "events.jsonl").read_text("utf-8")
+    assert "Synthetic removed" not in journal and "Synthetic preserved" in journal
     assert not store.chat(101)["manual_history_requested"] and store.chat(101)["message_delete_after"]
     chat_service.chat_archive.schedule_chat(store, store.chat(101), True)
     queued = json.loads(store.db.rows("SELECT data FROM ca_work WHERE account=? AND kind='new'", (store.account,))[0]["data"])

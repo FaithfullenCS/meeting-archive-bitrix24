@@ -181,7 +181,7 @@ def apply_index(store, id, manifest, targets):
                     "DELETE FROM ca_activity WHERE account=? AND json_extract(data,'$.chat')=?", (store.account, id)
                 )
                 con.execute(
-                    "DELETE FROM ca_events WHERE account=? AND COALESCE(json_extract(data,'$.data.chat.id'),json_extract(data,'$.data.message.chatId'),json_extract(data,'$.chatId'))=?",
+                    "DELETE FROM ca_events WHERE account=? AND COALESCE(json_extract(data,'$.data.chat.id'),json_extract(data,'$.data.message.chatId'),json_extract(data,'$.data.chatId'),json_extract(data,'$.chatId'))=?",
                     (store.account, id),
                 )
             for file in manifest.get("files", []):
