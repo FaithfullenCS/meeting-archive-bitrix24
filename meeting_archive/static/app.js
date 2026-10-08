@@ -717,9 +717,17 @@
     $$('[data-job-cancel]').forEach(button => decorateButton(button, 'x'));
     $$('[data-job-retry]').forEach(button => decorateButton(button, 'refresh'));
   }
+  function updateChatQueueSelection() {
+    const count = state.chatQueueSelected?.size || 0, total = state.chatQueueTotal || 0;
+    const button = $("#chat-jobs-cancel-selected"), selectAll = $("#chat-jobs-select-all");
+    button.disabled = count === 0;
+    button.title = count ? `Выбрано заданий: ${count}` : "Сначала выберите задания";
+    selectAll.checked = count > 0 && count >= total;
+    selectAll.indeterminate = count > 0 && count < total;
+  }
   function renderChatJobs(data, append=false, replace=false) {
     if (!data || !$("#chat-jobs-list")) return;
-    if(state.chatQueueAccount && state.chatQueueAccount!==data.account) { state.chatQueueItems=[]; for(const key of state.queueOpen?.keys() || []) if(key.startsWith("chat:")) state.queueOpen.delete(key); }
+    if(state.chatQueueAccount && state.chatQueueAccount!==data.account) { state.chatQueueItems=[]; state.chatQueueSelected=new Set(); for(const key of state.queueOpen?.keys() || []) if(key.startsWith("chat:")) state.queueOpen.delete(key); }
     state.chatQueueAccount=data.account;
     state.chatQueueSelected ||= new Set();
     const previous=state.chatQueueItems||[], keep=!replace && state.route==="jobs" && previous.length>100;
@@ -731,6 +739,7 @@
     if (state.chatQueueItems.length) renderQueueGroups($("#chat-jobs-list"),state.chatQueueItems,"chat",job => `<article class="job-item" data-chat-job-id="${job.id}"><label class="queue-job-select"><input type="checkbox" data-chat-job-select="${job.id}"${state.chatQueueSelected.has(job.id) ? " checked" : ""} aria-label="Выбрать задание ${job.label}"></label><div><div class="job-title">${icon(job.kind==="file" ? "file" : "chat")} ${escapeHtml(job.label)} ${badge(job.schedule_wait ? "waiting" : job.state)}</div><div class="job-meta">${escapeHtml(job.title)}${job.chat ? " · Чат ID "+job.chat : ""}${job.filename ? " · "+escapeHtml(job.filename) : ""}${job.automatic === true ? " · Автоматически" : job.automatic === false && job.kind!=="metadata" ? " · По вашему выбору" : ""}${job.touched ? " · "+escapeHtml(dateString(new Date(job.touched*1000).toISOString())) : ""}</div><div class="job-message">${escapeHtml(job.message||"")}${job.pages ? ` · Страниц: ${job.pages}` : ""}${job.messages ? ` · Обработано сообщений: ${job.messages}` : ""}${job.next_at>Date.now()/1000 ? ` · Повтор не раньше ${escapeHtml(dateString(new Date(job.next_at*1000).toISOString()))}` : ""}</div>${job.error ? `<div class="job-error">${escapeHtml(job.error)}</div>` : ""}${job.state==="running" ? `<progress class="job-progress" max="1"${job.total_bytes && job.downloaded_bytes ? ` value="${Math.min(1,job.downloaded_bytes/job.total_bytes)}"` : ""} aria-label="Выполнение задания чата"></progress>` : ""}</div><div class="job-actions">${job.state==="failed" || job.state==="cancelled" ? `<button class="button secondary small" data-chat-job-action="retry" data-chat-job="${job.id}">Повторить</button>` : ""}${job.state==="queued" || job.state==="failed" ? `<button class="button quiet small" data-chat-job-action="cancel" data-chat-job="${job.id}">Отменить</button>` : ""}</div></article>`, data.groups || []);
     else $("#chat-jobs-list").innerHTML = '<div class="empty-state"><p>Заданий чатов пока нет. Здесь появятся сохранение сообщений, история и вложения.</p></div>';
     $("#chat-jobs-more").hidden=state.chatQueueItems.length>=data.total;
+    updateChatQueueSelection();
     renderChatBackground(data.sync);
   }
   function renderModule(module) {
@@ -1130,17 +1139,21 @@
   $("#jobs-refresh").onclick = event => action(event.currentTarget, () => bootstrap());
   $("#chat-jobs-more").onclick=event=>action(event.currentTarget,async()=>renderChatJobs(await api(`/api/chat-archive/queue?offset=${state.chatQueueItems?.length||0}&limit=100`),true));
   $("#chat-jobs-select-all").onchange=event=>action(event.currentTarget,async()=>{
-    if(event.currentTarget.checked){ const all=await api("/api/chat-archive/queue?all_items=1"); state.chatQueueSelected=new Set(all.items.map(item=>item.id)); } else state.chatQueueSelected.clear();
-    await bootstrap();
+    const account = state.chatQueueAccount;
+    try {
+      if(event.currentTarget.checked){ const all=await api("/api/chat-archive/queue?all_items=1"); if(all.account!==account || state.chatQueueAccount!==account) return; state.chatQueueSelected=new Set(all.items.map(item=>item.id)); } else state.chatQueueSelected.clear();
+      updateChatQueueSelection();
+      await bootstrap();
+    } finally { updateChatQueueSelection(); }
   });
   $("#chat-jobs-cancel-selected").onclick=event=>action(event.currentTarget,async()=>{
     const ids=[...state.chatQueueSelected]; if(!ids.length)return;
     const summary=`Выбрано заданий: ${ids.length}. Уже скачанные материалы не удаляются; выполняемая сейчас работа завершится безопасно.`;
     if(!(await confirmAction("Отменить выбранные задания?",summary,"Отменить",true)))return;
-    const result=await api("/api/chat-archive/queue/bulk-cancel",{method:"POST",data:{ids,confirm:true}}); state.chatQueueSelected.clear();
+    const result=await api("/api/chat-archive/queue/bulk-cancel",{method:"POST",data:{ids,confirm:true}}); state.chatQueueSelected.clear(); updateChatQueueSelection();
     notify(`Отменено: ${result.cancelled}. В работе осталось: ${result.running}.`); await bootstrap();
   });
-  document.addEventListener("change",event=>{const input=event.target.closest("[data-chat-job-select]"); if(input){state.chatQueueSelected ||= new Set(); input.checked ? state.chatQueueSelected.add(input.dataset.chatJobSelect) : state.chatQueueSelected.delete(input.dataset.chatJobSelect); const b=$("#chat-jobs-cancel-selected"); if(b)b.disabled=!state.chatQueueSelected.size;}});
+  document.addEventListener("change",event=>{const input=event.target.closest("[data-chat-job-select]"); if(input){state.chatQueueSelected ||= new Set(); input.checked ? state.chatQueueSelected.add(input.dataset.chatJobSelect) : state.chatQueueSelected.delete(input.dataset.chatJobSelect); updateChatQueueSelection();}});
   document.addEventListener("click",event=>{ const button=event.target.closest("[data-chat-job-action]"); if(button) action(button,async()=>{ await api(`/api/chat-archive/queue/${button.dataset.chatJob}/${button.dataset.chatJobAction}`,{method:"POST"}); await bootstrap(); }); });
   function markSettingsDirty(event) { if (event?.target && !event.target.name && !event.target.closest("[data-schedule]")) return; state.settingsDirty = true; $("#settings-status").textContent = "Есть несохранённые изменения."; $(".settings-footer").classList.add("dirty"); updateCpuAcknowledgement(); updateAudioDownloadPolicy(); updateDiarization(); updateEngineControls(); updateScheduleVisibility(); }
   ["input", "change"].forEach(type => document.addEventListener(type, event => { if (event.target.form?.id === "settings-form") markSettingsDirty(event); }));

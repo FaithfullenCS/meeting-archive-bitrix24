@@ -551,3 +551,9 @@ option:disabled { color: #888; }
 @media (max-width: 560px) { .settings-tabs { width: 100%; } .settings-tabs .button { flex: 1 1 180px; } }
 
 .queue-select-all,.queue-job-select{display:flex;align-items:center;gap:7px}.queue-job-select{flex:0 0 22px;align-self:flex-start;padding-top:3px}.queue-job-select input,.queue-select-all input{accent-color:var(--accent)}.chat-queue-panel .section-heading{align-items:center}
+.chat-queue-panel .job-item { grid-template-columns: 22px minmax(0,1fr) auto; gap: 14px; align-items: start; }
+.chat-queue-panel .job-item > div { min-width: 0; }
+@media (max-width: 700px) {
+  .chat-queue-panel .job-item { grid-template-columns: 22px minmax(0,1fr); }
+  .chat-queue-panel .job-actions { grid-column: 2; }
+}
