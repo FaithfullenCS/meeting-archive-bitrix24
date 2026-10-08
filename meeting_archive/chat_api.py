@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse
 
 from .chat_model import positive, text_html
 from .chat_sync import instant
-from .chat_queue import queue_view, queue_action
+from .chat_queue import queue_view, queue_action, cancel_backlog
 
 
 def register_chat_api(app, service):
@@ -93,6 +93,14 @@ def register_chat_api(app, service):
         async with engine.lock:
             queue_action(engine,id,operation)
         return {"ok":True}
+
+    @app.post("/api/chat-archive/queue/cancel-backlog")
+    async def cancel_queue_backlog(request: Request):
+        data = await request.json()
+        if data.get("confirm") is not True:
+            raise ValueError("Подтвердите отмену очереди старой истории чатов")
+        async with engine.lock:
+            return cancel_backlog(engine, include_files=data.get("files", True))
 
     @app.get("/api/chat-archive/filters")
     async def filters():

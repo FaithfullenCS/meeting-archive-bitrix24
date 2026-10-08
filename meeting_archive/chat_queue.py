@@ -198,3 +198,29 @@ def queue_action(engine, id, action):
         if kind == "history":
             store.update_chat(chat, history_paused=True)
         store.activity(kind, chat, "cancelled")
+
+
+def cancel_backlog(engine, *, include_files=True):
+    """Cancel queued historical chat work, leaving new-message polling enabled."""
+    store = engine.store()
+    cancelled = 0
+    chats = set()
+    with store.db.lock:
+        rows = store.db.rows("SELECT chat,kind,data FROM ca_work WHERE account=?", (store.account,))
+        for row in rows:
+            kind = row["kind"]
+            if kind in {"new", "metadata", "recent_check", "audit"} or (kind != "history" and not kind.startswith("period:")):
+                continue
+            if getattr(engine, "current_work", None) == (store.account, row["chat"], kind):
+                continue
+            store.db.execute("DELETE FROM ca_work WHERE account=? AND chat=? AND kind=?", (store.account, row["chat"], kind))
+            store.activity(kind, row["chat"], "cancelled")
+            store.update_chat(row["chat"], history_paused=True)
+            cancelled += 1
+            chats.add(row["chat"])
+        if include_files:
+            for row in store.db.rows("SELECT chat,id FROM ca_files WHERE account=? AND state IN ('queued','error','unavailable','size_limited')", (store.account,)):
+                store.file_update(row["chat"], row["id"], state="not_saved", automatic=0)
+                cancelled += 1
+                chats.add(row["chat"])
+    return {"cancelled": cancelled, "chats": len(chats), "files": include_files}
