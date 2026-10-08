@@ -319,6 +319,102 @@ def test_cancel_selected_handles_all_queue_pages_and_leaves_running_visible(chat
     assert not store.db.rows("SELECT 1 FROM ca_work WHERE account=? AND chat=? AND kind='new'", (store.account, 101))
 
 
+def test_bulk_cancel_uses_one_snapshot_and_persists_across_recovery(chat_service, monkeypatch):
+    import meeting_archive.chat_queue as queue
+    store = seed(chat_service)
+    for number in range(779):
+        day = (datetime(2020, 1, 1) + timedelta(days=number)).date().isoformat()
+        store.enqueue(101, f"period:{day}:{day}", {"automatic": False}, 2)
+    store.flush(101)
+    ids = [item["id"] for item in queue.queue_view(chat_service.chat_archive, all_items=True)["items"]]
+    original = queue.queue_view
+    calls = []
+    def snapshot(*args, **kwargs):
+        calls.append(1)
+        assert len(calls) == 1, "Bulk cancellation must not look jobs up in a changing/pruned queue"
+        return original(*args, **kwargs)
+    monkeypatch.setattr(queue, "queue_view", snapshot)
+    result = queue.cancel_selected(chat_service.chat_archive, ids + ["already-finished-synthetic"])
+    assert result["cancelled"] == 779 and result["skipped"] == 1
+    assert not store.db.rows("SELECT kind FROM ca_work WHERE account=?", (store.account,))
+    store.db.execute("DELETE FROM ca_chats WHERE account=?", (store.account,))
+    store.recover()
+    assert not store.db.rows("SELECT kind FROM ca_work WHERE account=?", (store.account,))
+
+
+@pytest.mark.parametrize("kind", ["new", "history", "metadata"])
+async def test_access_error_stops_polling_until_explicit_retry(chat_service, monkeypatch, kind):
+    service = chat_service
+    store = seed(service)
+    service.settings.chat_auto_save = True
+    clock = [time.time()]
+    monkeypatch.setattr("meeting_archive.chat_sync.time.time", lambda: clock[0])
+    for key, value in {"collection_policy":5,"auto_since":"2020-01-01T00:00:00Z",
+                       "last_discovery":clock[0],"recent_check_at":clock[0],"audit_at":clock[0]}.items():
+        store.set_state(key, value)
+    service.chat_archive.recovered.add(store.account)
+    store.enqueue(101, kind, {"automatic": kind == "new"}, 2)
+    calls = []
+    async def denied(method, params, **kwargs):
+        calls.append(method)
+        raise BitrixError("Bitrix24: ACCESS_ERROR", code="ACCESS_ERROR")
+    service.client.call = denied
+    await service.chat_archive.step()
+    failed = next(item for item in queue_view(service.chat_archive)["items"] if item["kind"] == kind)
+    assert failed["state"] == "failed" and not failed.get("will_retry", False)
+    for _ in range(3):
+        clock[0] += 60
+        store.set_state("last_discovery", clock[0])
+        service.chat_archive.schedule_chat(store, store.chat(101), True)
+        await service.chat_archive.step()
+    assert len(calls) == 1, "Access denied must not be retried automatically"
+    queue_action(service.chat_archive, failed["id"], "retry")
+    await service.chat_archive.step()
+    assert len(calls) == 2, "Explicit Retry must permit another source request"
+
+
+async def test_bulk_cancel_api_ignores_finished_keys_and_rejects_changed_account(chat_service):
+    service = chat_service
+    store = seed(service)
+    store.enqueue(101, "history", {"automatic": False}, 2)
+    store.save_page(101, {"messages": [message(1)]})
+    app = create_app(service, launch_token="synthetic-bulk", manage_lifecycle=False)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app, raise_app_exceptions=False), base_url="http://127.0.0.1:8765") as client:
+        await client.get("/?launch=synthetic-bulk")
+        csrf = (await client.get("/api/bootstrap")).json()["csrf"]
+        headers = {"X-CSRF-Token": csrf}
+        selected = (await client.get("/api/chat-archive/queue?all_items=1")).json()
+        ids = [item["id"] for item in selected["items"]] + ["synthetic-finished"]
+        body = {"ids": ids, "account": selected["account"], "confirm": True}
+        assert (await client.post("/api/chat-archive/queue/bulk-cancel", json=body)).status_code == 403
+        assert (await client.post("/api/chat-archive/queue/bulk-cancel", json={**body,"confirm":False}, headers=headers)).status_code == 400
+        assert (await client.post("/api/chat-archive/queue/bulk-cancel", json={**body,"account":"other-synthetic-account"}, headers=headers)).status_code == 400
+        assert store.db.rows("SELECT kind FROM ca_work WHERE account=?", (store.account,))
+        response = await client.post("/api/chat-archive/queue/bulk-cancel", json=body, headers=headers)
+        assert response.status_code == 200 and response.json()["cancelled"] == 1 and response.json()["skipped"] == 1
+        again = await client.post("/api/chat-archive/queue/bulk-cancel", json=body, headers=headers)
+        assert again.status_code == 200 and again.json()["cancelled"] == 0
+    assert store.query(chat=101)["total"] == 1
+
+
+async def test_legacy_access_loss_and_automatic_files_make_no_source_requests(chat_service):
+    service = chat_service
+    store, _ = cleanup_seed(service)
+    store.update_chat(101, coverage="access_lost", error="Bitrix24: ACCESS_ERROR")
+    store.enqueue(101, "new", {"automatic": True}, 0)
+    store.file_update(101, 77, state="queued", automatic=1)
+    store.set_state("last_discovery", time.time())
+    service.chat_archive.recovered.add(store.account)
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("Known denied chats must not call the source")
+    service.client.call = forbidden
+    service.chat_archive.schedule_chat(store, store.chat(101), True)
+    await service.chat_archive.step()
+    await service.chat_archive.file_step()
+    assert store.file(101, 77)["state"] == "unavailable"
+    assert not next(item for item in queue_view(service.chat_archive)["items"] if item["kind"] == "new")["will_retry"]
+
+
 async def test_chat_message_removal_clears_index_and_does_not_refetch_old(chat_service):
     store, folder = cleanup_seed(chat_service)
     store.save_page(101, {"messages": [message(1, fileIds=[77], text="Changed synthetic") ]})

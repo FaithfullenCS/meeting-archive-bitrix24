@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "meeting-archive"
-version = "0.2.40"
+version = "0.2.41"
 description = "Local Bitrix24 meeting and chat archive with optional offline transcription"
 requires-python = ">=3.12,<3.13"
 dependencies = [

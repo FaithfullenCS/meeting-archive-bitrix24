@@ -9,7 +9,7 @@ from fastapi import Request
 from fastapi.responses import FileResponse
 
 from .chat_model import positive, text_html
-from .chat_sync import instant
+from .chat_sync import instant, access_blocked, durable_io
 from .chat_queue import queue_view, queue_action, cancel_backlog, cancel_selected
 
 
@@ -65,7 +65,7 @@ def register_chat_api(app, service):
         store = engine.store()
         if chat:
             current=store.chat(chat)
-            if service.connected() and not current.get("participants"):
+            if service.connected() and not current.get("participants") and not access_blocked(current):
                 store.enqueue(chat,"metadata",{"automatic":False},1)
                 service.db.execute("UPDATE ca_work SET priority=1 WHERE account=? AND chat=? AND kind='metadata'",(store.account,chat))
         if around and chat:
@@ -92,7 +92,7 @@ def register_chat_api(app, service):
     async def queue_operation(id:str,operation:str):
         if operation not in {"cancel","retry"}:
             raise ValueError("Неизвестное действие очереди")
-        async with engine.lock:
+        async with service.auth_lock, engine.lock:
             queue_action(engine,id,operation)
         return {"ok":True}
 
@@ -101,8 +101,10 @@ def register_chat_api(app, service):
         data = await request.json()
         if data.get("confirm") is not True:
             raise ValueError("Подтвердите отмену выбранных заданий чатов")
-        async with engine.lock:
-            return cancel_selected(engine, data.get("ids"))
+        async with service.auth_lock, engine.lock:
+            if data.get("account") and data["account"] != engine.store().account:
+                raise ValueError("Аккаунт изменился. Обновите очередь и выберите задания заново")
+            return await durable_io(cancel_selected, engine, data.get("ids"))
 
     @app.post("/api/chat-archive/queue/cancel-backlog")
     async def cancel_queue_backlog(request: Request):

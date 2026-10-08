@@ -666,7 +666,7 @@
     const groups = new Map(), totals = new Map(overview.map(group => [group.key, group]));
     for (const job of jobs) {
       const key = namespace === "chat" ? job.group_key || (job.chat ? `chat:${job.chat}` : "catalogue") : job.meeting_id ? `meeting:${job.meeting_id}` : job.kind === "install" ? "models" : "catalogue";
-      if (!groups.has(key)) groups.set(key, {key, title: job.title || (job.meeting_id ? `Совещание ${job.meeting_id}` : "Модели и каталог"),
+      if (!groups.has(key)) groups.set(key, {key, title: namespace === "meeting" && job.meeting_id ? `Совещание · ${job.title || "№"+job.meeting_id}` : job.title || "Модели и каталог",
         meta: namespace === "chat" ? job.chat ? `${job.group === "tasks" ? `Чат задачи${job.task_id ? " №"+job.task_id : ""}` : "Чат"} · ID ${job.chat}` : "Обнаружение доступных чатов" : job.meeting_id ? `Совещание №${job.meeting_id}` : "Обслуживание приложения",
         items: [], pending: 0, running: 0, failed: 0});
       const group = groups.get(key); group.items.push(job);
@@ -1150,8 +1150,8 @@
     const ids=[...state.chatQueueSelected]; if(!ids.length)return;
     const summary=`Выбрано заданий: ${ids.length}. Уже скачанные материалы не удаляются; выполняемая сейчас работа завершится безопасно.`;
     if(!(await confirmAction("Отменить выбранные задания?",summary,"Отменить",true)))return;
-    const result=await api("/api/chat-archive/queue/bulk-cancel",{method:"POST",data:{ids,confirm:true}}); state.chatQueueSelected.clear(); updateChatQueueSelection();
-    notify(`Отменено: ${result.cancelled}. В работе осталось: ${result.running}.`); await bootstrap();
+    const result=await api("/api/chat-archive/queue/bulk-cancel",{method:"POST",data:{ids,account:state.chatQueueAccount,confirm:true}}); state.chatQueueSelected.clear(); updateChatQueueSelection();
+    notify(`Отменено: ${result.cancelled}. В работе осталось: ${result.running}.${result.skipped ? " Уже завершены или отсутствуют: "+result.skipped+"." : ""}`); await bootstrap();
   });
   document.addEventListener("change",event=>{const input=event.target.closest("[data-chat-job-select]"); if(input){state.chatQueueSelected ||= new Set(); input.checked ? state.chatQueueSelected.add(input.dataset.chatJobSelect) : state.chatQueueSelected.delete(input.dataset.chatJobSelect); updateChatQueueSelection();}});
   document.addEventListener("click",event=>{ const button=event.target.closest("[data-chat-job-action]"); if(button) action(button,async()=>{ await api(`/api/chat-archive/queue/${button.dataset.chatJob}/${button.dataset.chatJobAction}`,{method:"POST"}); await bootstrap(); }); });

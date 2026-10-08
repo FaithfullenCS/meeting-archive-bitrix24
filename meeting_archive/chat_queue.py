@@ -5,7 +5,7 @@ import time
 
 from .chat_model import fingerprint
 from .scheduling import window_status
-from .chat_sync import iso_day
+from .chat_sync import iso_day, access_blocked, allow_access_retry
 
 
 LABELS = {
@@ -53,9 +53,10 @@ def queue_view(engine, offset=0, limit=100, *, all_items=False):
         )
     for row in store.db.rows("SELECT * FROM ca_work WHERE account=? ORDER BY priority,touched,chat", (store.account,)):
         data = json.loads(row["data"])
+        blocked = access_blocked(chats.get(row["chat"], {})) or data.get("access_blocked", False)
         running = getattr(engine, "current_work", None) == (store.account, row["chat"], row["kind"])
-        state = "running" if running else "failed" if data.get("error") else "queued"
-        waiting = bool(data.get("automatic") and
+        state = "running" if running else "failed" if data.get("error") or blocked else "queued"
+        waiting = bool(not blocked and data.get("automatic") and
                        (not engine.service.settings.chat_auto_save or engine.service.settings.paused or not engine.selected(row["chat"])))
         value = item(
             row["kind"],
@@ -68,9 +69,9 @@ def queue_view(engine, offset=0, limit=100, *, all_items=False):
             pages=data.get("pages", 0),
             messages=data.get("messages", 0),
             schedule_wait=waiting,
-            message="Автоматизация на паузе" if waiting and engine.service.settings.paused else
+            message="Нет доступа. Автоматические повторы остановлены; доступна кнопка «Повторить»." if blocked else "Автоматизация на паузе" if waiting and engine.service.settings.paused else
                     "Автосохранение выключено или чат исключён" if waiting else "",
-            will_retry=True,
+            will_retry=not blocked,
         )
         entries[value["id"]] = value
     for row in store.db.rows(
@@ -158,6 +159,13 @@ def queue_action(engine, id, action):
     selected = next((e for e in queue_view(engine, all_items=True)["items"] if e["id"] == id), None)
     if not selected:
         raise ValueError("Задание недоступно для текущего аккаунта")
+    apply_queue_action(engine, store, selected, action)
+    if selected["chat"]:
+        store.flush(selected["chat"])
+
+
+def apply_queue_action(engine, store, selected, action):
+    """Apply a key already resolved in this account's snapshot, without a second lookup."""
     kind, chat = selected["kind"], selected["chat"]
     if kind == "discovery":
         if action == "retry":
@@ -170,7 +178,8 @@ def queue_action(engine, id, action):
         if action == "retry":
             engine.queue_file(store, chat, selected["file_id"])
         else:
-            store.file_update(chat, selected["file_id"], state="not_saved", automatic=0)
+            store.file_update(chat, selected["file_id"], state="not_saved", automatic=0, error="", next_at=0)
+            store.activity(kind, chat, "cancelled", file_id=selected["file_id"])
     elif action == "retry":
         rows = store.db.rows(
             "SELECT data FROM ca_work WHERE account=? AND chat=? AND kind=?", (store.account, chat, kind)
@@ -178,6 +187,8 @@ def queue_action(engine, id, action):
         payload = json.loads(rows[0]["data"]) if rows else {}
         payload.update(cursor=0, automatic=False)
         payload.pop("error", None)
+        payload.pop("access_blocked", None)
+        allow_access_retry(store, chat)
         if kind == "new":
             payload.setdefault("date_from", store.state("auto_since", ""))
             payload["stop_id"] = (
@@ -230,16 +241,24 @@ def cancel_selected(engine, ids):
     """Cancel selected queued chat jobs; running jobs remain safe and visible."""
     if not isinstance(ids, list) or not ids or len(ids) > 10000 or any(not isinstance(item, str) for item in ids):
         raise ValueError("Выберите задания чатов")
+    store = engine.store()
     items = {item["id"]: item for item in queue_view(engine, all_items=True)["items"]}
     cancelled = 0
     running = 0
+    skipped = 0
+    chats = set()
     for id in set(ids):
         item = items.get(id)
-        if not item:
+        if not item or item["state"] in {"done", "cancelled"}:
+            skipped += 1
             continue
         if item["state"] == "running":
             running += 1
             continue
-        queue_action(engine, id, "cancel")
+        apply_queue_action(engine, store, item, "cancel")
         cancelled += 1
-    return {"cancelled": cancelled, "running": running, "requested": len(set(ids))}
+        if item["chat"]:
+            chats.add(item["chat"])
+    for chat in chats:
+        store.flush(chat)
+    return {"cancelled": cancelled, "running": running, "skipped": skipped, "requested": len(set(ids))}
