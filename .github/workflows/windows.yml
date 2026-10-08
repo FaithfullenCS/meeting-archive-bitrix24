@@ -42,8 +42,12 @@ jobs:
         run: |
           .venv/Scripts/python.exe -m ruff check meeting_archive oauth_relay tests scripts
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          .venv/Scripts/python.exe -m pytest -q
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .venv/Scripts/python.exe -m pytest -q --junitxml=.work/test-results.xml
+          $testExitCode = $LASTEXITCODE
+          if ($testExitCode -ne 0) {
+            .venv/Scripts/python.exe -X utf8 scripts/report_test_failures.py .work/test-results.xml
+            exit $testExitCode
+          }
           .venv/Scripts/python.exe scripts/check_resources.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build standalone Windows app
