@@ -18,7 +18,7 @@ from meeting_archive.chat_storage import ChatStore
 from meeting_archive.chat_model import chat_classification
 from meeting_archive.chat_queue import queue_view, queue_action
 from meeting_archive.chat_cleanup import material_plan, remove_materials
-from meeting_archive.chat_queue import cancel_backlog
+from meeting_archive.chat_queue import cancel_backlog, cancel_selected
 from meeting_archive.service import Service
 
 
@@ -305,6 +305,18 @@ def test_cancel_backlog_keeps_new_message_polling_and_meeting_scope(chat_service
     assert not store.db.rows("SELECT 1 FROM ca_work WHERE account=? AND chat=? AND kind='history'", (store.account, 101))
     assert not store.db.rows("SELECT 1 FROM ca_work WHERE account=? AND chat=? AND kind LIKE 'period:%'", (store.account, 101))
     assert store.db.rows("SELECT 1 FROM ca_work WHERE account=? AND chat=? AND kind='new'", (store.account, 101))
+
+
+def test_cancel_selected_handles_all_queue_pages_and_leaves_running_visible(chat_service):
+    store = seed(chat_service)
+    store.enqueue(101, "history", {"automatic": False}, 2)
+    store.enqueue(101, "new", {"automatic": True}, 0)
+    items = queue_view(chat_service.chat_archive, all_items=True)["items"]
+    result = cancel_selected(chat_service.chat_archive, [item["id"] for item in items])
+    assert result["cancelled"] >= 1 and result["requested"] == len(items)
+    assert result["running"] == 0
+    assert not store.db.rows("SELECT 1 FROM ca_work WHERE account=? AND chat=? AND kind='history'", (store.account, 101))
+    assert not store.db.rows("SELECT 1 FROM ca_work WHERE account=? AND chat=? AND kind='new'", (store.account, 101))
 
 
 async def test_chat_message_removal_clears_index_and_does_not_refetch_old(chat_service):

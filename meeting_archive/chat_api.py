@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse
 
 from .chat_model import positive, text_html
 from .chat_sync import instant
-from .chat_queue import queue_view, queue_action, cancel_backlog
+from .chat_queue import queue_view, queue_action, cancel_backlog, cancel_selected
 
 
 def register_chat_api(app, service):
@@ -76,7 +76,9 @@ def register_chat_api(app, service):
                                        coverage=coverage, offset=offset, limit=limit)
 
     @app.get("/api/chat-archive/queue")
-    async def queue(offset:int=0,limit:int=100,ids:str=""):
+    async def queue(offset:int=0,limit:int=100,ids:str="",all_items:int=0):
+        if all_items:
+            return queue_view(engine, all_items=True)
         if ids:
             selected=set(ids.split(","))
             if len(selected)>1000:
@@ -93,6 +95,14 @@ def register_chat_api(app, service):
         async with engine.lock:
             queue_action(engine,id,operation)
         return {"ok":True}
+
+    @app.post("/api/chat-archive/queue/bulk-cancel")
+    async def bulk_cancel_queue(request: Request):
+        data = await request.json()
+        if data.get("confirm") is not True:
+            raise ValueError("Подтвердите отмену выбранных заданий чатов")
+        async with engine.lock:
+            return cancel_selected(engine, data.get("ids"))
 
     @app.post("/api/chat-archive/queue/cancel-backlog")
     async def cancel_queue_backlog(request: Request):

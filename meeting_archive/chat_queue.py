@@ -224,3 +224,22 @@ def cancel_backlog(engine, *, include_files=True):
                 cancelled += 1
                 chats.add(row["chat"])
     return {"cancelled": cancelled, "chats": len(chats), "files": include_files}
+
+
+def cancel_selected(engine, ids):
+    """Cancel selected queued chat jobs; running jobs remain safe and visible."""
+    if not isinstance(ids, list) or not ids or len(ids) > 10000 or any(not isinstance(item, str) for item in ids):
+        raise ValueError("Выберите задания чатов")
+    items = {item["id"]: item for item in queue_view(engine, all_items=True)["items"]}
+    cancelled = 0
+    running = 0
+    for id in set(ids):
+        item = items.get(id)
+        if not item:
+            continue
+        if item["state"] == "running":
+            running += 1
+            continue
+        queue_action(engine, id, "cancel")
+        cancelled += 1
+    return {"cancelled": cancelled, "running": running, "requested": len(set(ids))}
