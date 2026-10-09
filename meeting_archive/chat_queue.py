@@ -54,9 +54,10 @@ def queue_view(engine, offset=0, limit=100, *, all_items=False):
     for row in store.db.rows("SELECT * FROM ca_work WHERE account=? ORDER BY priority,touched,chat", (store.account,)):
         data = json.loads(row["data"])
         blocked = access_blocked(chats.get(row["chat"], {})) or data.get("access_blocked", False)
+        held = data.get("held", False)
         running = getattr(engine, "current_work", None) == (store.account, row["chat"], row["kind"])
         state = "running" if running else "failed" if data.get("error") or blocked else "queued"
-        waiting = bool(not blocked and data.get("automatic") and
+        waiting = held or engine.stopped(store) or bool(not blocked and data.get("automatic") and
                        (not engine.service.settings.chat_auto_save or engine.service.settings.paused or not engine.selected(row["chat"])))
         value = item(
             row["kind"],
@@ -69,13 +70,14 @@ def queue_view(engine, offset=0, limit=100, *, all_items=False):
             pages=data.get("pages", 0),
             messages=data.get("messages", 0),
             schedule_wait=waiting,
-            message="Нет доступа. Автоматические повторы остановлены; доступна кнопка «Повторить»." if blocked else "Автоматизация на паузе" if waiting and engine.service.settings.paused else
+            message="Восстановлено из архива. Ожидает команды продолжения." if held else "Все работы чатов остановлены" if engine.stopped(store) else "Нет доступа. Автоматические повторы остановлены; доступна кнопка «Повторить»." if blocked else "Автоматизация на паузе" if waiting and engine.service.settings.paused else
                     "Автосохранение выключено или чат исключён" if waiting else "",
-            will_retry=not blocked,
+            will_retry=not blocked and not held and not engine.stopped(store),
+            held=bool(held),
         )
         entries[value["id"]] = value
     for row in store.db.rows(
-        "SELECT * FROM ca_files WHERE account=? AND state IN ('queued','running','error','unavailable','size_limited')",
+        "SELECT * FROM ca_files WHERE account=? AND state IN ('queued','held','running','error','unavailable','size_limited')",
         (store.account,),
     ):
         data = json.loads(row["data"])
@@ -87,7 +89,7 @@ def queue_view(engine, offset=0, limit=100, *, all_items=False):
             else "queued"
         )
         window = window_status(engine.service.settings.chat_attachment_schedule)
-        waiting = bool(row["automatic"] and (engine.service.settings.paused or not window["allowed"]))
+        waiting = row["state"] == "held" or engine.stopped(store) or bool(row["automatic"] and (engine.service.settings.paused or not window["allowed"]))
         value = item(
             "file",
             row["chat"],
@@ -99,14 +101,14 @@ def queue_view(engine, offset=0, limit=100, *, all_items=False):
             next_at=row["next_at"],
             automatic=bool(row["automatic"]),
             schedule_wait=waiting,
-            message="Автоматизация на паузе"
+            message="Восстановлено из архива. Ожидает команды продолжения." if row["state"] == "held" else "Все работы чатов остановлены" if engine.stopped(store) else "Автоматизация на паузе"
             if engine.service.settings.paused and row["automatic"]
             else window["label"]
             if waiting
             else "",
             downloaded_bytes=data.get("downloaded_bytes", 0),
             total_bytes=data.get("size", 0),
-            will_retry=row["state"] == "queued",
+            will_retry=row["state"] == "queued" and not engine.stopped(store), held=row["state"] == "held",
         )
         entries[value["id"]] = value
     if store.state("discover_requested"):
@@ -139,7 +141,7 @@ def queue_view(engine, offset=0, limit=100, *, all_items=False):
             "total": 0, "pending": 0, "running": 0, "failed": 0,
         })
         group["total"] += 1
-        group["pending"] += value["state"] in {"queued", "running"} or value.get("will_retry", False)
+        group["pending"] += not value.get("held") and not engine.stopped(store) and (value["state"] in {"queued", "running"} or value.get("will_retry", False))
         group["running"] += value["state"] == "running"
         group["failed"] += value["state"] == "failed"
     return {
@@ -149,6 +151,10 @@ def queue_view(engine, offset=0, limit=100, *, all_items=False):
         "offset": offset,
         "pending": sum(g["pending"] for g in groups.values()),
         "failed": sum(g["failed"] for g in groups.values()),
+        "held": sum(bool(i.get("held")) for i in values),
+        "blocked": sum(i["state"] == "failed" and not i.get("will_retry", False) for i in values),
+        "history": sum(i["state"] in {"done", "cancelled"} for i in values),
+        "oldest_seconds": max([max(0, now-i.get("touched", now)) for i in values if i["state"] == "queued" and not i.get("held")] or [0]),
         "groups": list(groups.values()), "sync": engine.status(),
     }
 
@@ -167,6 +173,8 @@ def queue_action(engine, id, action):
 def apply_queue_action(engine, store, selected, action):
     """Apply a key already resolved in this account's snapshot, without a second lookup."""
     kind, chat = selected["kind"], selected["chat"]
+    if action == "retry" and engine.stopped(store):
+        raise ValueError("Работы чатов остановлены. Сначала возобновите работу")
     if kind == "discovery":
         if action == "retry":
             store.set_state("discovery_retry_at", 0)
@@ -188,6 +196,7 @@ def apply_queue_action(engine, store, selected, action):
         payload.update(cursor=0, automatic=False)
         payload.pop("error", None)
         payload.pop("access_blocked", None)
+        payload.pop("held", None)
         allow_access_retry(store, chat)
         if kind == "new":
             payload.setdefault("date_from", store.state("auto_since", ""))
@@ -259,6 +268,5 @@ def cancel_selected(engine, ids):
         cancelled += 1
         if item["chat"]:
             chats.add(item["chat"])
-    for chat in chats:
-        store.flush(chat)
+    store.flush_many(chats)
     return {"cancelled": cancelled, "running": running, "skipped": skipped, "requested": len(set(ids))}

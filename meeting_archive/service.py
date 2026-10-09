@@ -67,6 +67,14 @@ class Service:
         self.notifications = Notifications(self)
         from .chat_sync import ChatArchive
         self.chat_archive = ChatArchive(self)
+        self.recovery_status = {"running": False, "found": 0, "restored": 0, "errors": 0, "issues": []}
+        self.recovery_lock = asyncio.Lock()
+
+    async def restore_local_archive(self):
+        from .recovery import restore_local
+        from .chat_sync import durable_io
+        async with self.auth_lock, self.scan_lock, self.chat_archive.lock, self.recovery_lock:
+            return await durable_io(restore_local, self)
 
     @property
     def archive(self):
@@ -76,6 +84,7 @@ class Service:
         return bool(self.settings.portal and self.settings.user_id)
 
     async def start(self):
+        await self.restore_local_archive()
         self.reconcile_short_calls()
         self.alive = True
         self.event_loop = asyncio.get_running_loop()

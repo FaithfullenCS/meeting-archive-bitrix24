@@ -265,6 +265,20 @@ def chat_service(tmp_path, settings, vault):
     client = BitrixClient(settings, vault, transport=httpx.MockTransport(lambda r: httpx.Response(200, content=b"synthetic file")))
     service = Service(home, vault=vault, client=client)
     client.settings = service.settings
+    # Per-method mocks model batch transport as independent outcomes. Actual
+    # batch encoding, rate budgets and HTTP counts have separate integration tests.
+    async def batch_commands(commands):
+        outcomes = {}
+        for key, (method, params) in commands.items():
+            if "ORDER[ID]" in params:
+                params = {k: v for k, v in params.items() if k != "ORDER[ID]"}
+                params["ORDER"] = {"ID": "DESC"}
+            try:
+                outcomes[key] = await service.client.call(method, params, v3=False)
+            except (BitrixError, ValueError, OSError, httpx.HTTPError) as exc:
+                outcomes[key] = exc
+        return outcomes
+    client.batch_pages = batch_commands
     yield service
     service.db.close()
 

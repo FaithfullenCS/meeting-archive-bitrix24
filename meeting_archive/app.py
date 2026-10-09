@@ -252,6 +252,7 @@ def create_app(service: Service, launch_token: str | None = None, *, manage_life
                 job.update(schedule_wait=True, message=window["label"], schedule_next_at=window["next_at"])
         saved = service.vault.read()
         return {"csrf": csrf, "settings": asdict(service.settings), "connected": service.connected(),
+                "recovery": service.recovery_status, "integrity": getattr(service, "integrity_status", {}),
                 "updates": service.updates.status(), "activation": service.notifications.activation,
                 "notification_error": service.notifications.error,
                 "account_name": service.db.get_state(service.identity_key()) if service.connected() else "",
@@ -456,7 +457,20 @@ def create_app(service: Service, launch_token: str | None = None, *, manage_life
             service.settings.save(service.home)
             await service.chat_archive.settings_changed(old_settings)
         service.schedule_local_pending()
+        if old_settings.archive_root != service.settings.archive_root or old_settings.chat_archive_root != service.settings.chat_archive_root:
+            await service.restore_local_archive()
         return {"settings": asdict(service.settings)}
+
+    @app.post("/api/archive/recover")
+    async def recover_archive():
+        return await service.restore_local_archive()
+
+    @app.post("/api/archive/verify")
+    async def verify_archive():
+        from .recovery import verify_local
+        from .chat_sync import durable_io
+        async with service.recovery_lock:
+            return await durable_io(verify_local, service)
 
     @app.post("/api/auth/oauth")
     async def oauth(request: Request):

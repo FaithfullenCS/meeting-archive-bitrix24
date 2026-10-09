@@ -36,9 +36,9 @@ def register_chat_api(app, service):
     @app.get("/api/chat-archive")
     async def catalogue(q: str = "", type: str = "", participant: str = "", coverage: str = ""):
         store = engine.store()
-        if service.connected() and store.account not in engine.recovered:
+        if store.portal and store.user_id and store.account not in engine.recovered:
             async with engine.lock:
-                await asyncio.to_thread(store.recover)
+                await durable_io(lambda: store.recover(tolerant=True, hold_work=True))
                 engine.recovered.add(store.account)
         if service.connected() and not store.state("last_discovery"):
             engine.request_discovery(False)
@@ -105,6 +105,34 @@ def register_chat_api(app, service):
             if data.get("account") and data["account"] != engine.store().account:
                 raise ValueError("Аккаунт изменился. Обновите очередь и выберите задания заново")
             return await durable_io(cancel_selected, engine, data.get("ids"))
+
+    @app.post("/api/chat-archive/control")
+    async def control_chats(request: Request):
+        data = await request.json()
+        if data.get("confirm") is not True or data.get("account") != engine.store().account:
+            raise ValueError("Подтвердите действие для текущего аккаунта")
+        if data.get("action") not in {"stop", "resume", "continue_recovered"}:
+            raise ValueError("Неизвестная команда чатов")
+        if data["action"] == "stop":
+            engine.stop_requested = engine.store().account
+        async with service.auth_lock, engine.lock:
+            if data["account"] != engine.store().account:
+                raise ValueError("Аккаунт изменился. Обновите очередь")
+            return await durable_io(engine.control, data["action"])
+
+    @app.post("/api/chat-archive/local-account")
+    async def local_account(request: Request):
+        from .recovery import local_accounts
+        from .chat_model import canonical
+        data = await request.json()
+        async with service.auth_lock, engine.lock:
+            if service.connected():
+                raise ValueError("Для подключённого Bitrix используется его аккаунт")
+            selected = {"portal": data.get("portal"), "user_id": positive(data.get("user_id"))}
+            if selected not in local_accounts(service.settings.chat_archive_root):
+                raise ValueError("Локальный аккаунт не найден")
+            service.db.set_state("local_chat_account:" + service.settings.chat_archive_root, canonical(selected))
+        return {"ok": True}
 
     @app.post("/api/chat-archive/queue/cancel-backlog")
     async def cancel_queue_backlog(request: Request):

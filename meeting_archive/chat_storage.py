@@ -203,6 +203,8 @@ class ChatStore:
                                     (self.account, chat_id, message["id"], old["hash"], old["data"], old["observed"]))
                     if old and old["hash"] == digest:
                         observed_at = old["observed"]
+                        message.update(hash=digest, observed_at=observed_at)
+                        continue  # An unchanged audit must not rewrite the month's files.
                     else:
                         observed_at = observed
                     message.update(hash=digest, observed_at=observed_at)
@@ -419,84 +421,143 @@ class ChatStore:
         (self.folder / "_notebook").mkdir(exist_ok=True)
         atomic_json(self.folder / "account.json", {"schemaVersion": 1, "portal": self.portal, "user_id": self.user_id,
                     "chats": "chats/", "collections":{"tasks":"collections/tasks.json","conversations":"collections/conversations.json"}, "notebook": "_notebook/", "discovery": "recent_and_known_only"})
-        self.collections()
+        if not getattr(self, "defer_collections", False):
+            self.collections()
         atomic_json(self.root / "archive.json", {"schemaVersion": 1, "kind": "chat-archive", "accounts": "<portal>/user-<ID>/account.json"})
         self.db.execute("UPDATE ca_chats SET dirty=0 WHERE account=? AND id=?", (self.account, chat))
         self.db.execute("DELETE FROM ca_dirty_months WHERE account=? AND chat=?", (self.account, chat))
+        self.set_state(f"manifest:{chat}", [manifest_path.stat().st_size, manifest_path.stat().st_mtime_ns])
 
-    def recover(self):
+    def flush_many(self, ids):
+        self.defer_collections = True
+        try:
+            for id in ids:
+                self.flush(id)
+            self.collections()
+        finally:
+            self.defer_collections = False
+
+    def recover(self, *, tolerant=False, hold_work=False, before_insert=None):
         from .chat_cleanup import recover_pending
         recover_pending(self)
-        """Restore a lost index from portable files and replay unfinished projections."""
-        if self.folder.exists():
-            paths = list((self.folder / "chats").glob("chat-*/chat.json")) + list((self.folder / "chats/tasks").glob("chat-*/chat.json")) + list((self.folder / "chats/conversations").glob("chat-*/chat.json"))
-            for path in paths:
-                if path.is_symlink() or not path.resolve().is_relative_to((self.folder / "chats").resolve()):
-                    continue
+        control = self.folder / ".collection-control.json"
+        if control.is_file() and not control.is_symlink():
+            value = json.loads(control.read_text("utf-8"))
+            if value.get("portal") == self.portal and value.get("user_id") == self.user_id:
+                self.set_state("stopped", value.get("stopped") is True)
+        report = dict(found=0, restored=0, known=0, errors=0, issues=[])
+        paths = list((self.folder / "chats").glob("chat-*/chat.json")) + list((self.folder / "chats/tasks").glob("chat-*/chat.json")) + list((self.folder / "chats/conversations").glob("chat-*/chat.json"))
+        for path in paths:
+            try:
+                report["found"] += 1
+                if path.is_symlink() or any(p.is_symlink() or p.is_junction() for p in path.parents if p != self.root):
+                    raise ValueError("Ссылки в архиве не поддерживаются")
                 manifest = json.loads(path.read_text("utf-8"))
                 if manifest.get("portal") != self.portal or manifest.get("user_id") != self.user_id:
                     continue
                 id = positive(manifest.get("id"))
-                if path.parent != self.chat_folder(id):
+                if not id or path.parent != self.chat_folder(id):
                     raise ValueError("Идентичность папки архива не совпадает с chat.json")
-                if self.db.rows("SELECT id FROM ca_chats WHERE account=? AND id=?", (self.account, id)):
+                existing = self.db.rows("SELECT id FROM ca_chats WHERE account=? AND id=?", (self.account, id))
+                signature = [path.stat().st_size, path.stat().st_mtime_ns]
+                indexed = self.db.rows("SELECT count(*) AS n FROM ca_messages WHERE account=? AND chat=?", (self.account, id))[0]['n']
+                if existing and indexed >= manifest.get('range', {}).get('messages', 0) and self.state(f"manifest:{id}") == signature:
+                    report["known"] += 1
                     continue
-                # Validate a complete chat before insertion. Incomplete recovery must
-                # never project over the portable source or suppress the next attempt.
-                messages, versions, contexts, files = [], [], [], []
-                declared = set()
-                for entry in manifest.get("reading", []):
-                    relative = entry.get("jsonl", "")
-                    source = (path.parent / relative).resolve()
-                    if not source.is_relative_to((path.parent / "messages").resolve()) or not source.is_file() or source.is_symlink():
-                        raise ValueError("Не хватает файла месяца архива; восстановление остановлено без изменения источника")
-                    if hashlib.sha256(source.read_bytes()).hexdigest() != entry.get("sha256"):
-                        raise ValueError("Контрольная сумма месяца архива не совпадает; источник оставлен на месте")
-                    declared.add(source)
-                actual = {file.resolve() for file in (path.parent / "messages").glob("*.jsonl")}
-                if actual != declared:
-                    raise ValueError("Состав месяцев не совпадает с chat.json; источник оставлен на месте")
-                for file in (path.parent / "messages").glob("*.jsonl"):
-                    for line in file.read_text("utf-8").splitlines():
-                        m = json.loads(line)
-                        if m["chat_id"] != id or message_hash(m) != m["hash"]:
-                            raise ValueError("Повреждён JSONL архива; файл оставлен для восстановления")
-                        messages.append((self.account, id, m["id"], m["date"], m["author_id"], m["text"], canonical(m), m["hash"], m["observed_at"]))
-                if len(messages) != manifest.get("range", {}).get("messages") or len({m[2] for m in messages}) != len(messages):
-                    raise ValueError("Количество сообщений не совпадает с chat.json; неполный архив не объявлен восстановленным")
-                for file in (path.parent / "versions").glob("*.jsonl"):
-                    for line in file.read_text("utf-8").splitlines():
-                        m = json.loads(line)
-                        if m["chat_id"] != id or message_hash(m) != m["hash"]:
-                            raise ValueError("Повреждён файл редакций; источник оставлен на месте")
-                        versions.append((self.account, id, m["id"], m["hash"], canonical(m), m["observed_at"]))
-                context = path.parent / "context/excerpts.jsonl"
-                if context.exists():
-                    for line in context.read_text("utf-8").splitlines():
-                        m = json.loads(line)
-                        contexts.append((self.account, id, m["chat_id"], m["id"], m["hash"], canonical(m)))
-                for f in manifest.get("files", []):
-                    state = "queued" if f["state"] == "running" else f["state"]
-                    if f.get("path"):
-                        target = (path.parent / f["path"]).resolve()
-                        if not target.is_relative_to(path.parent.resolve()) or not target.is_file():
-                            state = "missing"
-                    files.append((self.account, id, f["id"], canonical({k: v for k, v in f.items() if k not in {"state", "automatic", "next_at", "attempts", "error"}}), state, int(bool(f.get("automatic"))), f.get("next_at", 0), f.get("attempts", 0), f.get("error", "")))
-                data = {k: v for k, v in manifest.items() if k not in {"schemaVersion", "portal", "user_id", "id", "dialog", "files", "range", "reading", "work"}}
-                work = [(self.account, id, w["kind"], canonical(w["data"]), w["priority"]) for w in manifest.get("work", [])]
-                with self.db.lock:
-                    con = self.db.connection
-                    try:
-                        con.execute("BEGIN")
-                        con.executemany("INSERT OR IGNORE INTO ca_messages VALUES(?,?,?,?,?,?,?,?,?)", messages)
-                        con.executemany("INSERT OR IGNORE INTO ca_versions VALUES(?,?,?,?,?,?)", versions)
-                        con.executemany("INSERT OR IGNORE INTO ca_context VALUES(?,?,?,?,?,?)", contexts)
-                        con.executemany("INSERT OR IGNORE INTO ca_files(account,chat,id,data,state,automatic,next_at,attempts,error) VALUES(?,?,?,?,?,?,?,?,?)", files)
-                        con.executemany("INSERT OR IGNORE INTO ca_work(account,chat,kind,data,priority) VALUES(?,?,?,?,?)", work)
-                        con.execute("INSERT INTO ca_chats(account,id,dialog,data,dirty) VALUES(?,?,?,?,0)", (self.account,id,manifest["dialog"],canonical(data)))
-                        con.commit()
-                    except BaseException:
-                        con.rollback()
-                        raise
+                self.recover_chat(path, manifest, id, hold_work, before_insert)
+                self.set_state(f"manifest:{id}", signature)
+                report["restored"] += 1
+            except (ValueError, OSError, KeyError, TypeError) as exc:
+                if not tolerant:
+                    raise
+                report["errors"] += 1
+                if len(report["issues"]) < 30:
+                    report["issues"].append({"kind": "chat", "chat": path.parent.name, "error": str(exc)})
         for row in self.db.rows("SELECT id FROM ca_chats WHERE account=? AND dirty=1", (self.account,)):
             self.flush(row["id"])
+        return report
+
+    def recover_chat(self, path, manifest, id, hold_work, before_insert):
+        for name in ("messages", "versions", "context", "attachments"):
+            directory = path.parent / name
+            if directory.is_symlink() or directory.is_junction():
+                raise ValueError("Ссылки в архиве не поддерживаются")
+        # Validate a complete chat before insertion. Incomplete recovery must
+        # never project over the portable source or suppress the next attempt.
+        messages, versions, contexts, files = [], [], [], []
+        declared = set()
+        for entry in manifest.get("reading", []):
+            relative = entry.get("jsonl", "")
+            source = (path.parent / relative).resolve()
+            if not source.is_relative_to((path.parent / "messages").resolve()) or not source.is_file() or source.is_symlink():
+                raise ValueError("Не хватает файла месяца архива; восстановление остановлено без изменения источника")
+            if hashlib.sha256(source.read_bytes()).hexdigest() != entry.get("sha256"):
+                raise ValueError("Контрольная сумма месяца архива не совпадает; источник оставлен на месте")
+            declared.add(source)
+        actual = {file.resolve() for file in (path.parent / "messages").glob("*.jsonl")}
+        if actual != declared:
+            raise ValueError("Состав месяцев не совпадает с chat.json; источник оставлен на месте")
+        for file in (path.parent / "messages").glob("*.jsonl"):
+            for line in file.read_text("utf-8").splitlines():
+                m = json.loads(line)
+                if m["chat_id"] != id or message_hash(m) != m["hash"]:
+                    raise ValueError("Повреждён JSONL архива; файл оставлен для восстановления")
+                messages.append((self.account, id, m["id"], m["date"], m["author_id"], m["text"], canonical(m), m["hash"], m["observed_at"]))
+        if len(messages) != manifest.get("range", {}).get("messages") or len({m[2] for m in messages}) != len(messages):
+            raise ValueError("Количество сообщений не совпадает с chat.json; неполный архив не объявлен восстановленным")
+        for file in (path.parent / "versions").glob("*.jsonl"):
+            if file.is_symlink() or not file.resolve().is_relative_to(path.parent.resolve()):
+                raise ValueError("Ссылки в архиве не поддерживаются")
+            for line in file.read_text("utf-8").splitlines():
+                m = json.loads(line)
+                if m["chat_id"] != id or message_hash(m) != m["hash"]:
+                    raise ValueError("Повреждён файл редакций; источник оставлен на месте")
+                versions.append((self.account, id, m["id"], m["hash"], canonical(m), m["observed_at"]))
+        context = path.parent / "context/excerpts.jsonl"
+        if context.exists():
+            if context.is_symlink() or not context.resolve().is_relative_to(path.parent.resolve()):
+                raise ValueError("Ссылки в архиве не поддерживаются")
+            for line in context.read_text("utf-8").splitlines():
+                m = json.loads(line)
+                contexts.append((self.account, id, m["chat_id"], m["id"], m["hash"], canonical(m)))
+        for f in manifest.get("files", []):
+            state = "queued" if f["state"] == "running" else f["state"]
+            if hold_work and state in {"queued", "error"}:
+                state = "held"
+            if f.get("path"):
+                raw = path.parent / f["path"]
+                target = raw.resolve()
+                if (not target.is_relative_to(path.parent.resolve()) or not target.is_file() or
+                        raw.is_symlink() or any(p.is_symlink() or p.is_junction() for p in raw.parents if p != self.root) or
+                        f.get("size") and target.stat().st_size != f["size"]):
+                    state = "missing"
+            files.append((self.account, id, f["id"], canonical({k: v for k, v in f.items() if k not in {"state", "automatic", "next_at", "attempts", "error"}}), state, int(bool(f.get("automatic"))), f.get("next_at", 0), f.get("attempts", 0), f.get("error", "")))
+        data = {k: v for k, v in manifest.items() if k not in {"schemaVersion", "portal", "user_id", "id", "dialog", "files", "range", "reading", "work"}}
+        existing = self.db.rows("SELECT data FROM ca_chats WHERE account=? AND id=?", (self.account, id))
+        if existing:
+            prior = json.loads(existing[0]['data'])
+            protected = {"coverage", "history_complete", "history_since", "history_paused", "manual_history_requested", "manual_history_origin", "access_blocked"}
+            data.update({k: v for k, v in prior.items() if k not in protected})
+            if prior.get('access_blocked') or prior.get('coverage') == 'access_lost':
+                data.update(access_blocked=True, coverage='access_lost')
+            if prior.get('history_paused'):
+                data['history_paused'] = True
+            if prior.get('manual_history_requested') and prior.get('manual_history_origin'):
+                data.update({k: prior[k] for k in protected if k.startswith('manual_history') and k in prior})
+        work = [(self.account, id, w["kind"], canonical({**w["data"], **({"held": True} if hold_work else {})}), w["priority"]) for w in manifest.get("work", [])]
+        if before_insert:
+            before_insert()
+        with self.db.lock:
+            con = self.db.connection
+            try:
+                con.execute("BEGIN")
+                con.executemany("INSERT OR IGNORE INTO ca_messages VALUES(?,?,?,?,?,?,?,?,?)", messages)
+                con.executemany("INSERT OR IGNORE INTO ca_versions VALUES(?,?,?,?,?,?)", versions)
+                con.executemany("INSERT OR IGNORE INTO ca_context VALUES(?,?,?,?,?,?)", contexts)
+                con.executemany("INSERT OR IGNORE INTO ca_files(account,chat,id,data,state,automatic,next_at,attempts,error) VALUES(?,?,?,?,?,?,?,?,?)", files)
+                con.executemany("INSERT OR IGNORE INTO ca_work(account,chat,kind,data,priority) VALUES(?,?,?,?,?)", work)
+                con.execute("INSERT INTO ca_chats(account,id,dialog,data,dirty) VALUES(?,?,?,?,0) ON CONFLICT(account,id) DO UPDATE SET data=excluded.data,dirty=0", (self.account,id,manifest["dialog"],canonical(data)))
+                con.commit()
+            except BaseException:
+                con.rollback()
+                raise

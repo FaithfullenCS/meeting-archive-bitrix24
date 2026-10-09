@@ -142,15 +142,67 @@ class ChatArchive:
         self.error = ""
         self.active = ""
         self.recovered = set()
+        self.metrics = {"pages": 0, "processing_seconds": 0.0, "batch_requests": 0, "last_batch_seconds": 0.0,
+                        "planned": 0, "unchanged": 0, "blocked": 0}
+        self.batch_size = 10
+        self.last_batch = 0
         ChatStore.initialize(service.db)
 
     def store(self):
         s = self.service.settings
-        return ChatStore(self.service.db, s.chat_archive_root, s.portal, s.user_id)
+        portal, user = s.portal, s.user_id
+        if not portal or not user:
+            from .recovery import local_accounts
+            accounts = getattr(self, "local_accounts", None)
+            if accounts is None or getattr(self, "local_root", None) != s.chat_archive_root:
+                accounts = self.local_accounts = local_accounts(s.chat_archive_root)
+                self.local_root = s.chat_archive_root
+            choice = self.service.db.get_state("local_chat_account:" + s.chat_archive_root)
+            selected = next((a for a in accounts if canonical(a) == choice), None)
+            selected = selected or (accounts[0] if len(accounts) == 1 else None)
+            if selected:
+                portal, user = selected["portal"], selected["user_id"]
+        return ChatStore(self.service.db, s.chat_archive_root, portal, user)
 
     def selected(self, id):
         s = self.service.settings
         return id not in s.chat_excluded_ids and (s.chat_scope == "all" or id in s.chat_selected_ids)
+
+    def stopped(self, store=None):
+        store = store or self.store()
+        return getattr(self, "stop_requested", None) == store.account or store.state("stopped", False)
+
+    def control(self, action):
+        from .settings import atomic_json
+        store = self.store()
+        if action == "stop":
+            store.set_state("stopped", True)
+            for row in store.db.rows("SELECT chat,kind FROM ca_work WHERE account=?", (store.account,)):
+                store.db.execute("DELETE FROM ca_work WHERE account=? AND chat=? AND kind=?", (store.account, row["chat"], row["kind"]))
+                if row["kind"] == "history":
+                    store.update_chat(row["chat"], history_paused=True)
+                store.activity(row["kind"], row["chat"], "cancelled")
+                store.update_chat(row["chat"], work_stopped=True)
+            for row in store.db.rows("SELECT chat,id FROM ca_files WHERE account=? AND state IN ('queued','held','error','unavailable','size_limited')", (store.account,)):
+                store.file_update(row["chat"], row["id"], state="not_saved", automatic=0, next_at=0, error="")
+            store.set_state("discover_requested", None)
+        elif action == "resume":
+            store.set_state("stopped", False)
+            self.stop_requested = None
+        elif action == "continue_recovered":
+            for row in store.db.rows("SELECT chat,kind,data FROM ca_work WHERE account=?", (store.account,)):
+                data = json.loads(row["data"])
+                if data.pop("held", False):
+                    store.db.execute("UPDATE ca_work SET data=? WHERE account=? AND chat=? AND kind=?",
+                                     (canonical(data), store.account, row["chat"], row["kind"]))
+            store.db.execute("UPDATE ca_files SET state='queued' WHERE account=? AND state='held'", (store.account,))
+        else:
+            raise ValueError("Неизвестная команда чатов")
+        store.folder.mkdir(parents=True, exist_ok=True)
+        atomic_json(store.folder / ".collection-control.json", {"portal": store.portal, "user_id": store.user_id,
+                    "stopped": bool(store.state("stopped", False))})
+        store.flush_many([row["id"] for row in store.db.rows("SELECT id FROM ca_chats WHERE account=? AND dirty=1", (store.account,))])
+        return {"stopped": self.stopped(store)}
 
     def has_current_messages(self, store, chat):
         return bool(self.service.db.rows("SELECT 1 FROM ca_messages WHERE account=? AND chat=? AND julianday(date)>=julianday(?) LIMIT 1",
@@ -210,6 +262,8 @@ class ChatArchive:
         if not self.service.connected():
             raise ValueError("Сначала подключите Bitrix24 с правом im")
         store = self.store()
+        if self.stopped(store):
+            return
         # Keep the initial inventory a baseline across all pages and restarts.
         if store.state("discover_requested"):
             return
@@ -221,6 +275,8 @@ class ChatArchive:
         if start and end and start > end:
             raise ValueError("Начало периода должно быть не позже окончания")
         store = self.store()
+        if self.stopped(store):
+            raise ValueError("Работы чатов остановлены. Нажмите «Возобновить работу» в очереди")
         ids = [c["id"] for c in store.chats() if self.selected(c["id"])] if ids is None else ids
         for id in ids:
             store.chat(positive(id))
@@ -230,15 +286,20 @@ class ChatArchive:
                               **({"manual_history_requested": True, "manual_history_origin": "request", "message_delete_after": ""} if not start and not end else {}))
             kind = "period:" + date_from + ":" + date_to if start or end else "history"
             current = self.service.db.rows("SELECT data FROM ca_work WHERE account=? AND chat=? AND kind=?", (store.account, positive(id), kind))
-            if current and (json.loads(current[0]["data"]).get("automatic") or json.loads(current[0]["data"]).get("access_blocked")):
+            if current and any(json.loads(current[0]["data"]).get(key) for key in ("automatic", "access_blocked", "held")):
                 self.service.db.execute("DELETE FROM ca_work WHERE account=? AND chat=? AND kind=?", (store.account, positive(id), kind))
             store.enqueue(positive(id), kind, {"cursor": 0, "date_from": start, "date_to": end, "automatic": False}, 2)
         return len(ids)
 
     def schedule_chat(self, store, chat, automatic):
-        if access_blocked(chat):
+        if self.stopped(store) or access_blocked(chat):
+            self.metrics["blocked"] += 1
             return
-        if time.time() - chat.get("participants_at", 0) > 86400:
+        if not chat.get("participants_at") and not chat.get("metadata_due"):
+            due = time.time() + chat["id"] % 900
+            store.update_chat(chat["id"], metadata_due=due)
+            chat["metadata_due"] = due
+        if time.time() >= chat.get("metadata_due", 0) and time.time() - chat.get("participants_at", 0) > 86400:
             store.enqueue(chat["id"], "metadata", {"automatic": False}, 4)
         if not automatic or not self.selected(chat["id"]):
             return
@@ -248,10 +309,67 @@ class ChatArchive:
         unchanged = head and head == chat.get("sync_head_id")
         recently_checked = time.time() - chat.get("new_checked_at", 0) < max(900, self.service.settings.chat_poll_seconds * 5)
         if not unchanged or not recently_checked:
+            self.metrics["planned"] += 1
             urgent = head and head != chat.get("sync_head_id") and (instant(chat.get("source_last_message_at")) or 0) >= (instant(since) or 0)
             store.enqueue(chat["id"], "new", {"cursor": 0, "stop_id": newest, "source_head_id": head, "date_from": since, "automatic": True}, -1 if urgent else 0)
             if urgent:
                 self.service.db.execute("UPDATE ca_work SET priority=-1 WHERE account=? AND chat=? AND kind='new'", (store.account, chat["id"]))
+        else:
+            self.metrics["unchanged"] += 1
+
+    async def prefetch(self, store, rows):
+        """Fetch one independent page per chat; apply each result through process_work."""
+        if getattr(self, "batch_unavailable", False):
+            return {}
+        commands = {}
+        methods = {}
+        for index, row in enumerate(rows):
+            chat = store.chat(row["chat"])
+            work = json.loads(row["data"])
+            if not manual_history_complete(chat) and (row["kind"] == "new" or
+                    row["kind"] in {"recent_check", "audit"} and work.get("automatic")):
+                cutoff = auto_since_for(store, chat)
+                if not work.get("date_from") or (instant(work["date_from"]) or 0) < (instant(cutoff) or 0):
+                    work.update(date_from=cutoff, cursor=0)
+            method = "get" if chat.get("method") == "get" else "search"
+            if method == "get":
+                params = {"DIALOG_ID": chat["dialog"], "LIMIT": 50}
+            else:
+                params = {"CHAT_ID": chat["id"], "ORDER[ID]": "DESC", "LIMIT": 200}
+                for field, key in (("DATE_FROM", "date_from"), ("DATE_TO", "date_to")):
+                    if work.get(key):
+                        params[field] = work[key]
+            if work.get("cursor"):
+                params["LAST_ID"] = work["cursor"]
+            key = f"page_{index}"
+            commands[key] = ("im.dialog.messages." + method, params)
+            methods[key] = method
+        start = time.monotonic()
+        try:
+            outcomes = await self.service.client.batch_pages(commands)
+        except (BitrixError, httpx.HTTPError, ValueError) as exc:
+            if isinstance(exc, BitrixError) and exc.code in UNSUPPORTED_CODES | {"ERROR_BATCH_METHOD_NOT_ALLOWED"}:
+                self.batch_unavailable = True
+                return {}
+            outcomes = {key: exc for key in commands}
+        elapsed = time.monotonic() - start
+        self.last_batch = len(rows)
+        self.metrics.update(batch_requests=self.metrics["batch_requests"] + 1, last_batch_seconds=elapsed)
+        self.batch_size = max(10, self.batch_size // 2) if elapsed > 8 or any(isinstance(v, Exception) for v in outcomes.values()) else min(50, self.batch_size + 5)
+        result = {}
+        for index, row in enumerate(rows):
+            key = f"page_{index}"
+            page = outcomes.get(key, BitrixError("В пакете отсутствует результат команды", retryable=True))
+            if isinstance(page, BitrixError) and page.code in UNSUPPORTED_CODES | {"ERROR_BATCH_METHOD_NOT_ALLOWED"}:
+                continue  # Existing individual fallback remains authoritative.
+            if not isinstance(page, Exception):
+                chat = store.chat(row["chat"])
+                if not isinstance(page, dict) or not isinstance(page.get("messages"), list):
+                    page = ValueError("Неизвестный формат истории; страница не считается пустой")
+                elif methods[key] == "get" and positive(page.get("chat_id") or page.get("chatId")) != chat["id"]:
+                    page = ValueError("Источник вернул историю другого чата")
+            result[(row["chat"], row["kind"])] = page if isinstance(page, Exception) else (page, methods[key])
+        return result
 
     async def add_dialog(self, store, dialog, hint=None):
         result = await self.service.client.call("im.dialog.get", {"DIALOG_ID": str(dialog)}, v3=False)
@@ -327,8 +445,9 @@ class ChatArchive:
                 existing.add(id)
         if not (page.get("hasMore") or page.get("hasMorePages")):
             await self.extra_recent(store)
-        for chat in store.chats():
-            self.schedule_chat(store, chat, automatic)
+        if not (page.get("hasMore") or page.get("hasMorePages")):
+            for chat in store.chats():
+                self.schedule_chat(store, chat, automatic)
         if page.get("hasMore") or page.get("hasMorePages"):
             if not page["items"]:
                 raise ValueError("Пустая страница при незавершённом списке чатов")
@@ -368,7 +487,7 @@ class ChatArchive:
             raise ValueError("Неизвестный формат истории; страница не считается пустой")
         return page, "get" if fallback else "search"
 
-    async def process_work(self, store, row):
+    async def process_work(self, store, row, prefetched=None):
         chat = store.chat(row["chat"])
         work = json.loads(row["data"])
         if row["kind"] == "metadata":
@@ -387,7 +506,8 @@ class ChatArchive:
                 peer = positive(chat["dialog"]) if chat["type"] == "user" else 0
                 peer_state = {"peer_active": activity[peer]} if peer in activity else {}
                 store.update_chat(chat["id"], title=str(details.get("name") or names.get(peer) or chat["title"]), participants=[{"id":positive(id),"name":names.get(positive(id),next((p.get("name", "") for p in chat.get("participants",[]) if p["id"]==positive(id)),"")), **({"active":activity[positive(id)]} if positive(id) in activity else {})} for id in members], **peer_state, **chat_classification(details),
-                                  participants_at=time.time(), participants_warning="", parent_chat_id=positive(details.get("parent_chat_id")), parent_message_id=positive(details.get("parent_message_id")))
+                                  participants_at=time.time(), metadata_due=time.time() + 86400 + chat["id"] % 1800,
+                                  participants_warning="", parent_chat_id=positive(details.get("parent_chat_id")), parent_message_id=positive(details.get("parent_message_id")))
             except (BitrixError, httpx.HTTPError, ValueError, OSError) as exc:
                 if isinstance(exc, (httpx.HTTPError, OSError)) or isinstance(exc, BitrixError) and (exc.retryable or exc.code in ACCESS_CODES):
                     raise
@@ -401,7 +521,7 @@ class ChatArchive:
             cutoff = auto_since_for(store, chat)
             if not work.get("date_from") or (instant(work["date_from"]) or 0) < (instant(cutoff) or 0):
                 work.update(date_from=cutoff, cursor=0, pages=0, messages=0)
-        page, method = await self.fetch_page(chat, work)
+        page, method = prefetched if prefetched is not None else await self.fetch_page(chat, work)
         raw_messages = page["messages"]
         # get treats a missing/deleted anchor as an empty result. Restart a bounded
         # traversal from the newest page; only a verified lower boundary may finish it.
@@ -496,7 +616,9 @@ class ChatArchive:
         last = store.state("last_discovery", 0)
         running = bool(self.service.alive and getattr(self, "loop_running", False))
         automatic = self.service.settings.chat_auto_save and not self.service.settings.paused
-        return {"discovering": bool(getattr(self, "discovering", False) or store.state("discover_requested")),
+        return {"stopped": self.stopped(store), "metrics": {**self.metrics, "batch_size": self.batch_size},
+                "rest": getattr(self.service.client, "metrics", {}),
+                "discovering": bool(getattr(self, "discovering", False) or store.state("discover_requested")),
                 "last_catalogue_at": last,
                 "next_catalogue_at": max(last + self.service.settings.chat_poll_seconds, store.state("discovery_retry_at", 0)),
                 "worker_running": running, "file_worker_running": bool(getattr(self, "file_loop_running", False)),
@@ -522,6 +644,8 @@ class ChatArchive:
                 return
             raise
         s = self.service.settings
+        if self.stopped(store):
+            raise ValueError("Работы чатов остановлены. Сначала возобновите работу")
         restore_collection = manual_collection and (collection_kind == "history" or collection_kind.startswith("period:"))
         if (file.get("locally_deleted") or file.get("auto_suppressed")) and automatic and not restore_collection:
             return
@@ -776,6 +900,8 @@ class ChatArchive:
             elif store.state("cleanup_pending", False):
                 from .chat_cleanup import recover_pending
                 await durable_io(recover_pending, store)
+            if self.stopped(store):
+                return
             await self.upgrade_collection_policy(store)
             automatic = s.chat_auto_save and not s.paused
             prefix = f"chat_events:{store.portal}:{store.user_id}:"
@@ -822,6 +948,8 @@ class ChatArchive:
                                     bounds.append(auto_since_for(store, chat))
                                 start = max(bounds, key=lambda value: instant(value) or 0)
                                 store.enqueue(chat["id"], kind, {"cursor": 0, "date_from": start, "automatic": True}, priority)
+                                store.db.execute("UPDATE ca_work SET next_at=max(next_at,?) WHERE account=? AND chat=? AND kind=?",
+                                                 (time.time() + chat["id"] % min(seconds, 3600), store.account, chat["id"], kind))
                         store.set_state(kind + "_at", time.time())
             if s.chat_events and self.service.db.get_state(prefix + "consent") and not s.paused and time.time() - store.state("events_at", 0) >= 15:
                 try:
@@ -836,16 +964,40 @@ class ChatArchive:
             background_turn = self.work_turn % 5 == 0
             order = "CASE WHEN priority>0 THEN 0 ELSE 1 END," if background_turn else ""
             rows = self.service.db.rows(f"SELECT * FROM ca_work WHERE account=? AND next_at<=? ORDER BY {order}priority,touched,chat", (store.account, time.time()))
+            ready, chats = [], set()
             for row in rows:
+                payload = json.loads(row["data"])
+                if row["chat"] in chats or payload.get("held") or payload.get("access_blocked") or access_blocked(store.chat(row["chat"])):
+                    continue
+                if payload.get("automatic") and (not automatic or not self.selected(row["chat"])):
+                    continue
+                if ready and (row["kind"] == "metadata" or ready[0]["kind"] == "metadata"):
+                    continue
+                ready.append(row)
+                chats.add(row["chat"])
+                if len(ready) >= getattr(self, "batch_size", 10) or row["kind"] == "metadata":
+                    break
+            self.last_batch = 0
+            outcomes = await self.prefetch(store, ready) if len(ready) > 1 else {}
+            store.defer_collections = len(ready) > 1
+            for row in ready:
+                if self.stopped(store):
+                    break
                 work = json.loads(row["data"])
-                if work.get("access_blocked") or access_blocked(store.chat(row["chat"])):
+                if work.get("held") or work.get("access_blocked") or access_blocked(store.chat(row["chat"])):
                     continue
                 if work.get("automatic") and (not automatic or not self.selected(row["chat"])):
                     continue
                 self.active = f"Чат {row['chat']}"
                 self.current_work=(store.account,row["chat"],row["kind"])
                 try:
-                    result = await self.process_work(store, row)
+                    outcome = outcomes.get((row["chat"], row["kind"]))
+                    if isinstance(outcome, Exception):
+                        raise outcome
+                    page_start = time.monotonic()
+                    result = await self.process_work(store, row) if outcome is None else await self.process_work(store, row, prefetched=outcome)
+                    self.metrics["pages"] += (result or {}).get("pages", 0) > 0
+                    self.metrics["processing_seconds"] += time.monotonic() - page_start
                     left=self.service.db.rows("SELECT data FROM ca_work WHERE account=? AND chat=? AND kind=?",(store.account,row["chat"],row["kind"]))
                     if not left:
                         store.activity(row["kind"], row["chat"], "done", **(result or {}))
@@ -865,7 +1017,11 @@ class ChatArchive:
                 finally:
                     self.active = ""
                     self.current_work=None
-                break  # One page per turn: fair across chats and cancellable.
+                if self.stopped(store):
+                    break
+            if store.defer_collections:
+                await durable_io(store.collections)
+                store.defer_collections = False
 
     async def loop(self):
         self.loop_running = True
@@ -877,7 +1033,7 @@ class ChatArchive:
                 except Exception as exc:
                     self.error = self.service.vault.redact(str(exc))
                     await asyncio.sleep(10)
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.1 if getattr(self, "last_batch", 0) > 1 else 1)
         finally:
             self.loop_running = False
             self.active = ""
@@ -958,7 +1114,7 @@ class ChatArchive:
             return
         async with self.file_lock:
             store = self.store()
-            if store.state("cleanup_pending", False):
+            if self.stopped(store) or store.state("cleanup_pending", False):
                 return
             s = self.service.settings
             rows = self.service.db.rows("SELECT * FROM ca_files WHERE account=? AND state='queued' AND next_at<=? ORDER BY automatic,id", (store.account, time.time()))

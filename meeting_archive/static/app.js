@@ -429,6 +429,7 @@
     $("#chat-filter-status").textContent = data.chat_warning || "";
     $("#chat-filter-status").hidden = !data.chat_warning;
     state.bootstrap = data; state.csrf = data.csrf || state.csrf;
+    renderRecovery(data);
     updateDownloadButtons();
     const settings = data.settings || {};
     if (data.chat_archive && $("#nav-chat-total")) $("#nav-chat-total").textContent = Number(data.chat_archive.count || 0).toLocaleString("ru");
@@ -725,6 +726,13 @@
     selectAll.checked = count > 0 && count >= total;
     selectAll.indeterminate = count > 0 && count < total;
   }
+  function renderRecovery(data) {
+    const report=data.recovery || {}, integrity=data.integrity || {};
+    if($("#archive-recovery-status")) $("#archive-recovery-status").textContent=report.running ? `Восстановление: найдено ${report.found||0}, восстановлено ${report.restored||0}…` : report.completed_at ? `Найдено: ${report.found||0} · восстановлено: ${report.restored||0} · уже в индексе: ${report.known||0} · ошибок: ${report.errors||0}${report.missing ? " · отсутствующих файлов: "+report.missing : ""}. Материалы сохранены; незавершённые задания ожидают команды в очереди.` : "Поиск сохранённых материалов ещё не выполнен.";
+    if($("#archive-integrity-status")) $("#archive-integrity-status").textContent=integrity.running ? `Проверка целостности: ${integrity.checked||0} файлов…` : integrity.completed_at ? `Проверено файлов: ${integrity.checked||0} · ошибок: ${integrity.errors||0}.` : "Полная проверка целостности запускается отдельно.";
+    const accounts=report.accounts||[], label=$("#local-account-label"), select=$("#local-account-select");
+    if(label && select){ label.hidden=data.connected || accounts.length<2; if(document.activeElement!==select) select.innerHTML='<option value="">Выберите локальный аккаунт</option>'+accounts.map(a=>`<option value="${escapeHtml(JSON.stringify(a))}">${escapeHtml(a.portal)} · пользователь ${a.user_id}</option>`).join(""); }
+  }
   function renderChatJobs(data, append=false, replace=false) {
     if (!data || !$("#chat-jobs-list")) return;
     if(state.chatQueueAccount && state.chatQueueAccount!==data.account) { state.chatQueueItems=[]; state.chatQueueSelected=new Set(); for(const key of state.queueOpen?.keys() || []) if(key.startsWith("chat:")) state.queueOpen.delete(key); }
@@ -735,6 +743,12 @@
     state.chatQueueTotal=data.total;
     const meetingActive=(state.bootstrap?.jobs||[]).filter(job=>["queued","running","waiting"].includes(job.state)).length;
     $("#nav-jobs").textContent=String(meetingActive+data.pending); $("#nav-jobs").hidden=meetingActive+data.pending===0;
+    const stopped=Boolean(data.sync?.stopped);
+    if($("#chat-work-stop")) $("#chat-work-stop").hidden=stopped;
+    if($("#chat-work-resume")) $("#chat-work-resume").hidden=!stopped;
+    if($("#chat-work-recovered")) $("#chat-work-recovered").hidden=!data.held || stopped;
+    const metrics=data.sync?.metrics || {}, rest=data.sync?.rest || {};
+    if($("#chat-work-metrics")) $("#chat-work-metrics").textContent=`${stopped ? "Все работы чатов остановлены. " : ""}Восстановленных заданий: ${data.held||0} · Без повторов: ${data.blocked||0} · Результатов: ${data.history||0} · Возраст очереди: ${Math.round((data.oldest_seconds||0)/60)} мин. · Пакет: ${metrics.batch_size||10} · Последний пакет: ${Number(metrics.last_batch_seconds||0).toFixed(1)} с · REST-запросов за запуск: ${Object.values(rest).reduce((sum,m)=>sum+(m.requests||0),0)} · Последняя проверка каталога: ${data.sync?.last_catalogue_at ? dateString(new Date(data.sync.last_catalogue_at*1000).toISOString()) : "ещё не выполнена"}`;
     $("#chat-jobs-summary").textContent=`Ожидают или выполняются: ${data.pending}${data.failed ? " · Ошибок: "+data.failed : ""} · показано работ ${state.chatQueueItems.length} из ${data.total}`;
     if (state.chatQueueItems.length) renderQueueGroups($("#chat-jobs-list"),state.chatQueueItems,"chat",job => `<article class="job-item" data-chat-job-id="${job.id}"><label class="queue-job-select"><input type="checkbox" data-chat-job-select="${job.id}"${state.chatQueueSelected.has(job.id) ? " checked" : ""} aria-label="Выбрать задание ${job.label}"></label><div><div class="job-title">${icon(job.kind==="file" ? "file" : "chat")} ${escapeHtml(job.label)} ${badge(job.schedule_wait ? "waiting" : job.state)}</div><div class="job-meta">${escapeHtml(job.title)}${job.chat ? " · Чат ID "+job.chat : ""}${job.filename ? " · "+escapeHtml(job.filename) : ""}${job.automatic === true ? " · Автоматически" : job.automatic === false && job.kind!=="metadata" ? " · По вашему выбору" : ""}${job.touched ? " · "+escapeHtml(dateString(new Date(job.touched*1000).toISOString())) : ""}</div><div class="job-message">${escapeHtml(job.message||"")}${job.pages ? ` · Страниц: ${job.pages}` : ""}${job.messages ? ` · Обработано сообщений: ${job.messages}` : ""}${job.next_at>Date.now()/1000 ? ` · Повтор не раньше ${escapeHtml(dateString(new Date(job.next_at*1000).toISOString()))}` : ""}</div>${job.error ? `<div class="job-error">${escapeHtml(job.error)}</div>` : ""}${job.state==="running" ? `<progress class="job-progress" max="1"${job.total_bytes && job.downloaded_bytes ? ` value="${Math.min(1,job.downloaded_bytes/job.total_bytes)}"` : ""} aria-label="Выполнение задания чата"></progress>` : ""}</div><div class="job-actions">${job.state==="failed" || job.state==="cancelled" ? `<button class="button secondary small" data-chat-job-action="retry" data-chat-job="${job.id}">Повторить</button>` : ""}${job.state==="queued" || job.state==="failed" ? `<button class="button quiet small" data-chat-job-action="cancel" data-chat-job="${job.id}">Отменить</button>` : ""}</div></article>`, data.groups || []);
     else $("#chat-jobs-list").innerHTML = '<div class="empty-state"><p>Заданий чатов пока нет. Здесь появятся сохранение сообщений, история и вложения.</p></div>';
@@ -1137,6 +1151,14 @@
     await api("/api/link", { method: "POST", data: { source_id: state.meetingId, target_id: target } }); notify("Запись привязана. Исходный импорт сохранён."); await loadDetail();
   });
   $("#jobs-refresh").onclick = event => action(event.currentTarget, () => bootstrap());
+  $("#archive-recover").onclick=event=>action(event.currentTarget,async()=>{ await api("/api/archive/recover",{method:"POST",data:{}}); await bootstrap(); await loadList(); });
+  $("#archive-verify").onclick=event=>action(event.currentTarget,async()=>{ await api("/api/archive/verify",{method:"POST",data:{}}); await bootstrap(); });
+  $("#local-account-select").onchange=event=>action(event.currentTarget,async()=>{ if(!event.currentTarget.value)return; await api("/api/chat-archive/local-account",{method:"POST",data:JSON.parse(event.currentTarget.value)}); await api("/api/archive/recover",{method:"POST",data:{}}); await bootstrap(); });
+  for(const [id,command] of [["chat-work-stop","stop"],["chat-work-resume","resume"],["chat-work-recovered","continue_recovered"]]) $("#"+id).onclick=event=>action(event.currentTarget,async()=>{
+    const messages={stop:["Остановить все работы чатов?","Текущая операция завершится безопасно. Ожидающие задания будут отменены; новые проверки, история и вложения останутся остановлены после перезапуска. Скачанные материалы сохраняются."],resume:["Возобновить работы чатов?","Новые проверки будут выполняться согласно настройкам. Отменённая история не запускается заново."],continue_recovered:["Продолжить восстановленные задания?","Будут продолжены незавершённые задания из сохранённого архива. Чаты с отказом доступа остаются заблокированы до отдельной команды «Повторить»."]};
+    if(!(await confirmAction(...messages[command],"Подтвердить",true)))return;
+    await api("/api/chat-archive/control",{method:"POST",data:{account:state.chatQueueAccount,action:command,confirm:true}}); await bootstrap();
+  });
   $("#chat-jobs-more").onclick=event=>action(event.currentTarget,async()=>renderChatJobs(await api(`/api/chat-archive/queue?offset=${state.chatQueueItems?.length||0}&limit=100`),true));
   $("#chat-jobs-select-all").onchange=event=>action(event.currentTarget,async()=>{
     const account = state.chatQueueAccount;

@@ -4,7 +4,7 @@ import asyncio
 import ipaddress
 import time
 from email.utils import parsedate_to_datetime
-from urllib.parse import unquote, urljoin, urlsplit
+from urllib.parse import unquote, urljoin, urlsplit, urlencode
 
 import httpx
 
@@ -42,6 +42,69 @@ class BitrixClient:
         self.request_budget = {"next_at": 0.0, "blocked_until": 0.0, "failures": 0}
         self.method_budget = {}
         self.request_interval = 1.0
+        self.metrics = {}
+
+    async def measured_post(self, method, url, payload):
+        metric = self.metrics.setdefault(method, {"requests": 0, "seconds": 0.0, "errors": 0, "last_seconds": 0.0})
+        start = time.monotonic()
+        metric["requests"] += 1
+        try:
+            return await self.http.post(url, json=payload)
+        except httpx.HTTPError:
+            metric["errors"] += 1
+            raise
+        finally:
+            elapsed = time.monotonic() - start
+            metric["seconds"] += elapsed
+            metric["last_seconds"] = elapsed
+
+    async def batch_pages(self, commands):
+        """Independent legacy REST calls, with a budget and outcome for each method."""
+        if not 1 <= len(commands) <= 50:
+            raise ValueError("Пакет должен содержать от 1 до 50 команд")
+        outcomes, pending = {}, {}
+        for key, (method, params) in commands.items():
+            budget = self.method_budget.get(method, {})
+            if budget.get("until", 0) > time.time():
+                outcomes[key] = BitrixError("Ожидается безопасный повтор метода", code="RATE_LIMITED",
+                                           retryable=True, retry_at=budget["until"])
+            else:
+                pending[key] = method + '?' + urlencode(params, doseq=True)
+        if not pending:
+            return outcomes
+        result = await self.call("batch", {"halt": 0, "cmd": pending}, v3=False)
+        if not isinstance(result, dict) or not isinstance(result.get("result"), dict):
+            raise BitrixError("Неизвестный формат пакета сообщений")
+        times = result.get("result_time") or {}
+        errors = result.get("result_error") or {}
+        for key in pending:
+            method = commands[key][0]
+            metric = self.metrics.setdefault(method, {"requests": 0, "seconds": 0.0, "errors": 0, "last_seconds": 0.0})
+            metric["subrequests"] = metric.get("subrequests", 0) + 1
+            budget = self.method_budget.setdefault(method, {"until": 0.0, "reset_at": 0.0})
+            timing = times.get(key) or {}
+            try:
+                reset, operating = float(timing.get("operating_reset_at", 0)), float(timing.get("operating", 0))
+            except (ValueError, TypeError, AttributeError):
+                reset, operating = 0, 0
+            budget["reset_at"] = max(budget.get("reset_at", 0), reset)
+            if operating >= 240 and reset > time.time():
+                budget["until"] = max(budget.get("until", 0), reset)
+            if key in errors:
+                error = errors[key]
+                code = str(error.get("error") or "BATCH_ERROR").upper()
+                limited = code in {"OPERATION_TIME_LIMIT", "QUERY_LIMIT_EXCEEDED", "RATE_LIMITED"}
+                if limited:
+                    budget["until"] = max(budget.get("until", 0), time.time() + 60)
+                metric["errors"] += 1
+                # Descriptions can include source content: retain only the vendor code.
+                outcomes[key] = BitrixError("Bitrix24: " + code, code=code, retryable=limited,
+                                           retry_at=budget.get("until", 0) if limited else 0)
+            elif key in result["result"]:
+                outcomes[key] = result["result"][key]
+            else:
+                outcomes[key] = BitrixError("В пакете отсутствует результат команды", retryable=True)
+        return outcomes
 
     async def close(self):
         await self.http.aclose()
@@ -163,10 +226,11 @@ class BitrixClient:
             self.request_budget["next_at"] = time.monotonic() + self.request_interval
         # Pace starts without holding the gate through network latency: this
         # preserves concurrent OAuth refresh guards and fair request admission.
-        response = await self.http.post(url, json=payload)
+        response = await self.measured_post(method, url, payload)
         try:
             data = self._response(response)
         except BitrixError as exc:
+            self.metrics[method]["errors"] += 1
             if exc.code in {"QUERY_LIMIT_EXCEEDED", "RATE_LIMITED", "OPERATION_TIME_LIMIT"}:
                 if exc.code == "OPERATION_TIME_LIMIT":
                     budget["until"] = max(time.time() + max(60, self.retry_after(response)), budget["reset_at"])
