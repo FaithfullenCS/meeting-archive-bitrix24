@@ -292,7 +292,13 @@ class ChatArchive:
         return len(ids)
 
     def schedule_chat(self, store, chat, automatic):
-        if self.stopped(store) or access_blocked(chat):
+        if self.stopped(store):
+            return
+        if access_blocked(chat):
+            # Recheck only recently visible dialogs, at most once daily. This
+            # probes permission without downloading or restarting old history.
+            if chat.get("source_recent_seen_at") and time.time() - chat.get("access_checked_at", 0) >= 86400:
+                store.enqueue(chat["id"], "access_check", {"automatic": True}, 5)
             self.metrics["blocked"] += 1
             return
         if not chat.get("participants_at") and not chat.get("metadata_due"):
@@ -308,7 +314,7 @@ class ChatArchive:
         head = positive(chat.get("source_last_message_id"))
         unchanged = head and head == chat.get("sync_head_id")
         recently_checked = time.time() - chat.get("new_checked_at", 0) < max(900, self.service.settings.chat_poll_seconds * 5)
-        if not unchanged or not recently_checked:
+        if (head and not unchanged) or not recently_checked:
             self.metrics["planned"] += 1
             urgent = head and head != chat.get("sync_head_id") and (instant(chat.get("source_last_message_at")) or 0) >= (instant(since) or 0)
             store.enqueue(chat["id"], "new", {"cursor": 0, "stop_id": newest, "source_head_id": head, "date_from": since, "automatic": True}, -1 if urgent else 0)
@@ -490,6 +496,29 @@ class ChatArchive:
     async def process_work(self, store, row, prefetched=None):
         chat = store.chat(row["chat"])
         work = json.loads(row["data"])
+        if row["kind"] == "access_check":
+            store.update_chat(chat["id"], access_checked_at=time.time())
+            try:
+                page = await self.service.client.call("im.dialog.messages.get", {"DIALOG_ID": chat["dialog"], "LIMIT": 1}, v3=False)
+                if not isinstance(page, dict) or positive(page.get("chat_id") or page.get("chatId")) != chat["id"] or not isinstance(page.get("messages"), list):
+                    raise ValueError("Источник не подтвердил доступ к этому чату")
+            except BitrixError as exc:
+                if exc.code not in ACCESS_CODES:
+                    raise
+            else:
+                # Do not resume previously blocked historical work automatically.
+                store.update_chat(chat["id"], access_blocked=False, coverage="pending", error="")
+                for blocked in store.db.rows("SELECT kind,data FROM ca_work WHERE account=? AND chat=?", (store.account, chat["id"])):
+                    payload = json.loads(blocked["data"])
+                    if payload.get("access_blocked") and blocked["kind"] in {"new", "metadata"}:
+                        store.db.execute("DELETE FROM ca_work WHERE account=? AND chat=? AND kind=?", (store.account, chat["id"], blocked["kind"]))
+                    elif payload.get("access_blocked"):
+                        payload.pop("access_blocked", None)
+                        payload["held"] = True
+                        store.db.execute("UPDATE ca_work SET data=? WHERE account=? AND chat=? AND kind=?", (canonical(payload), store.account, chat["id"], blocked["kind"]))
+            store.db.execute("DELETE FROM ca_work WHERE account=? AND chat=? AND kind='access_check'", (store.account, chat["id"]))
+            await durable_io(store.flush, chat["id"])
+            return
         if row["kind"] == "metadata":
             try:
                 details = await self.service.client.call("im.dialog.get", {"DIALOG_ID": chat["dialog"]}, v3=False)
@@ -509,7 +538,7 @@ class ChatArchive:
                                   participants_at=time.time(), metadata_due=time.time() + 86400 + chat["id"] % 1800,
                                   participants_warning="", parent_chat_id=positive(details.get("parent_chat_id")), parent_message_id=positive(details.get("parent_message_id")))
             except (BitrixError, httpx.HTTPError, ValueError, OSError) as exc:
-                if isinstance(exc, (httpx.HTTPError, OSError)) or isinstance(exc, BitrixError) and (exc.retryable or exc.code in ACCESS_CODES):
+                if isinstance(exc, (httpx.HTTPError, OSError)) or isinstance(exc, BitrixError) and exc.retryable:
                     raise
                 store.update_chat(chat["id"], participants_at=time.time(), participants_warning=self.service.vault.redact(str(exc)))
             self.service.db.execute("DELETE FROM ca_work WHERE account=? AND chat=? AND kind=?", (store.account, chat["id"], row["kind"]))
@@ -967,15 +996,15 @@ class ChatArchive:
             ready, chats = [], set()
             for row in rows:
                 payload = json.loads(row["data"])
-                if row["chat"] in chats or payload.get("held") or payload.get("access_blocked") or access_blocked(store.chat(row["chat"])):
+                if row["chat"] in chats or payload.get("held") or payload.get("access_blocked") or (row["kind"] != "access_check" and access_blocked(store.chat(row["chat"]))):
                     continue
                 if payload.get("automatic") and (not automatic or not self.selected(row["chat"])):
                     continue
-                if ready and (row["kind"] == "metadata" or ready[0]["kind"] == "metadata"):
+                if ready and (row["kind"] in {"metadata", "access_check"} or ready[0]["kind"] in {"metadata", "access_check"}):
                     continue
                 ready.append(row)
                 chats.add(row["chat"])
-                if len(ready) >= getattr(self, "batch_size", 10) or row["kind"] == "metadata":
+                if len(ready) >= getattr(self, "batch_size", 10) or row["kind"] in {"metadata", "access_check"}:
                     break
             self.last_batch = 0
             outcomes = await self.prefetch(store, ready) if len(ready) > 1 else {}
@@ -984,7 +1013,7 @@ class ChatArchive:
                 if self.stopped(store):
                     break
                 work = json.loads(row["data"])
-                if work.get("held") or work.get("access_blocked") or access_blocked(store.chat(row["chat"])):
+                if work.get("held") or work.get("access_blocked") or (row["kind"] != "access_check" and access_blocked(store.chat(row["chat"]))):
                     continue
                 if work.get("automatic") and (not automatic or not self.selected(row["chat"])):
                     continue
@@ -1008,9 +1037,11 @@ class ChatArchive:
                     denied = isinstance(exc, BitrixError) and exc.code in ACCESS_CODES
                     if denied:
                         work["access_blocked"] = True
+                        store.update_chat(row["chat"], access_checked_at=time.time())
                     self.service.db.execute("UPDATE ca_work SET data=?,next_at=?,touched=? WHERE account=? AND chat=? AND kind=?",
                                             (canonical(work),max(time.time() + 30, getattr(exc, "retry_at", 0)), time.time(), store.account, row["chat"], row["kind"]))
-                    store.update_chat(row["chat"], error=message, access_blocked=denied, coverage="access_lost" if denied else "error")
+                    if row["kind"] != "access_check":
+                        store.update_chat(row["chat"], error=message, access_blocked=denied, coverage="access_lost" if denied else "error")
                     if denied:
                         await durable_io(store.flush, row["chat"])
                     self.error = message

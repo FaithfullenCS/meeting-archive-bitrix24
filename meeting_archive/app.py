@@ -667,6 +667,9 @@ def create_app(service: Service, launch_token: str | None = None, *, manage_life
         if service.module_maintenance and rows[0]["kind"] in {"install", "transcribe"}:
             raise ValueError("Сначала дождитесь удаления моделей")
         payload = json.loads(rows[0]["payload"])
+        if rows[0]["kind"] == "transcribe":
+            # Retry is a new request with the current transcription profile.
+            return {"job": service.request_transcribe(rows[0]["meeting_id"], mode=payload.get("mode", "combined"), sample=payload.get("sample", False), file_names=payload.get("file_names")), "queued": True}
         payload["automatic"] = False
         service.db.execute("UPDATE jobs SET payload=? WHERE id=?", (json.dumps(payload), job_id))
         service.db.job_update(job_id, state="queued", next_at=0, error="", progress=0, message="В очереди")
@@ -678,6 +681,9 @@ def create_app(service: Service, launch_token: str | None = None, *, manage_life
         if not rows or rows[0]["state"] != "queued":
             raise ValueError("Запустить сейчас можно только ожидающую задачу")
         payload = json.loads(rows[0]["payload"])
+        if rows[0]["kind"] == "transcribe":
+            # Retry is a new request with the current transcription profile.
+            return {"job": service.request_transcribe(rows[0]["meeting_id"], mode=payload.get("mode", "combined"), sample=payload.get("sample", False), file_names=payload.get("file_names")), "queued": True}
         payload["automatic"] = False
         service.db.execute("UPDATE jobs SET payload=? WHERE id=?", (json.dumps(payload), job_id))
         service.db.job_update(job_id, next_at=0, error="", message="Ручной запуск")

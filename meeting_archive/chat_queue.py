@@ -9,6 +9,7 @@ from .chat_sync import iso_day, access_blocked, allow_access_retry
 
 
 LABELS = {
+    "access_check": "Проверка восстановления доступа",
     "new": "Новые сообщения",
     "history": "История чата",
     "metadata": "Участники и сведения о чате",

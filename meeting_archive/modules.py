@@ -525,6 +525,8 @@ class ModuleManager:
 
     async def transcribe(self, job_id: int, job: dict, external: str, progress) -> dict:
         settings = job.get("settings", {})
+        if not external and settings.get("engine", "whisper") == "whisper":
+            await self.discover()
         model = settings.get("model", "large-v3")
         from .engine_catalog import catalogue, full_runtime_ready
         own = next(m for e in catalogue(self.root, settings.get("device", "cuda"))["engines"] if e["id"] == "whisper" for m in e["models"] if m["id"] == model)

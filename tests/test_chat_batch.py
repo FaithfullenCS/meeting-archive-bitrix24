@@ -158,3 +158,65 @@ async def test_734_chats_use_bounded_adaptive_batches(batch_service, record_prop
     await service.chat_archive.step()
     assert len(sizes) == before  # No repeated sweep for unchanged heads.
     await service.client.close()
+
+
+def test_unknown_head_does_not_requeue_on_every_catalogue_or_restart(batch_service):
+    store = batch_service.chat_archive.store()
+    store.upsert_chat(42, 'chat42', participants_at=time.time(), new_checked_at=time.time())
+    batch_service.chat_archive.schedule_chat(store, store.chat(42), True)
+    assert not store.db.rows("SELECT * FROM ca_work WHERE kind='new'")
+    from meeting_archive.chat_sync import ChatArchive
+    restarted = ChatArchive(batch_service)
+    restarted.schedule_chat(store, store.chat(42), True)
+    assert not store.db.rows("SELECT * FROM ca_work WHERE kind='new'")
+
+
+async def test_metadata_access_error_does_not_block_message_reading(batch_service):
+    from unittest.mock import AsyncMock
+    store = batch_service.chat_archive.store()
+    store.upsert_chat(42, 'chat42')
+    store.enqueue(42, 'metadata', {}, 4)
+    row = store.db.rows("SELECT * FROM ca_work WHERE kind='metadata'")[0]
+    batch_service.client.call = AsyncMock(side_effect=BitrixError('ACCESS_ERROR', code='ACCESS_ERROR'))
+    await batch_service.chat_archive.process_work(store, row)
+    assert not store.chat(42).get('access_blocked')
+    assert store.chat(42).get('participants_warning')
+    assert not store.db.rows("SELECT * FROM ca_work WHERE kind='metadata'")
+
+
+async def test_daily_access_probe_recovers_stale_status_without_resuming_history(batch_service):
+    from unittest.mock import AsyncMock
+    store = batch_service.chat_archive.store()
+    store.upsert_chat(42, 'chat42', coverage='access_lost', access_blocked=True, source_recent_seen_at=time.time())
+    store.enqueue(42, 'history', {'access_blocked': True, 'cursor': 90}, 2)
+    store.enqueue(42, 'new', {'access_blocked': True, 'automatic': True}, 0)
+    batch_service.client.call = AsyncMock(return_value={'chat_id': 42, 'messages': []})
+    batch_service.chat_archive.schedule_chat(store, store.chat(42), True)
+    await batch_service.chat_archive.step()
+    assert not store.chat(42)['access_blocked']
+    assert not store.db.rows("SELECT * FROM ca_work WHERE kind='new'")
+    history = store.db.rows("SELECT data FROM ca_work WHERE kind='history'")[0]
+    assert json.loads(history['data'])['held'] and json.loads(history['data'])['cursor'] == 90
+    batch_service.client.call.assert_awaited_once()
+
+
+async def test_daily_access_probe_denial_is_bounded(batch_service):
+    from unittest.mock import AsyncMock
+    store = batch_service.chat_archive.store()
+    store.upsert_chat(42, 'chat42', coverage='access_lost', access_blocked=True, source_recent_seen_at=time.time())
+    batch_service.client.call = AsyncMock(side_effect=BitrixError('denied', code='ACCESS_ERROR'))
+    for _ in range(3):
+        batch_service.chat_archive.schedule_chat(store, store.chat(42), True)
+        await batch_service.chat_archive.step()
+    batch_service.client.call.assert_awaited_once()
+    assert store.chat(42)['access_blocked']
+
+
+async def test_access_probe_network_error_does_not_clear_denial(batch_service):
+    from unittest.mock import AsyncMock
+    store = batch_service.chat_archive.store()
+    store.upsert_chat(42, 'chat42', coverage='access_lost', access_blocked=True, source_recent_seen_at=time.time())
+    batch_service.client.call = AsyncMock(side_effect=httpx.ConnectError('Synthetic network failure'))
+    batch_service.chat_archive.schedule_chat(store, store.chat(42), True)
+    await batch_service.chat_archive.step()
+    assert store.chat(42)['access_blocked'] and store.chat(42)['coverage'] == 'access_lost'

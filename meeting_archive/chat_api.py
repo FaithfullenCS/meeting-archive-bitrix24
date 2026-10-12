@@ -49,8 +49,9 @@ def register_chat_api(app, service):
                  (not participants or participants.issubset({p["id"] for p in c.get("participants", [])}))]
         previews = {r["id"]: r["preview"] for r in service.db.rows("SELECT c.id,(SELECT text FROM ca_messages m WHERE m.account=c.account AND m.chat=c.id ORDER BY date DESC,id DESC LIMIT 1) AS preview FROM ca_chats c WHERE c.account=?", (store.account,))}
         for item in items:
+            item["last_message_at"] = max((item.get("source_last_message_at") or "", item["count"].get("last") or ""), key=lambda value: instant(value) or 0)
             item["preview"] = (previews.get(item["id"]) or "Сообщения ещё не сохранены")[:160]
-        return {"items": sorted(items, key=lambda c: (instant(c.get("source_last_message_at")) or 0, c.get("source_last_message_id", 0), c["id"]), reverse=True), "account": store.account,
+        return {"items": sorted(items, key=lambda c: (instant(c.get("last_message_at")) or 0, c.get("source_last_message_id", 0), c["id"]), reverse=True), "account": store.account,
                 **store.summary(), "total": len(items), "poll_seconds": service.settings.chat_poll_seconds,
                 "connected": service.connected(), "error": engine.error, "active": engine.active,
                 "auto_save": service.settings.chat_auto_save, "events_error": store.state("event_error", ""),

@@ -452,3 +452,15 @@ async def test_stop_install_kills_owned_worker_grandchildren(tmp_path, vault):
         for process in owned_children:
             if process.is_running():
                 process.kill()  # Only captured descendants of this exact test task.
+
+
+async def test_transcribe_waits_for_resource_discovery(tmp_path, vault, monkeypatch):
+    module = ModuleManager(tmp_path, vault)
+    from unittest.mock import AsyncMock
+    module.discover = AsyncMock(return_value={})
+    def borrowed(*args, **kwargs):
+        assert module.discover.await_count == 1
+        raise ValueError('discovery reached')
+    monkeypatch.setattr(module, 'borrowed_environment', borrowed)
+    with pytest.raises(ValueError, match='discovery reached'):
+        await module.transcribe(1, {'settings': {'engine': 'whisper', 'model': 'large-v3'}}, '', lambda *_: None)

@@ -33,8 +33,8 @@ async def test_catalogue_orders_unsaved_chats_by_source_message_date(chat_servic
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8765") as client:
         await client.get("/?launch=synthetic-order")
         items = (await client.get("/api/chat-archive")).json()["items"]
-    assert [item["id"] for item in items] == [102, 103, 101]
-    assert items[1]["peer_active"] is False and items[1]["count"]["n"] == 0
+    assert [item["id"] for item in items] == [101, 102, 103]
+    assert items[2]["peer_active"] is False and items[2]["count"]["n"] == 0
 
 
 async def test_extra_recent_keeps_inactive_dialog_without_saving_text(chat_service):
@@ -125,7 +125,7 @@ async def test_new_self_message_not_starved_by_large_catalogue(chat_service, mon
     )
 
 
-async def test_history_does_not_change_order_without_remote_date(chat_service):
+async def test_history_supplies_last_message_date_without_remote_date(chat_service):
     store = seed(chat_service)
     store.upsert_chat(102, "chat102")
     app = create_app(chat_service, launch_token="synthetic-order-stable", manage_lifecycle=False)
@@ -134,7 +134,7 @@ async def test_history_does_not_change_order_without_remote_date(chat_service):
         before = [c["id"] for c in (await client.get("/api/chat-archive")).json()["items"]]
         store.save_page(101, {"messages": [message(1, date="2026-12-01T00:00:00Z")]})
         after = [c["id"] for c in (await client.get("/api/chat-archive")).json()["items"]]
-    assert before == after
+    assert before == [102, 101] and after == [101, 102]
 
 
 def test_task_collections_new_paths_and_legacy_links(chat_service):
@@ -356,7 +356,7 @@ def test_bulk_cancel_uses_one_snapshot_and_persists_across_recovery(chat_service
     assert not store.db.rows("SELECT kind FROM ca_work WHERE account=?", (store.account,))
 
 
-@pytest.mark.parametrize("kind", ["new", "history", "metadata"])
+@pytest.mark.parametrize("kind", ["new", "history"])
 async def test_access_error_stops_polling_until_explicit_retry(chat_service, monkeypatch, kind):
     service = chat_service
     store = seed(service)

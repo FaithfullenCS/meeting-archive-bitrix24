@@ -550,3 +550,21 @@ async def test_meeting_detail_does_not_read_transcript_outside_meeting(ui, tmp_p
         assert (await browser.get(f"/api/file/{saved['id']}/bitrix/transcript.txt")).status_code == 400
     finally:
         os.rmdir(bitrix)
+
+
+async def test_transcription_retry_uses_current_profile_and_validates_again(ui, monkeypatch):
+    browser, service, _ = ui
+    await login(browser)
+    job = service.db.enqueue('transcribe', None, {'settings': {'model': 'old'}, 'mode': 'combined', 'sample': True, 'file_names': ['demo.wav']})
+    service.db.job_update(job, state='failed')
+    calls = []
+    def request(meeting_id, **kwargs):
+        calls.append((meeting_id, kwargs, service.settings.model))
+        return 999
+    monkeypatch.setattr(service, 'request_transcribe', request)
+    service.settings.model = 'large-v3'
+    csrf = (await browser.get('/api/bootstrap')).json()['csrf']
+    response = await browser.post(f'/api/jobs/{job}/retry', json={}, headers={'X-CSRF-Token': csrf})
+    assert response.status_code == 200 and response.json()['job'] == 999
+    assert calls == [(None, {'mode': 'combined', 'sample': True, 'file_names': ['demo.wav']}, 'large-v3')]
+    assert service.db.rows('SELECT state FROM jobs WHERE id=?', (job,))[0]['state'] == 'failed'
