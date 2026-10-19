@@ -137,7 +137,8 @@ def test_handled_startup_failure_exits_without_pyinstaller_traceback_dialog(tmp_
     monkeypatch.setattr(launcher, "single_instance", lambda _: (SimpleNamespace(CloseHandle=close_handle), 1, False))
     def bind(_):
         raise OSError("synthetic occupied port")
-    monkeypatch.setattr(launcher.socket, "socket", lambda *a: SimpleNamespace(setsockopt=lambda *a: None, bind=bind))
+    monkeypatch.setattr(launcher.socket, "socket", lambda *a: SimpleNamespace(
+        setsockopt=lambda *a: None, bind=bind, close=lambda: None))
     monkeypatch.setattr(launcher, "notice", lambda _: pytest.fail("Unexpected error dialog"))
     with pytest.raises(SystemExit) as error:
         launcher.main()

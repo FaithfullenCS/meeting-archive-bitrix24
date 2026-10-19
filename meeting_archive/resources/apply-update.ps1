@@ -56,7 +56,8 @@ try {
         if ($name -notin $c.new_files) { Remove-Item -LiteralPath (Safe-File $target $name) -Force }
     }
     $started = Start-Archive $true
-    $deadline = (Get-Date).AddSeconds($(if ($c.headless) {45} else {240}))
+    # Includes the launcher's cold-start archive recovery budget (180 seconds).
+    $deadline = (Get-Date).AddSeconds(240)
     $healthy = $false
     $startupError = ''
     do {

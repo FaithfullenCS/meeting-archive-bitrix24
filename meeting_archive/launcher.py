@@ -13,6 +13,26 @@ from pathlib import Path
 
 from .settings import app_home, atomic_json
 
+SERVER_START_TIMEOUT = 180
+
+
+def record_startup_failure(home: Path, error: Exception, elapsed: float, stage: str, service=None) -> str:
+    from datetime import datetime, timezone
+    from . import __version__
+    from .settings import Vault
+
+    vault = getattr(service, "vault", None) or Vault(home)
+    message = vault.redact(str(error))
+    report = {"at": datetime.now(timezone.utc).isoformat(), "version": __version__,
+              "stage": stage, "elapsed_seconds": round(elapsed, 2), "error": message}
+    recovery = getattr(service, "recovery_status", {})
+    report["recovery"] = {key: recovery[key] for key in ("running", "found", "restored", "errors") if key in recovery}
+    try:
+        atomic_json(home / "startup-error.json", report)
+    except OSError:
+        return message  # Diagnostic failure must not replace the original error.
+    return message + "\n\nСведения о запуске: " + str(home / "startup-error.json")
+
 
 def self_test():
     from .modules import ModuleManager
@@ -107,6 +127,8 @@ def main():
     home.mkdir(parents=True, exist_ok=True)
     kernel, mutex, existing = single_instance(home)
     runtime_file = home / "runtime.json"
+    launch_started = time.monotonic()
+    stage = "activate_existing" if existing else "prepare_runtime"
     try:
         if existing:
             if runtime_file.exists() and (not args.no_browser or args.activate):
@@ -135,11 +157,13 @@ def main():
         import uvicorn
         from .app import create_app
         from .service import Service
+        stage = "bind_local_port"
         # Reserve the expected callback port; never take over another program's listener.
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         listener.bind(("127.0.0.1", 8765))
         listener.listen(128)
+        stage = "load_profile"
         service = Service(home)
         from .browser import configure_window, close_browser
         from .notifications import register_windows
@@ -179,13 +203,30 @@ def main():
         # A protected endpoint supports graceful headless QA; normal users exit through the tray.
         app = create_app(service, app.state.launch_token, shutdown_callback=exit_requested)
         config.app = app
-        thread = threading.Thread(target=lambda: server.run(sockets=[listener]), name="MeetingArchiveServer", daemon=True)
+        server_errors = []
+
+        def run_server():
+            try:
+                server.run(sockets=[listener])
+            except BaseException as exc:
+                # A server-thread exception cannot be caught by main's handler.
+                server_errors.append(service.vault.redact(f"{type(exc).__name__}: {exc}"))
+
+        stage = "start_local_server"
+        thread = threading.Thread(target=run_server, name="MeetingArchiveServer", daemon=True)
         thread.start()
-        deadline = time.monotonic() + 15
+        # Lifespan first reconciles the portable archive with SQLite. A cold
+        # disk at Windows login can need much longer than the old 15 seconds.
+        deadline = time.monotonic() + SERVER_START_TIMEOUT
         while not server.started and thread.is_alive() and time.monotonic() < deadline:
             time.sleep(.05)
         if not server.started:
-            raise RuntimeError("Локальный интерфейс не запустился")
+            detail = getattr(app.state, "startup_error", "") or next(iter(server_errors), "")
+            if not detail:
+                detail = (f"ожидание готовности превысило {SERVER_START_TIMEOUT} с"
+                          if thread.is_alive() else "поток сервера завершился до готовности")
+            raise RuntimeError("Локальный интерфейс не запустился: " + detail)
+        stage = "run_desktop"
         if args.no_tray and args.no_browser:
             try:
                 while thread.is_alive():
@@ -251,9 +292,8 @@ def main():
             if tray_icon:
                 tray_icon.stop()
         thread.join(timeout=20)
-        listener.close()
     except Exception as exc:
-        if "server" in locals():
+        if "server" in locals() and "thread" in locals():
             server.should_exit = True
             thread.join(timeout=20)
         if "tray_icon" in locals() and tray_icon:
@@ -263,9 +303,12 @@ def main():
         elif args.update_start:
             atomic_json(home / "update-startup-error.json", {"error": str(exc)})
         else:
-            notice(str(exc))
+            notice(record_startup_failure(home, exc, time.monotonic() - launch_started,
+                                          stage, locals().get("service")))
         raise SystemExit(1) from None  # Handled failure: no PyInstaller traceback dialog blocking rollback.
     finally:
+        if "listener" in locals():
+            listener.close()
         if not existing:
             runtime_file.unlink(missing_ok=True)
         kernel.CloseHandle.argtypes = [ctypes.c_void_p]

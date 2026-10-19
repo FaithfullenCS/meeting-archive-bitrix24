@@ -11,12 +11,24 @@ from meeting_archive import browser, launcher
 
 
 @pytest.mark.parametrize("action", ["open", "exit"])
-def test_windows_run_starts_only_tray_and_creates_window_on_request(tmp_path, monkeypatch, action):
+@pytest.mark.parametrize("startup_delay", [0, 30, 120])
+def test_windows_run_starts_only_tray_and_creates_window_on_request(tmp_path, monkeypatch, action, startup_delay):
     import uvicorn
     import pystray
     from meeting_archive import app, notifications, service, tray, webview_runtime
 
     calls = []
+    clock = SimpleNamespace(elapsed=0)
+    startup_due = threading.Event()
+    startup_finished = threading.Event()
+
+    def sleep(seconds):
+        clock.elapsed += seconds
+        if clock.elapsed >= startup_delay:
+            startup_due.set()
+            assert startup_finished.wait(1)
+
+    monkeypatch.setattr(launcher, "time", SimpleNamespace(monotonic=lambda: clock.elapsed, sleep=sleep))
     monkeypatch.setattr(sys, "argv", ["archive", "--home", str(tmp_path), "--no-browser"])
     monkeypatch.setattr(browser, "_window", None)
     monkeypatch.setattr(launcher, "single_instance", lambda _: (
@@ -39,7 +51,11 @@ def test_windows_run_starts_only_tray_and_creates_window_on_request(tmp_path, mo
             pass
 
         def run(self, **kwargs):
+            while not startup_due.wait(.01):
+                if self.should_exit:
+                    return
             self.started = True
+            startup_finished.set()
             while not self.should_exit:
                 time.sleep(.01)
 
@@ -87,3 +103,106 @@ def test_windows_run_starts_only_tray_and_creates_window_on_request(tmp_path, mo
     assert tray_finished.wait(1)
     assert calls == (["tray-only", "runtime", "window"] if action == "open" else ["tray-only"])
     assert not (tmp_path / "runtime.json").exists()
+
+
+@pytest.mark.parametrize("failure", ["timeout", "thread_exception", "lifespan", "early_exit"])
+def test_failed_server_start_is_bounded_and_records_redacted_cause(tmp_path, monkeypatch, vault, failure):
+    import uvicorn
+    from meeting_archive import app, service
+    from meeting_archive.settings import Vault
+
+    monkeypatch.setattr(vault, "redact", lambda value: Vault.redact(vault, value))
+
+    messages, closed = [], []
+    clock = SimpleNamespace(elapsed=0)
+    running = threading.Event()
+
+    def sleep(seconds):
+        assert running.wait(1)
+        clock.elapsed += seconds
+        time.sleep(.0001)  # Let an exiting server thread finish; no real 180-second delay.
+
+    monkeypatch.setattr(launcher, "time", SimpleNamespace(monotonic=lambda: clock.elapsed, sleep=sleep))
+    monkeypatch.setattr(sys, "argv", ["archive", "--home", str(tmp_path), "--no-browser", "--no-tray"])
+    monkeypatch.setattr(launcher, "single_instance", lambda _: (
+        SimpleNamespace(CloseHandle=lambda _: closed.append("mutex")), 1, False))
+    monkeypatch.setattr(launcher.socket, "socket", lambda *a: SimpleNamespace(
+        setsockopt=lambda *a: None, bind=lambda *a: None, listen=lambda *a: None,
+        close=lambda: closed.append("socket")))
+    monkeypatch.setattr(service, "Service", lambda _: SimpleNamespace(
+        updates=SimpleNamespace(), notifications=SimpleNamespace(), vault=vault,
+        recovery_status={"running": True, "found": 12, "restored": 2, "errors": 0}))
+    detail = "ValueError: synthetic-token https://private.test/secret" if failure == "lifespan" else ""
+    monkeypatch.setattr(app, "create_app", lambda *a, **k: SimpleNamespace(
+        state=SimpleNamespace(launch_token="synthetic", startup_error=detail)))
+    monkeypatch.setattr(launcher, "notice", messages.append)
+
+    class Server:
+        started = False
+        should_exit = False
+
+        def __init__(self, config):
+            pass
+
+        def run(self, **kwargs):
+            running.set()
+            if failure == "thread_exception":
+                raise OSError("synthetic-token https://private.test/secret")
+            if failure == "timeout":
+                while not self.should_exit:
+                    time.sleep(.001)
+
+    monkeypatch.setattr(uvicorn, "Server", Server)
+    monkeypatch.setattr(uvicorn, "Config", lambda *a, **k: SimpleNamespace())
+    with pytest.raises(SystemExit) as error:
+        launcher.main()
+    assert error.value.code == 1
+    assert len(messages) == 1 and "Локальный интерфейс не запустился" in messages[0]
+    report_text = (tmp_path / "startup-error.json").read_text("utf-8")
+    report = json.loads(report_text)
+    assert "synthetic-token" not in report_text + messages[0]
+    assert "private.test" not in report_text + messages[0]
+    assert report["stage"] == "start_local_server"
+    assert report["recovery"]["found"] == 12
+    if failure == "timeout":
+        assert 180 <= clock.elapsed < 181
+        assert "180" in report["error"]
+    elif failure in {"thread_exception", "lifespan"}:
+        assert ("OSError" if failure == "thread_exception" else "ValueError") in report["error"]
+        assert clock.elapsed < 180
+    else:
+        assert "завершился до готовности" in report["error"]
+        assert clock.elapsed < 180
+    assert closed == ["socket", "mutex"]
+    assert not (tmp_path / "runtime.json").exists()
+
+
+async def test_lifespan_exposes_startup_error_when_uvicorn_handles_exception(tmp_path, monkeypatch, vault):
+    from meeting_archive.app import create_app
+    from meeting_archive.service import Service
+
+    service = Service(tmp_path, vault=vault)
+
+    async def fail_start():
+        raise ValueError("synthetic-token https://private.test/secret")
+
+    monkeypatch.setattr(service, "start", fail_start)
+    try:
+        app = create_app(service)
+        with pytest.raises(ValueError):
+            async with app.router.lifespan_context(app):
+                pytest.fail("A failed startup must not serve requests")
+        assert "ValueError" in app.state.startup_error
+        assert "synthetic-token" not in app.state.startup_error
+    finally:
+        await service.stop()
+
+
+def test_startup_diagnostic_write_failure_preserves_original_error(tmp_path, monkeypatch, vault):
+    def unavailable(*args):
+        raise PermissionError("diagnostic unavailable")
+
+    monkeypatch.setattr(launcher, "atomic_json", unavailable)
+    message = launcher.record_startup_failure(tmp_path, ValueError("synthetic-token"), 2, "start_local_server",
+                                              SimpleNamespace(vault=vault))
+    assert message == "[hidden]"

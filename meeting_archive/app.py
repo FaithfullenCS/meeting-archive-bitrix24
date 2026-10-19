@@ -183,13 +183,20 @@ def create_app(service: Service, launch_token: str | None = None, *, manage_life
     @asynccontextmanager
     async def lifespan(app):
         if manage_lifecycle:
-            await service.start()
+            try:
+                await service.start()
+            except Exception as exc:
+                # Uvicorn handles lifespan failures internally. Keep the cause
+                # available to the launcher even when console logging is off.
+                app.state.startup_error = service.vault.redact(f"{type(exc).__name__}: {exc}")
+                raise
         yield
         if manage_lifecycle:
             await service.stop()
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.launch_token = launch_token
+    app.state.startup_error = ""
 
     @app.middleware("http")
     async def security(request: Request, call_next):
