@@ -79,6 +79,11 @@ try {
                 }
             }
         } catch { $startupError = $_.Exception.Message }
+        # This process cannot become the requested version by waiting longer.
+        # A confirmed mismatch must roll back promptly, including on slow disks.
+        if ($runtime.pid -eq $started.Id -and $runtime.version -and $runtime.version -ne $c.version) {
+            throw ('Unexpected application version: expected ' + $c.version + ', received ' + $runtime.version)
+        }
     } until ($healthy -or $started.HasExited -or (Get-Date) -gt $deadline)
     if (-not $healthy) { throw ('New application did not pass startup verification. ' + $startupError + ' Process=' + $started.Id + ' Runtime=' + $runtime.pid + ' Version=' + $runtime.version) }
     @{state='installed';version=$c.version;backup=$backup} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path (Split-Path -Parent $Config) 'receipt.json') -Encoding UTF8
