@@ -333,7 +333,7 @@ def create_app(service: Service, launch_token: str | None = None, *, manage_life
     @app.get("/api/meetings")
     async def meetings(q: str = "", date_from: str = "", date_to: str = "", min_minutes: float = 0,
                        max_minutes: float = 0, audio: str = "", bitrix: str = "", local: str = "", offset: int = 0, limit: int = 50,
-                       participants: str = "", chat: str = "", chats: str = ""):
+                       participants: str = "", chat: str = "", chats: str = "", source: str = ""):
         if len(participants) > 12000:
             raise ValueError("Слишком длинный список участников")
         selected = {value for value in participants.split(",") if value}
@@ -346,6 +346,8 @@ def create_app(service: Service, launch_token: str | None = None, *, manage_life
             raise ValueError("Можно выбрать до 100 участников")
         records = [meeting_view(r) for r in service.db.rows("SELECT * FROM meetings")]
         def matches(r):
+            if source and r["source"] != source:
+                return False
             minutes = float(r["durationSeconds"] or 0) / 60
             day = (r["startDate"] or "")[:10]
             if selected_chats and str(r["chat_id"] or "") not in selected_chats:

@@ -634,7 +634,40 @@ class Service:
     def transcription_files(self, meeting, file_names=None):
         folder = self.archive.folder(meeting)
         audio = self.archive.contained(folder / "audio", within=folder)
-        files = sorted(p for p in audio.iterdir() if p.is_file() and p.suffix.lower() in MEDIA_EXTENSIONS) if audio.is_dir() else []
+        files = []
+        if audio.is_dir():
+            # Older imports could lose their extension when a long filename was
+            # truncated. Accept those only while their archive manifest still
+            # proves the exact file's size, timestamp, and recorded digest.
+            manifest = self.archive.contained(folder / "meeting.json", within=folder)
+            try:
+                manifest_files = json.loads(manifest.read_text("utf-8")).get("files", {})
+            except (OSError, ValueError, AttributeError):
+                manifest_files = {}
+            if not isinstance(manifest_files, dict):
+                manifest_files = {}
+            for path in audio.iterdir():
+                if not path.is_file():
+                    continue
+                if path.suffix.lower() in MEDIA_EXTENSIONS:
+                    files.append(path)
+                    continue
+                if path.suffix:
+                    continue
+                self.archive.contained(path, within=audio)
+                record = manifest_files.get(path.relative_to(folder).as_posix())
+                if not isinstance(record, dict):
+                    continue
+                digest = record.get("sha256")
+                if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdefABCDEF" for c in digest):
+                    continue
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                if record.get("size") == stat.st_size and record.get("mtime_ns") == stat.st_mtime_ns:
+                    files.append(path)
+        files.sort()
         for path in files:
             self.archive.contained(path, within=audio)
         if file_names is not None:

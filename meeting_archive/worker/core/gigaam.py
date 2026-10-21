@@ -34,6 +34,32 @@ MODEL_FILES = {
     "pytorch_model.bin": (448928167, "afc6dcbae8320ea56f2cddebc0f13fbf62c9d59b6ddcad899782623c8610826a"),
     "tokenizer.model": (255336, "828c12c991019eef952a960661f25a92d6ad279591e2ea466b4aeddf1d20a18a"),
 }
+OFFICIAL_MODEL_FILES = {
+    "config.json": MODEL_FILES["config.json"],
+    "v3_e2e_rnnt.ckpt": (448929252, "f60c62fe45902d967000770a12f260de7c5ac4d4b8e5e852f1df8c548e3958b5"),
+    "tokenizer.model": MODEL_FILES["tokenizer.model"],
+}
+OFFICIAL_CDN = "https://cdn.chatwm.opensmodel.sberdevices.ru/GigaAM/"
+
+
+def model_files(directory: Path):
+    # Select only a known fixed manifest, never paths supplied by the marker.
+    marker = directory.parent / "ready.json"
+    try:
+        if marker.stat().st_size <= 2 * 1024**2:
+            saved = json.loads(marker.read_text("utf-8")).get("files", {})
+            if set(saved) == set(OFFICIAL_MODEL_FILES):
+                return OFFICIAL_MODEL_FILES
+            if set(saved) == set(MODEL_FILES):
+                return MODEL_FILES
+    except (OSError, ValueError, AttributeError, TypeError):
+        pass
+    # Compatibility with older markers and structural availability checks.
+    if (directory / "v3_e2e_rnnt.ckpt").is_file() and not (directory / "pytorch_model.bin").exists():
+        return OFFICIAL_MODEL_FILES
+    return MODEL_FILES
+
+
 SAMPLE_RATE = 16000
 MAX_CHUNK_SECONDS = 25
 VAD_WINDOW_SECONDS = 60
@@ -51,7 +77,7 @@ def sha256(path: Path) -> str:
 
 
 def verify_models(directory: Path):
-    for name, (size, digest) in MODEL_FILES.items():
+    for name, (size, digest) in model_files(directory).items():
         path = directory / name
         if (not path.is_file() or path.is_symlink() or path.stat().st_size != size or sha256(path) != digest):
             raise RuntimeError("Файлы GigaAM отсутствуют или изменены. Повторите установку этой модели")
@@ -167,8 +193,22 @@ class Transcriber:
         raw = json.loads((directory / "model/config.json").read_text("utf-8"))
         cfg = OmegaConf.create(model_config(raw, directory / "model/tokenizer.model"))
         model = GigaAMASR(cfg)
-        state = torch.load(directory / "model/pytorch_model.bin", map_location="cpu", weights_only=True)
-        model.load_state_dict(unpack_state(state), strict=True)
+        files = model_files(directory / "model")
+        if "v3_e2e_rnnt.ckpt" in files:
+            # Official checkpoint includes OmegaConf metadata. Allow only these
+            # fixed data containers, never arbitrary pickle globals/code.
+            import collections
+            import typing
+            from omegaconf import DictConfig
+            from omegaconf.base import ContainerMetadata, Metadata
+            from omegaconf.nodes import AnyNode
+            allowed = [DictConfig, ContainerMetadata, Metadata, AnyNode, typing.Any, dict, collections.defaultdict]
+            with torch.serialization.safe_globals(allowed):
+                checkpoint = torch.load(directory / "model/v3_e2e_rnnt.ckpt", map_location="cpu", weights_only=True)
+            state = checkpoint["state_dict"]
+        else:
+            state = unpack_state(torch.load(directory / "model/pytorch_model.bin", map_location="cpu", weights_only=True))
+        model.load_state_dict(state, strict=True)
         model.eval()
         if self.device.type == "cuda":
             model.encoder = model.encoder.half()

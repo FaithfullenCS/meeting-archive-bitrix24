@@ -1,0 +1,67 @@
+{
+  "model_type": "gigaam",
+  "auto_map": {
+    "AutoConfig": "modeling_gigaam.GigaAMConfig",
+    "AutoModel": "modeling_gigaam.GigaAMModel"
+  },
+  "cfg": {
+    "model": {
+      "cfg": {
+        "model_class": "rnnt",
+        "sample_rate": 16000,
+        "preprocessor": {
+          "_target_": "modeling_gigaam.FeatureExtractor",
+          "sample_rate": 16000,
+          "features": 64,
+          "win_length": 320,
+          "hop_length": 160,
+          "mel_scale": "htk",
+          "n_fft": 320,
+          "mel_norm": null,
+          "center": false
+        },
+        "encoder": {
+          "_target_": "modeling_gigaam.ConformerEncoder",
+          "feat_in": 64,
+          "n_layers": 16,
+          "d_model": 768,
+          "subsampling_factor": 4,
+          "ff_expansion_factor": 4,
+          "self_attention_model": "rotary",
+          "pos_emb_max_len": 5000,
+          "n_heads": 16,
+          "conv_kernel_size": 5,
+          "flash_attn": false,
+          "subs_kernel_size": 5,
+          "subsampling": "conv1d",
+          "conv_norm_type": "layer_norm"
+        },
+        "head": {
+          "_target_": "modeling_gigaam.RNNTHead",
+          "decoder": {
+            "pred_hidden": 320,
+            "pred_rnn_layers": 1,
+            "num_classes": 1025
+          },
+          "joint": {
+            "enc_hidden": 768,
+            "pred_hidden": 320,
+            "joint_hidden": 320,
+            "num_classes": 1025
+          }
+        },
+        "decoding": {
+          "_target_": "modeling_gigaam.RNNTGreedyDecoding",
+          "vocabulary": null,
+          "model_path": "tokenizer.model"
+        },
+        "model_name": "v3_e2e_rnnt",
+        "hashes": {
+          "model": "72e2a9b5c7caad963b2bbfd2f298c252",
+          "tokenizer": "3b3bf8370e882885d79731592fc99f98"
+        }
+      },
+      "_target_": "modeling_gigaam.GigaAMASR"
+    }
+  }
+}

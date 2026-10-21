@@ -222,7 +222,7 @@ def test_explicit_installer_does_not_touch_shared_runtime_or_external_app(monkey
     monkeypatch.setattr(installer, "extract_source", lambda *_: {"model.py": "synthetic-checksum"})
     root = tmp_path / "owned/engines/gigaam"
     ready = installer.install(root, progress=lambda *_: None)
-    assert len(downloads) == 4
+    assert len(downloads) == 3
     assert all(target.is_relative_to(root) for _, target in downloads)
     assert ready["source_commit"] == gigaam.SOURCE_COMMIT
     assert json.loads((root / "ready.json").read_text("utf-8"))["files"] == ready["files"]
@@ -264,3 +264,102 @@ def test_source_extraction_rejects_traversal_even_from_a_synthetic_verified_zip(
 def test_https_download_redirect_cannot_downgrade_transport():
     with pytest.raises(ValueError, match="небезопасный адрес"):
         installer.HTTPSRedirect().redirect_request(None, None, 302, "", {}, "http://unsafe.test/")
+
+
+def test_download_retries_connection_reset_without_reloading_verified_file(monkeypatch, tmp_path):
+    calls = []
+    class Response(io.BytesIO):
+        status = 200
+    def opened(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise ConnectionResetError(10054, "reset")
+        return Response(b"correct")
+    monkeypatch.setattr(installer.urllib.request, "build_opener", lambda *_: SimpleNamespace(open=opened))
+    monkeypatch.setattr(installer.time, "sleep", lambda _: None)
+    target = tmp_path / "model.bin"
+    installer.download("https://huggingface.co/fixed-model", target, 7, hashlib.sha256(b"correct").hexdigest(), lambda *_: None)
+    installer.download("https://huggingface.co/fixed-model", target, 7, hashlib.sha256(b"correct").hexdigest(), lambda *_: None)
+    assert target.read_bytes() == b"correct"
+    assert len(calls) == 2
+
+
+def test_download_resumes_interrupted_stream_with_valid_range(monkeypatch, tmp_path):
+    requests = []
+    class Broken:
+        status = 200
+        reads = 0
+        def __enter__(self): return self
+        def __exit__(self, *_): pass
+        def read(self, _):
+            self.reads += 1
+            if self.reads == 1:
+                return b"cor"
+            raise ConnectionResetError(10054, "signed-private-url")
+    class Response(io.BytesIO):
+        status = 206
+        headers = {"Content-Range": "bytes 3-6/7"}
+    def opened(request, **kwargs):
+        requests.append(request)
+        return Broken() if len(requests) == 1 else Response(b"rect")
+    monkeypatch.setattr(installer.urllib.request, "build_opener", lambda *_: SimpleNamespace(open=opened))
+    monkeypatch.setattr(installer.time, "sleep", lambda _: None)
+    target = tmp_path / "model.bin"
+    installer.download("https://huggingface.co/fixed-model", target, 7, hashlib.sha256(b"correct").hexdigest(), lambda *_: None)
+    assert requests[1].get_header("Range") == "bytes=3-"
+    assert target.read_bytes() == b"correct"
+    assert not target.with_suffix(".bin.part").exists()
+
+
+def test_download_exhaustion_keeps_partial_and_hides_signed_error(monkeypatch, tmp_path):
+    target = tmp_path / "model.bin"
+    partial = tmp_path / "model.bin.part"
+    partial.write_bytes(b"cor")
+    attempts, messages = [], []
+    def opened(*args, **kwargs):
+        attempts.append(1)
+        raise ConnectionResetError(10054, "https://private.test/?signature=secret")
+    monkeypatch.setattr(installer.urllib.request, "build_opener", lambda *_: SimpleNamespace(open=opened))
+    monkeypatch.setattr(installer.time, "sleep", lambda _: None)
+    with pytest.raises(installer.DownloadError, match="model.bin") as error:
+        installer.download("https://huggingface.co/fixed-model", target, 7, "hash", lambda _, msg: messages.append(msg))
+    assert len(attempts) == 4
+    assert partial.read_bytes() == b"cor"
+    assert "private.test" not in str(error.value) + str(messages)
+    assert "secret" not in str(error.value) + str(messages)
+
+
+@pytest.mark.parametrize("range_header", [None, "bytes 0-3/7", "bytes 3-6/8"])
+def test_download_rejects_bad_resume_range(monkeypatch, tmp_path, range_header):
+    target = tmp_path / "model.bin"
+    partial = tmp_path / "model.bin.part"
+    partial.write_bytes(b"cor")
+    class Response(io.BytesIO):
+        status = 206
+        headers = {"Content-Range": range_header or ""}
+    monkeypatch.setattr(installer.urllib.request, "build_opener", lambda *_: SimpleNamespace(open=lambda *_a, **_k: Response(b"rect")))
+    with pytest.raises(ValueError, match="диапазон"):
+        installer.download("https://huggingface.co/fixed-model", target, 7, "hash", lambda *_: None)
+    assert not target.exists()
+    assert not partial.exists()
+
+
+def test_download_restarts_if_server_ignores_range(monkeypatch, tmp_path):
+    target = tmp_path / "model.bin"
+    (tmp_path / "model.bin.part").write_bytes(b"cor")
+    class Response(io.BytesIO):
+        status = 200
+    monkeypatch.setattr(installer.urllib.request, "build_opener", lambda *_: SimpleNamespace(open=lambda *_a, **_k: Response(b"correct")))
+    installer.download("https://huggingface.co/fixed-model", target, 7, hashlib.sha256(b"correct").hexdigest(), lambda *_: None)
+    assert target.read_bytes() == b"correct"
+
+
+def test_official_checkpoint_integrity_is_checked_before_loading(monkeypatch, tmp_path):
+    data = b"official synthetic checkpoint"
+    monkeypatch.setattr(gigaam, "OFFICIAL_MODEL_FILES", {"v3_e2e_rnnt.ckpt": (len(data), hashlib.sha256(data).hexdigest())})
+    checkpoint = tmp_path / "v3_e2e_rnnt.ckpt"
+    checkpoint.write_bytes(data)
+    gigaam.verify_models(tmp_path)
+    checkpoint.write_bytes(b"tampered")
+    with pytest.raises(RuntimeError, match="отсутствуют или изменены"):
+        gigaam.verify_models(tmp_path)

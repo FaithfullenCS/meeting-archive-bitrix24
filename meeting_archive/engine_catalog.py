@@ -52,14 +52,14 @@ def parakeet_installed(root: Path, profile: str) -> bool:
 
 
 def gigaam_installed(root: Path, profile: str) -> bool:
-    from .worker.core.gigaam import MODEL_FILES, MODEL_REVISION, SOURCE_COMMIT, SOURCE_FILES_SHA256
+    from .worker.core.gigaam import model_files, MODEL_REVISION, SOURCE_COMMIT, SOURCE_FILES_SHA256
     engine = root / "engines/gigaam"
     ready = read_marker(engine / "ready.json")
     # Hashes are verified by the worker before inference; the catalogue performs
     # cheap availability/size checks so it never re-reads multi-GB weights per poll.
     return (ready.get("model") == GIGAAM_MODEL and ready.get("source_commit") == SOURCE_COMMIT
             and ready.get("model_revision") == MODEL_REVISION and full_runtime_ready(root, profile)
-            and all(present(engine / "model" / name, size) for name, (size, _) in MODEL_FILES.items())
+            and all(present(engine / "model" / name, size) for name, (size, _) in model_files(engine / "model").items())
             and all(present(engine / "packages/gigaam" / name) for name in SOURCE_FILES_SHA256)
             and all(present(engine / "addons" / name) for name in
                     ("hydra/__init__.py", "omegaconf/__init__.py", "silero_vad/__init__.py", "sentencepiece/__init__.py")))
@@ -115,8 +115,9 @@ def installation_plan(root: Path, profile: str, packages: list[dict], *, full_fe
             return whisper_installed(root, package["model"]) or package["model"] in cached_whisper
         if package["engine"] == "parakeet":
             return present(root / "engines/parakeet/models" / MODEL_FILE, MODEL_BYTES)
-        from .worker.core.gigaam import MODEL_FILES
-        return all(present(root / "engines/gigaam/model" / name, size) for name, (size, _) in MODEL_FILES.items())
+        from .worker.core.gigaam import model_files
+        directory = root / "engines/gigaam/model"
+        return all(present(directory / name, size) for name, (size, _) in model_files(directory).items())
     weights = sum(models[(p["engine"], p["model"])]["download_gb"] for p in packages if not have_weights(p))
     native = (.101 if profile == "cuda" else .005) if any(p["engine"] == "parakeet" and
         not models[(p["engine"], p["model"])]["installed"] for p in packages) else 0

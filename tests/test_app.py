@@ -568,3 +568,18 @@ async def test_transcription_retry_uses_current_profile_and_validates_again(ui, 
     assert response.status_code == 200 and response.json()['job'] == 999
     assert calls == [(None, {'mode': 'combined', 'sample': True, 'file_names': ['demo.wav']}, 'large-v3')]
     assert service.db.rows('SELECT state FROM jobs WHERE id=?', (job,))[0]['state'] == 'failed'
+
+
+@pytest.mark.asyncio
+async def test_incoming_source_filter_keeps_imports_without_text(ui):
+    browser, service, _ = ui
+    await login(browser)
+    imported = service.db.upsert("local-import", {"callId": "import-recording", "overview": {"topic": "Запись.m4a"}}, "import")
+    service.db.upsert(service.settings.portal, {"callId": "remote-recording"})
+    result = (await browser.get("/api/meetings", params={"source": "import"})).json()
+    assert result["total"] == 1
+    assert result["items"][0]["id"] == imported["id"]
+    assert (await browser.get("/api/meetings", params={"source": "bitrix"})).json()["total"] == 1
+    assert (await browser.get("/api/meetings", params={"source": "import", "q": "нет"})).json()["total"] == 0
+    assert (await browser.get("/api/meetings")).json()["total"] == 2
+    assert not service.db.rows("SELECT * FROM jobs")

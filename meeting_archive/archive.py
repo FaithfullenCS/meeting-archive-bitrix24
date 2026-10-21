@@ -81,6 +81,16 @@ def safe_name(value: str, limit=90) -> str:
     return value
 
 
+def safe_media_name(value: str, limit=90) -> str:
+    """Sanitize a media filename without truncating its usable extension."""
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value).strip(" .")
+    suffix = Path(cleaned).suffix
+    if not suffix or len(suffix) >= limit or not re.fullmatch(r"\.[A-Za-z0-9]{1,10}", suffix):
+        return safe_name(value, limit)
+    stem = cleaned[:-len(suffix)]
+    return safe_name(stem, limit - len(suffix)) + suffix
+
+
 def sha256(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as stream:
@@ -251,7 +261,7 @@ class Archive:
     async def download(self, client: BitrixClient, folder: Path, track: dict, progress) -> tuple[Path, bool]:
         folder = self.contained(folder)
         key = str(track.get("trackId") or track.get("fileId") or track.get("diskFileId") or "recording")
-        filename = safe_name(key) + "_" + safe_name(track.get("fileName") or "recording.webm", 65)
+        filename = safe_name(key) + "_" + safe_media_name(track.get("fileName") or "recording.webm", 65)
         target = self.contained(folder / "audio" / filename, within=folder)
         expected = int(track.get("fileSize") or 0)
         manifest = self.contained(folder / "meeting.json", within=folder)
@@ -318,7 +328,7 @@ class Archive:
             raise ValueError("Файл записи не найден")
         folder = self.ensure(meeting)
         digest = sha256(source)
-        path = self.contained(folder / "audio" / (digest[:12] + "_" + safe_name(source.name, 65)), within=folder)
+        path = self.contained(folder / "audio" / (digest[:12] + "_" + safe_media_name(source.name, 65)), within=folder)
         if path.exists() and sha256(path) == digest:
             return path, False
         if shutil.disk_usage(folder).free < source.stat().st_size + 32 * 1024 * 1024:

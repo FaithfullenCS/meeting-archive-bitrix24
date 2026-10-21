@@ -239,6 +239,28 @@ def test_invalid_or_missing_selected_audio_never_enters_queue(service, monkeypat
     assert service.db.meeting(meeting["id"])["local"] == "not_saved"
 
 
+def test_manifested_extensionless_audio_can_be_transcribed(service):
+    meeting = service.db.upsert(service.settings.portal, record())
+    folder = service.archive.ensure(meeting)
+    audio = folder / "audio/legacy-import-with-truncated-extension"
+    audio.write_bytes(b"synthetic recording")
+    service.archive.remember_audio(folder, audio)
+    service.db.update_meeting(meeting["id"], folder=str(folder), audio="saved")
+
+    assert service.transcription_files(meeting, [audio.name]) == [audio]
+
+
+def test_unmanifested_extensionless_audio_is_not_accepted(service):
+    meeting = service.db.upsert(service.settings.portal, record())
+    folder = service.archive.ensure(meeting)
+    audio = folder / "audio/untracked-file"
+    audio.write_bytes(b"synthetic recording")
+    service.db.update_meeting(meeting["id"], folder=str(folder), audio="saved")
+
+    with pytest.raises(ValueError, match="Выбранная запись отсутствует"):
+        service.transcription_files(meeting, [audio.name])
+
+
 @pytest.mark.parametrize("engine", ["parakeet", "gigaam"])
 def test_automatic_nonwhisper_engine_queues_with_stale_legacy_adapter(service, tmp_path, monkeypatch, engine):
     service.settings.auto_local = True

@@ -200,3 +200,55 @@ def test_incomplete_own_cache_falls_back_to_complete_shared_weights(tmp_path, mo
     monkeypatch.setenv("HF_HUB_CACHE", str(own))
     monkeypatch.setenv("MEETING_ARCHIVE_MODEL_CACHE", str(shared))
     assert installed_model_path("tiny") == snapshot
+
+
+def test_worker_clears_inherited_windows_dll_directory_before_run(monkeypatch):
+    seen = []
+    monkeypatch.setattr(entry, "reset_dll_search", lambda: seen.append("reset"), raising=False)
+    monkeypatch.setattr(entry, "run", lambda job: seen.append("run"))
+    monkeypatch.setattr(sys, "argv", ["worker"])
+    monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
+    entry.main()
+    assert seen == ["reset", "run"]
+
+
+def test_diarization_uses_existing_public_cache_without_network(tmp_path, monkeypatch):
+    from meeting_archive.worker.core import diarizer
+    shared = tmp_path / ".cache/torch/pyannote"
+    shared.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("PYANNOTE_CACHE", str(tmp_path / "empty-owned-cache"))
+    calls = []
+    def download(repo, filename, **kwargs):
+        calls.append(kwargs)
+        assert kwargs["local_files_only"] is True
+        if Path(kwargs["cache_dir"]) == shared:
+            return "cached-model"
+        raise FileNotFoundError()
+    assert diarizer.download_with_cache(download, "pyannote/segmentation-3.0", "pytorch_model.bin") == "cached-model"
+    assert len(calls) == 2
+
+
+def test_diarization_falls_back_to_network_only_when_all_local_caches_miss(tmp_path, monkeypatch):
+    from meeting_archive.worker.core import diarizer
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("PYANNOTE_CACHE", str(tmp_path / "owned"))
+    calls = []
+    def download(*args, **kwargs):
+        calls.append(kwargs)
+        if kwargs.get("local_files_only"):
+            raise FileNotFoundError()
+        return "downloaded"
+    assert diarizer.download_with_cache(download, "pyannote/segmentation-3.0", "pytorch_model.bin", token="synthetic") == "downloaded"
+    assert len(calls) == 4
+    assert calls[-1] == {"token": "synthetic"}
+
+
+def test_diarization_does_not_redirect_unrelated_model_downloads(monkeypatch):
+    from meeting_archive.worker.core import diarizer
+    calls = []
+    def download(*args, **kwargs):
+        calls.append(kwargs)
+        return "original"
+    assert diarizer.download_with_cache(download, "unrelated/model", "config.json") == "original"
+    assert calls == [{}]

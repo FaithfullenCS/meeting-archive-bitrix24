@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 from typing import Callable, List, Optional
 
 from .transcriber import Segment, TranscriptionResult
@@ -17,6 +18,27 @@ def _noop(*_a, **_k) -> None:
 
 class DiarizationError(RuntimeError):
     pass
+
+
+def download_with_cache(download, *args, **kwargs):
+    """Read already authorized named model caches before trying the network."""
+    repo = args[0] if args else kwargs.get("repo_id")
+    known = {"pyannote/speaker-diarization-3.1", "pyannote/segmentation-3.0",
+             "pyannote/wespeaker-voxceleb-resnet34-LM"}
+    if repo in known:
+        caches = [kwargs.get("cache_dir") or os.environ.get("PYANNOTE_CACHE"),
+                  Path.home() / ".cache/torch/pyannote", Path.home() / ".cache/huggingface/hub"]
+        tried = set()
+        for cache in caches:
+            if cache is None or str(cache) in tried:
+                continue
+            tried.add(str(cache))
+            local = {**kwargs, "cache_dir": str(cache), "local_files_only": True}
+            try:
+                return download(*args, **local)
+            except FileNotFoundError:
+                pass
+    return download(*args, **kwargs)
 
 
 class Diarizer:
@@ -67,7 +89,7 @@ class Diarizer:
             def _patched_download(*args, **kwargs):
                 if "use_auth_token" in kwargs:
                     kwargs.setdefault("token", kwargs.pop("use_auth_token"))
-                return _orig_download(*args, **kwargs)
+                return download_with_cache(_orig_download, *args, **kwargs)
             _hf_hub.hf_hub_download = _patched_download  # type: ignore[attr-defined]
 
             # То же для cached_download (если используется старым кодом)

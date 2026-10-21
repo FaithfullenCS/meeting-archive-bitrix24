@@ -206,3 +206,68 @@ def test_startup_diagnostic_write_failure_preserves_original_error(tmp_path, mon
     message = launcher.record_startup_failure(tmp_path, ValueError("synthetic-token"), 2, "start_local_server",
                                               SimpleNamespace(vault=vault))
     assert message == "[hidden]"
+
+
+def test_repeated_launch_waits_for_local_server_without_proxy(tmp_path, monkeypatch):
+    import httpx
+    (tmp_path / "runtime.json").write_text(json.dumps({"url": "http://localhost:8765/?launch=synthetic"}))
+    monkeypatch.setattr(sys, "argv", ["archive", "--home", str(tmp_path)])
+    kernel = SimpleNamespace(CloseHandle=lambda _: None)
+    monkeypatch.setattr(launcher, "single_instance", lambda _: (kernel, 1, True))
+    clock = SimpleNamespace(elapsed=0)
+    monkeypatch.setattr(launcher, "time", SimpleNamespace(monotonic=lambda: clock.elapsed,
+        sleep=lambda seconds: setattr(clock, "elapsed", clock.elapsed + seconds)))
+    attempts = []
+    def post(url, **kwargs):
+        attempts.append((url, kwargs))
+        if len(attempts) == 1:
+            raise httpx.ConnectError("connection refused")
+        return httpx.Response(200, request=httpx.Request("POST", url))
+    monkeypatch.setattr(httpx, "post", post)
+    monkeypatch.setattr(launcher, "notice", lambda message: pytest.fail(message))
+    launcher.main()
+    assert len(attempts) == 2
+    assert all(url.startswith("http://127.0.0.1:8765/") and kwargs.get("trust_env") is False for url, kwargs in attempts)
+    assert not (tmp_path / "startup-error.json").exists()
+
+
+def test_repeated_launch_takes_over_only_after_old_mutex_is_released(tmp_path, monkeypatch):
+    from meeting_archive import webview_runtime
+    monkeypatch.setattr(sys, "argv", ["archive", "--home", str(tmp_path)])
+    kernel = SimpleNamespace(CloseHandle=lambda _: None)
+    claims, messages = [], []
+    def claim(_):
+        claims.append(1)
+        return kernel, len(claims), len(claims) == 1
+    monkeypatch.setattr(launcher, "single_instance", claim)
+    monkeypatch.setattr(launcher.time, "sleep", lambda _: None)
+    def prepared(**kwargs):
+        assert len(claims) == 2
+        raise RuntimeError("synthetic reached new server preparation")
+    monkeypatch.setattr(webview_runtime, "prepare_runtime", prepared)
+    monkeypatch.setattr(launcher, "notice", messages.append)
+    with pytest.raises(SystemExit):
+        launcher.main()
+    assert len(messages) == 1 and "synthetic reached new server preparation" in messages[0]
+
+
+def test_repeated_launch_has_bounded_wait_and_keeps_existing_runtime(tmp_path, monkeypatch):
+    import httpx
+    runtime = tmp_path / "runtime.json"
+    runtime.write_text(json.dumps({"url": "http://localhost:8765/?launch=synthetic"}))
+    monkeypatch.setattr(sys, "argv", ["archive", "--home", str(tmp_path)])
+    kernel = SimpleNamespace(CloseHandle=lambda _: None)
+    monkeypatch.setattr(launcher, "single_instance", lambda _: (kernel, 1, True))
+    clock = SimpleNamespace(elapsed=0)
+    monkeypatch.setattr(launcher, "time", SimpleNamespace(monotonic=lambda: clock.elapsed,
+        sleep=lambda seconds: setattr(clock, "elapsed", clock.elapsed + seconds)))
+    def refused(*args, **kwargs):
+        raise httpx.ConnectError("private-network-details")
+    monkeypatch.setattr(httpx, "post", refused)
+    messages = []
+    monkeypatch.setattr(launcher, "notice", messages.append)
+    with pytest.raises(SystemExit):
+        launcher.main()
+    assert 180 <= clock.elapsed < 181
+    assert runtime.exists()
+    assert "180" in messages[0] and "private-network-details" not in messages[0]

@@ -23,11 +23,12 @@ async def test_download_atomic_manifest_dedup_and_no_secret_url(settings, vault,
         return httpx.Response(200, content=content, headers={"content-type": "audio/webm"})
 
     client = BitrixClient(settings, vault, transport=httpx.MockTransport(handler))
-    track = {"trackId": "track-1", "fileName": "voice.webm", "fileSize": len(content),
+    track = {"trackId": "track-1", "fileName": "long-meeting-recording-name-" * 4 + ".webm", "fileSize": len(content),
              "url": "https://synthetic.bitrix24.ru/recording?auth=synthetic-download-token"}
     try:
         path, changed = await archive.download(client, folder, track, lambda *_: None)
         assert changed and path.read_bytes() == content
+        assert path.suffix == ".webm"
         assert not list((folder / "audio").glob(".download-*"))
         record = json.loads((folder / "meeting.json").read_text("utf-8"))["files"][path.relative_to(folder).as_posix()]
         assert record["sha256"] == sha256(path)
@@ -166,6 +167,18 @@ def test_import_is_copy_deduplicated_and_source_preserved(settings, meeting, tmp
     assert archive.import_file(meeting, source) == (first, False)
     assert source.read_bytes() == b"synthetic audio"
     assert not list(first.parent.glob(".import-*"))
+
+
+def test_long_import_filename_keeps_media_extension(settings, meeting, tmp_path):
+    archive = Archive(Path(settings.archive_root))
+    source = tmp_path / ("long-meeting-recording-name-" * 4 + ".wav")
+    source.write_bytes(b"synthetic audio")
+
+    imported, changed = archive.import_file(meeting, source)
+
+    assert changed
+    assert imported.suffix == ".wav"
+    assert imported.read_bytes() == source.read_bytes()
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Native Windows junction regression")

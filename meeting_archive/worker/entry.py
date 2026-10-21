@@ -11,6 +11,12 @@ import time
 from pathlib import Path
 
 try:
+    from .windows_runtime import reset_dll_search
+except ImportError:
+    from windows_runtime import reset_dll_search
+
+
+try:
     from .core.model_catalog import WHISPER_MODELS
 except ImportError:
     from core.model_catalog import WHISPER_MODELS
@@ -139,6 +145,7 @@ def run(job: dict):
 
 def main():
     try:
+        reset_dll_search()
         with contextlib.redirect_stdout(sys.stderr):
             if len(sys.argv) > 2 and sys.argv[1] == "--download":
                 from huggingface_hub import snapshot_download

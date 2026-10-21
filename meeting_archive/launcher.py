@@ -40,9 +40,9 @@ def self_test():
     required = ["static/index.html", "static/app.js", "static/styles.css", "worker/entry.py",
                 "static/icon.svg", "static/icon.png", "static/favicon.ico",
                 "worker/core/transcriber.py", "worker/core/model_catalog.py", "worker/core/parakeet.py",
-                "worker/core/gigaam.py", "worker/install_parakeet.py", "worker/install_gigaam.py",
+                "worker/core/gigaam.py", "worker/windows_runtime.py", "worker/install_parakeet.py", "worker/install_gigaam.py",
                 "resources/worker-cuda.lock", "resources/worker-cuda126.lock", "resources/worker-cpu.lock", "resources/worker-native.lock",
-                "resources/worker-gigaam-addons.lock"]
+                "resources/worker-gigaam-addons.lock", "resources/gigaam-v3-config.json"]
     missing = [name for name in required if not (package / name).is_file()]
     if missing:
         raise RuntimeError("Missing packaged resources: " + ", ".join(missing))
@@ -130,22 +130,39 @@ def main():
     launch_started = time.monotonic()
     stage = "activate_existing" if existing else "prepare_runtime"
     try:
-        if existing:
-            if runtime_file.exists() and (not args.no_browser or args.activate):
+        deadline = time.monotonic() + SERVER_START_TIMEOUT
+        while existing:
+            if args.no_browser and not args.activate:
+                return
+            from urllib.parse import parse_qs, urlsplit
+            import httpx
+            try:
                 runtime = json.loads(runtime_file.read_text("utf-8"))
                 url = runtime.get("url", "")
                 if url.startswith(("http://127.0.0.1:8765/?launch=", "http://localhost:8765/?launch=")):
-                    from urllib.parse import parse_qs, urlsplit
-                    import httpx
                     token = parse_qs(urlsplit(url).query)["launch"][0]
+                    options = {"headers": {"x-desktop-token": token}, "timeout": 2, "trust_env": False}
                     if args.activate:
-                        response = httpx.post("http://localhost:8765/api/desktop/activate",
-                                              json={"uri": args.activate}, headers={"x-desktop-token": token}, timeout=10)
-                        response.raise_for_status()
+                        httpx.post("http://127.0.0.1:8765/api/desktop/activate",
+                                   json={"uri": args.activate}, **options).raise_for_status()
                     if not args.no_browser:
-                        httpx.post("http://localhost:8765/api/desktop/open", json={},
-                                   headers={"x-desktop-token": token}, timeout=20).raise_for_status()
-            return
+                        httpx.post("http://127.0.0.1:8765/api/desktop/open", json={}, **options).raise_for_status()
+                    return
+            except (OSError, ValueError, KeyError, httpx.TransportError):
+                pass  # Startup/shutdown may leave a missing/stale runtime briefly.
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code not in {401, 403, 502, 503, 504}:
+                    raise RuntimeError("Не удалось открыть окно работающего приложения") from None
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Работающий экземпляр не отвечает в течение 180 секунд. "
+                                   "Закройте Meeting Archive через трей и запустите снова")
+            # Never start a second server until the old instance releases its mutex.
+            kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+            kernel.CloseHandle(mutex)
+            mutex = None
+            time.sleep(.25)  # Drop our reference while waiting for the old instance.
+            kernel, mutex, existing = single_instance(home)
+        stage = "prepare_runtime"
         # A repeated EXE launch only needs the mutex/runtime and our window.
         # Load the server stack after that fast path, not before activating it.
         # --no-browser is the existing Windows Run registration: start only the
@@ -312,7 +329,8 @@ def main():
         if not existing:
             runtime_file.unlink(missing_ok=True)
         kernel.CloseHandle.argtypes = [ctypes.c_void_p]
-        kernel.CloseHandle(mutex)
+        if mutex is not None:
+            kernel.CloseHandle(mutex)
         if qa_handler:
             logger.removeHandler(qa_handler)
             qa_handler.close()

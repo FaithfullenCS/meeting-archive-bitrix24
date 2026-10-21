@@ -1005,9 +1005,18 @@
   });
   $("#meeting-list").addEventListener("click", event => { if (event.target.dataset.select) selectMeeting(Number(event.target.dataset.select), event.target.checked, event.shiftKey); });
   $("#select-page").addEventListener("change", event => { state.selectionAnchor = null; state.items.forEach(item => { if (event.target.checked) state.selected.add(item.id); else state.selected.delete(item.id); }); $$("#meeting-list input[data-select]").forEach(input => { input.checked = state.selected.has(Number(input.dataset.select)); }); renderSelection(); });
+  $$("[data-incoming-open]").forEach(button => { button.onclick = () => {
+    $("#filter-form").reset();
+    setTimeout(() => {
+      $("#filter-form").elements.source.value = "import";
+      state.offset = 0;
+      navigate("archive");
+      requestFilter();
+    }, 0);
+  }; });
   $("#filter-form").addEventListener("submit", event => { event.preventDefault(); requestFilter(); });
   $("#filter-form").addEventListener("input", event => { if (["q", "chat"].includes(event.target.name)) requestFilter(280); else if (["min_minutes", "max_minutes"].includes(event.target.name)) requestFilter(); });
-  $("#filter-form").addEventListener("change", event => { if (["audio", "bitrix", "local"].includes(event.target.name)) requestFilter(); });
+  $("#filter-form").addEventListener("change", event => { if (["audio", "bitrix", "local", "source"].includes(event.target.name)) requestFilter(); });
   $("#filter-form").addEventListener("reset", () => { state.participantIds.clear(); state.chatIds.clear(); $("#chat-search").value = ""; closeChats(); renderChats(); $("#participant-search").value = ""; state.dateEndpoint = "from"; state.calendarFocus = ""; closeParticipants(); closeCalendar(); renderParticipants(); clearTimeout(state.filterTimer); state.listRequest++; setTimeout(() => { $("#filter-form").elements.date_from.value = ""; $("#filter-form").elements.date_to.value = ""; renderCalendar(); requestFilter(); }, 0); });
   $("#period-toggle").onclick = () => $("#period-menu").hidden ? openCalendar() : closeCalendar();
   $("#period-close").onclick = () => closeCalendar(true);
@@ -1303,7 +1312,7 @@
       let result;
       if (state.pickedPaths.length) result = await api("/api/import", { method: "POST", data: { paths: state.pickedPaths, ...(target ? { meeting_id: target } : {}) } });
       else { const form = new FormData(); [...files].forEach(file => form.append("files", file)); if (target) form.append("meeting_id", String(target)); result = await api("/api/upload", { method: "POST", form }); }
-      $("#import-dialog").close(); notify(result?.message || "Записи переданы на импорт."); state.pickedPaths = []; $("#import-form").reset(); await loadMeetings(); await bootstrap(); if (state.route === "detail") await loadDetail();
+      $("#import-dialog").close(); notify(result?.message || "Записи переданы на импорт. Найдите их кнопкой «Входящие записи», откройте карточку и нажмите «Расшифровать локально»."); state.pickedPaths = []; $("#import-form").reset(); await loadMeetings(); await bootstrap(); if (state.route === "detail") await loadDetail();
     });
   });
   window.addEventListener("hashchange", applyRoute);

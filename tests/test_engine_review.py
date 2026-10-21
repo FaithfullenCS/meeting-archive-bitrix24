@@ -177,3 +177,27 @@ async def test_service_runs_manual_task_outside_automatic_window(monkeypatch, tm
     finally:
         await client.close()
         service.db.close()
+
+
+def test_official_checkpoint_is_available_and_not_counted_again(tmp_path):
+    engine = gigaam_layout(tmp_path)
+    (engine / "model/pytorch_model.bin").unlink()
+    size, _ = gigaam.OFFICIAL_MODEL_FILES["v3_e2e_rnnt.ckpt"]
+    sparse_file(engine / "model/v3_e2e_rnnt.ckpt", size)
+    assert installed(tmp_path, "gigaam") is True
+    plan = installation_plan(tmp_path, "cuda", [{"engine": "gigaam", "model": gigaam.MODEL_NAME}])
+    assert plan["weights_gb"] == 0
+    (engine / "model/v3_e2e_rnnt.ckpt").write_bytes(b"broken")
+    assert installed(tmp_path, "gigaam") is False
+
+
+def test_official_install_marker_ignores_leftover_broken_hf_weights(tmp_path):
+    engine = gigaam_layout(tmp_path)
+    (engine / "model/pytorch_model.bin").write_bytes(b"old broken download")
+    size, _ = gigaam.OFFICIAL_MODEL_FILES["v3_e2e_rnnt.ckpt"]
+    sparse_file(engine / "model/v3_e2e_rnnt.ckpt", size)
+    marker = engine / "ready.json"
+    ready = json.loads(marker.read_text("utf-8"))
+    ready["files"] = {name: {} for name in gigaam.OFFICIAL_MODEL_FILES}
+    marker.write_text(json.dumps(ready), encoding="utf-8")
+    assert installed(tmp_path, "gigaam") is True

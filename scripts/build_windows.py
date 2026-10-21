@@ -18,7 +18,7 @@ PUBLIC_DOCS = (
 def source_hashes(root: Path) -> dict[str, str]:
     paths = [root / "pyproject.toml", root / "requirements.lock", root / "requirements-dev.lock"]
     paths.extend(path for path in (root / "meeting_archive").rglob("*")
-                 if path.is_file() and path.suffix in {".py", ".js", ".css", ".html", ".lock", ".png", ".ico", ".svg", ".ps1"})
+                 if path.is_file() and path.suffix in {".py", ".js", ".css", ".html", ".lock", ".json", ".png", ".ico", ".svg", ".ps1"})
     paths.extend(path for path in (root / "skills").rglob("*")
                  if path.is_file() and path.suffix in {".md", ".yaml"})
     paths.extend([root / "uninstall.cmd", root / "scripts/reset-profile.ps1", root / "scripts/uninstall-ui.ps1"])

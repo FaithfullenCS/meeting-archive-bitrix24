@@ -570,7 +570,8 @@ class ModuleManager:
             code = await process.wait()
             await drain
             if code or not result:
-                raise RuntimeError(error or "Обработка остановлена или завершилась с ошибкой")
+                raise RuntimeError(error or (f"Обработчик аварийно завершился (код Windows 0x{code & 0xffffffff:08X})"
+                                            if code else "Обработчик завершился без результата"))
             return result
         finally:
             if process.returncode is None:
