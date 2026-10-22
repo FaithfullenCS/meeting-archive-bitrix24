@@ -5,8 +5,14 @@ import re
 
 def main():
     root = Path(__file__).resolve().parents[1] / "meeting_archive"
+    audio_lock = (root / "resources/worker-audio.lock").read_text("utf-8")
+    audio_hashes = set(re.findall(r"--hash=sha256:([a-f0-9]{64})", audio_lock))
+    assert "av==18.1.0" in audio_lock and audio_hashes
     for profile, torch_suffix in (("cpu", "+cpu"), ("cuda", "+cu128"), ("cuda126", "+cu126")):
         text = (root / f"resources/worker-{profile}.lock").read_text(encoding="utf-8")
+        audio = re.search(r"(?m)^av==[^\n]+\n(?:[ \t].*\n)*", text)
+        assert audio and audio.group().startswith("av==18.1.0 ")
+        assert set(re.findall(r"--hash=sha256:([a-f0-9]{64})", audio.group())) == audio_hashes
         assert f"torch==2.7.1{torch_suffix}" in text
         assert f"torchaudio==2.7.1{torch_suffix}" in text
         assert "https://download.pytorch.org/whl/" in text
@@ -24,7 +30,7 @@ def main():
     assert (root / "static/icon.png").is_file()
     assert (root / "static/icon.svg").is_file()
     assert (root / "static/favicon.ico").is_file()
-    for name in ("worker-native.lock", "worker-gigaam-addons.lock"):
+    for name in ("worker-native.lock", "worker-gigaam-addons.lock", "worker-audio.lock"):
         text = (root / "resources" / name).read_text("utf-8")
         requirements = re.split(r"\n(?=[a-zA-Z0-9])", text)
         for requirement in requirements:

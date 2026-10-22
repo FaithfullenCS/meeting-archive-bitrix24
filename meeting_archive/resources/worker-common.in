@@ -1,5 +1,7 @@
 # Recompile with scripts/lock-workers.ps1. No models or credentials belong here.
 faster-whisper==1.1.1
+# PyAV 19 removed metadata_errors, still passed by faster-whisper 1.1.1.
+-r worker-audio.lock
 ctranslate2==4.8.2
 pyannote.audio==3.3.2
 ffmpeg-python==0.2.0

@@ -464,3 +464,41 @@ async def test_transcribe_waits_for_resource_discovery(tmp_path, vault, monkeypa
     monkeypatch.setattr(module, 'borrowed_environment', borrowed)
     with pytest.raises(ValueError, match='discovery reached'):
         await module.transcribe(1, {'settings': {'engine': 'whisper', 'model': 'large-v3'}}, '', lambda *_: None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("av_version,whisper_version,reused,repair", [
+    ("19.0.0", "1.1.1", False, True),
+    ("19.0.1", "1.1.1", False, True),
+    ("18.1.0", "1.1.1", False, False),
+    ("19.0.0", "1.1.1", True, False),
+    ("19.0.0", "2.0.0", False, False),
+])
+async def test_whisper_audio_repairs_only_known_owned_pair(tmp_path, vault, monkeypatch,
+                                                         av_version, whisper_version, reused, repair):
+    manager = ModuleManager(tmp_path, vault)
+    site = manager.root / "venv/Lib/site-packages"
+    for name, version in (("av", av_version), ("faster-whisper", whisper_version)):
+        info = site / (name.replace("-", "_") + "-" + version + ".dist-info")
+        info.mkdir(parents=True)
+        (info / "METADATA").write_text(f"Name: {name}\nVersion: {version}\n", encoding="utf-8")
+    (manager.root / "ready.json").write_text(json.dumps({"reused": reused}))
+    calls = []
+
+    async def command(args, _progress, **kwargs):
+        calls.append((args, kwargs))
+
+    monkeypatch.setattr(manager, "command", command)
+    monkeypatch.setattr(manager, "uv", lambda: Path("uv.exe"))
+    python = str(manager.root / "venv/Scripts/python.exe")
+    await manager.ensure_whisper_audio(python, {"synthetic": "environment"}, lambda *_: None)
+    assert bool(calls) is repair
+    if repair:
+        args, options = calls[0]
+        assert args[1:3] == ["pip", "install"]
+        assert "--no-deps" in args and "--require-hashes" in args
+        assert args[-1].endswith("worker-audio.lock")
+        assert options["environment"] == {"synthetic": "environment"}
+    calls.clear()
+    await manager.ensure_whisper_audio(str(tmp_path / "neighbor/python.exe"), {}, lambda *_: None)
+    assert not calls

@@ -50,6 +50,14 @@ jobs:
           }
           .venv/Scripts/python.exe scripts/check_resources.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify actual Whisper audio dependencies without models
+        run: |
+          uv venv --python .venv/Scripts/python.exe .work/audio-smoke
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          uv pip install --python .work/audio-smoke/Scripts/python.exe --constraint meeting_archive/resources/worker-cpu.lock faster-whisper==1.1.1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .work/audio-smoke/Scripts/python.exe -B scripts/smoke_worker_audio.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build standalone Windows app
         run: .venv/Scripts/python.exe -X utf8 scripts/build_windows.py
       - name: Verify Internet-marked CLR libraries without system Python on PATH

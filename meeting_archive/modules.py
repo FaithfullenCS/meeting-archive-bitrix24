@@ -44,6 +44,7 @@ class ModuleManager:
         self.discovered = {"sources": [], "cached_models": []}
         self.discovery_at = 0.0
         self.discovery_lock = asyncio.Lock()
+        self.audio_repair_lock = asyncio.Lock()
 
     async def discover(self, *, refresh=False):
         async with self.discovery_lock:
@@ -523,6 +524,25 @@ class ModuleManager:
         if support["requires_install"]:
             raise ValueError(support["reason"])
 
+    async def ensure_whisper_audio(self, python: str, env: dict, progress):
+        """Repair the known incompatible pair only in our independent runtime."""
+        from importlib.metadata import distributions
+        from .engine_catalog import read_marker
+        own_python = self.root / "venv/Scripts/python.exe"
+        if Path(python).resolve() != own_python.resolve() or read_marker(self.root / "ready.json").get("reused"):
+            return
+        async with self.audio_repair_lock:
+            site = self.root / "venv/Lib/site-packages"
+            versions = {d.metadata.get("Name", "").lower().replace("_", "-"): d.version
+                        for d in distributions(path=[str(site)])}
+            av_major = versions.get("av", "").split(".")[0]
+            if versions.get("faster-whisper") != "1.1.1" or not av_major.isdigit() or int(av_major) < 19:
+                return
+            progress(0, "Восстановление совместимости чтения аудио")
+            await self.command([str(self.uv()), "pip", "install", "--python", python, "--no-deps",
+                                "--require-hashes", "--no-cache", "-r", str(PACKAGE / "resources/worker-audio.lock")],
+                               progress, stage="Совместимость чтения аудио", environment=env)
+
     async def transcribe(self, job_id: int, job: dict, external: str, progress) -> dict:
         settings = job.get("settings", {})
         if not external and settings.get("engine", "whisper") == "whisper":
@@ -540,6 +560,8 @@ class ModuleManager:
             env = self.env(bool(external))
         if external:
             env["MEETING_ARCHIVE_EXTERNAL_ENGINE"] = str(Path(external).resolve())
+        if settings.get("engine", "whisper") == "whisper":
+            await self.ensure_whisper_audio(python, env, progress)
         process = await asyncio.create_subprocess_exec(python, "-B", str(PACKAGE / "worker/entry.py"),
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             env=env, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
