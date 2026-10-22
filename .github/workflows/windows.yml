@@ -54,7 +54,7 @@ jobs:
         run: |
           uv venv --python .venv/Scripts/python.exe .work/audio-smoke
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          uv pip install --python .work/audio-smoke/Scripts/python.exe --constraint meeting_archive/resources/worker-cpu.lock --index-strategy unsafe-best-match faster-whisper==1.1.1
+          uv pip install --python .work/audio-smoke/Scripts/python.exe --constraint meeting_archive/resources/worker-cpu.lock --index-strategy unsafe-best-match faster-whisper==1.1.1 requests
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .work/audio-smoke/Scripts/python.exe -B scripts/smoke_worker_audio.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
