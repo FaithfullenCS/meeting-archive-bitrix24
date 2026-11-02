@@ -179,6 +179,8 @@ def create_app(service: Service, launch_token: str | None = None, *, manage_life
     pending_oauth: dict = {}
     resource_sources: dict = {}
     pick_lock = asyncio.Lock()
+    from .bootstrap_status import BootstrapModelStatus
+    model_status = BootstrapModelStatus(service)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -258,6 +260,7 @@ def create_app(service: Service, launch_token: str | None = None, *, manage_life
             if job["state"] == "queued" and job["automatic"] and not window["allowed"]:
                 job.update(schedule_wait=True, message=window["label"], schedule_next_at=window["next_at"])
         saved = service.vault.read()
+        models = model_status.snapshot(jobs)
         return {"csrf": csrf, "settings": asdict(service.settings), "connected": service.connected(),
                 "recovery": service.recovery_status, "integrity": getattr(service, "integrity_status", {}),
                 "updates": service.updates.status(), "activation": service.notifications.activation,
@@ -271,12 +274,12 @@ def create_app(service: Service, launch_token: str | None = None, *, manage_life
                                   "hf_token_saved": bool(saved.get("hf_token")),
                                   "client_secret_saved": bool(saved.get("client_secret")),
                                   "client_id": saved.get("client_id", "")},
-                "automation_windows": windows, "local_automation": await asyncio.to_thread(service.automation_status),
+                "automation_windows": windows, "local_automation": models["local_automation"],
                 "automation_timing": service.automation_timing(),
                 "catalogue": {**service.catalogue, "total": service.db.rows("SELECT COUNT(*) AS total FROM meetings")[0]["total"]}, "auth_error": service.auth_error, "jobs": jobs,
-                "module": await asyncio.to_thread(service.module.status), "watch_error": service.db.get_state("watch_error"),
+                "module": models["module"], "watch_error": service.db.get_state("watch_error"),
                 "hf_verified": bool(service.db.get_state("hf_verified")), "model_test": service.db.get_state("model_test"),
-                "transcription": await asyncio.to_thread(service.transcription_status)}
+                "transcription": models["transcription"]}
 
     @app.post("/api/desktop/ready")
     async def desktop_ready():

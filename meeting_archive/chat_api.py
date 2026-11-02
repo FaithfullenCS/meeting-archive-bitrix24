@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import zipfile
 
 from fastapi import Request
@@ -15,6 +16,15 @@ from .chat_queue import queue_view, queue_action, cancel_backlog, cancel_selecte
 
 def register_chat_api(app, service):
     engine = service.chat_archive
+
+    def attachment(chat, id):
+        store = engine.store()
+        item = store.file(chat, id)
+        folder = store.chat_folder(chat).resolve()
+        path = (folder / item.get("path", "")).resolve()
+        if not path.is_relative_to(folder / "attachments") or not path.is_file():
+            raise ValueError("Вложение ещё не скачано или файл перемещён")
+        return item, path
 
     @app.post("/api/chat-archive/materials/plan")
     async def materials_plan(request: Request):
@@ -207,14 +217,29 @@ def register_chat_api(app, service):
 
     @app.get("/api/chat-archive/chats/{chat}/files/{id}")
     async def file(chat: int, id: int):
-        store = engine.store()
-        item = store.file(chat, id)
-        folder = store.chat_folder(chat).resolve()
-        path = (folder / item.get("path", "")).resolve()
-        if not path.is_relative_to(folder / "attachments") or not path.is_file():
-            raise ValueError("Вложение ещё не скачано или файл перемещён")
+        item, path = attachment(chat, id)
         # Download arbitrary source files, never execute HTML/SVG on the local origin.
         return FileResponse(path, media_type="application/octet-stream", filename=item["name"], content_disposition_type="attachment")
+
+    @app.get("/api/chat-archive/chats/{chat}/files/{id}/status")
+    async def file_status(chat: int, id: int):
+        item = engine.store().file(chat, id)
+        return {key: item.get(key) for key in ("id", "name", "size", "category", "state", "error", "path", "contents")}
+
+    @app.post("/api/chat-archive/chats/{chat}/files/{id}/open")
+    async def open_file(chat: int, id: int):
+        _, path = attachment(chat, id)
+        await asyncio.to_thread(os.startfile, path)
+        return {"ok": True}
+
+    @app.get("/api/chat-archive/chats/{chat}/files/{id}/preview")
+    async def preview_file(chat: int, id: int):
+        item, path = attachment(chat, id)
+        with path.open("rb") as stream:
+            signature = stream.read(8)
+        if not item["name"].lower().endswith(".png") or signature != b"\x89PNG\r\n\x1a\n":
+            raise ValueError("Предпросмотр доступен только для файлов PNG")
+        return FileResponse(path, media_type="image/png", content_disposition_type="inline")
 
     @app.post("/api/chat-archive/export")
     async def export(request: Request):

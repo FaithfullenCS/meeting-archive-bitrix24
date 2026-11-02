@@ -529,9 +529,9 @@ class Service:
         except (ValueError, OSError) as exc:
             return {"ready": False, "reason": str(exc)}
 
-    def automation_status(self):
+    def automation_status(self, readiness=None):
         pending = self.db.rows("SELECT key,value FROM state WHERE key LIKE 'auto_local_pending:%' AND value!='[]'")
-        readiness = self.transcription_status()
+        readiness = readiness if readiness is not None else self.transcription_status()
         window = window_status(self.settings.local_schedule)
         reason = ("Локальная авторасшифровка выключена" if not self.settings.auto_local else
                   "Автоматизация приостановлена" if self.settings.paused else

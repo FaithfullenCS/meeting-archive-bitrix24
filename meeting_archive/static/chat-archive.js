@@ -7,6 +7,7 @@ window.ChatArchiveUI = {
     const coverage = {pending: "Ожидает сохранения", backfilling: "Догружается…", source_boundary: "Доступная история сохранена", tariff_limited: "История ограничена тарифом", access_lost: "Потеря доступа", error: "Ошибка — повторим позже", boundary_unverified: "Граница не подтверждена", verifying_boundary: "Проверяется граница"};
     const files = {not_saved: "Не скачан", queued: "В очереди", running: "Скачивается…", saved: "Скачан", unavailable: "Недоступен", error: "Ошибка", missing: "Файл перемещён", size_limited: "Превышен лимит размера"};
     const fileIcons = {images: "image", documents: "file", audio: "music", video: "video", other: "file"};
+    const trackedFiles = new Set();
     const avatar = name => `<span class="ca-avatar" aria-hidden="true">${esc(String(name || "?").split(/\s+/).filter(Boolean).slice(0,2).map(n => n[0]).join("").toUpperCase())}</span>`;
     const selected = selector => [...$(selector).selectedOptions].map(option => Number(option.value));
     function values() {
@@ -77,10 +78,14 @@ window.ChatArchiveUI = {
       $("#ca-coverage").hidden = false;
       $("#ca-coverage").innerHTML = `${icon("info")} ${esc(coverage[chat.coverage] || chat.coverage)} · ${esc(first)} — ${esc(last)} · Проверено: ${esc(chat.last_checked ? dateString(chat.last_checked) : "ещё не проверено")}${chat.history_since ? `<br>Граница сбора: ${esc(chat.history_since)}` : ""}${chat.event_gap ? "<br>Пропущены уведомления об изменениях: промежуточные редакции могут отсутствовать." : ""}${(chat.limitations || []).map(t => `<br>${esc(t)}`).join("")}${chat.error ? `<br>${esc(chat.error)}` : ""}${chat.meeting_ids?.length ? `<br>Совещания: ${chat.meeting_ids.map(id => `<a href="#meeting/${id}">№${id}</a>`).join(", ")}` : ""}`;
     }
+    function renderAttachment(f, chat) {
+      const preview=f.path && /\.png$/i.test(f.name || "") ? `<button type="button" class="ca-image-preview" data-ca-preview="${Number(f.id)}" data-file-chat="${Number(chat)}" aria-label="Увеличить изображение ${esc(f.name)}"><img src="/api/chat-archive/chats/${Number(chat)}/files/${Number(f.id)}/preview" alt="${esc(f.name)}" loading="lazy"></button>` : "";
+      return `<div class="ca-attachment" data-ca-attachment="${Number(f.id)}" data-attachment-chat="${Number(chat)}">${preview}<div class="ca-file">${icon(fileIcons[f.category] || "file")}<div class="ca-file-info"><strong>${esc(f.name)}</strong><small>${f.size ? `${(f.size/1024).toLocaleString("ru",{maximumFractionDigits:1})} КБ · ` : ""}${esc(files[f.state] || f.state)}${f.error ? " · " + esc(f.error) : ""}</small></div>${f.path ? `<button type="button" class="button secondary" data-ca-open="${Number(f.id)}" data-file-chat="${Number(chat)}">Открыть</button>` : ""}${f.path || f.contents?.length ? `<button type="button" class="button quiet ca-file-delete" data-ca-remove-file="${Number(f.id)}" data-file-chat="${Number(chat)}" aria-label="Удалить сохранённый файл ${esc(f.name)}">${icon("trash")}</button>` : ""}<button type="button" class="button ${f.state === "saved" ? "quiet" : "secondary"}" data-ca-file="${Number(f.id)}" data-file-chat="${Number(chat)}"${["queued","running"].includes(f.state) ? " disabled" : ""}>${icon("download")}<span>${f.state === "saved" ? "Обновить файл" : "Скачать"}</span></button></div></div>`;
+    }
     function renderMessage(m) {
       const name = m.author || (m.system ? "Bitrix24" : `Автор ID ${m.author_id}`);
       const links = (m.relations || []).map(link => `<div class="ca-relation ${link.kind}"><div class="ca-relation-title">${icon(link.kind === "forward" ? "forward" : "reply")}<strong>${link.kind === "forward" ? "Переслано от" : link.kind === "reply" ? "Ответ" : "Цитата"} ${esc(link.author || (link.author_id ? `ID ${link.author_id}` : "· автор не предоставлен"))}</strong></div><small class="muted">Чат ${link.chat_id} · сообщение ${link.message_id}${link.date ? " · " + esc(dateString(link.date)) : ""}</small>${link.excerpt ? `<p>${esc(link.excerpt)}</p>` : ""}<button type="button" class="ca-source-link" data-ca-source="${link.message_id}" data-source-chat="${link.chat_id}" data-owner-chat="${m.chat_id}">К исходному</button></div>`).join("");
-      const attachments = (m.files || []).map(f => `<div class="ca-file">${icon(fileIcons[f.category] || "file")}<div class="ca-file-info"><strong>${esc(f.name)}</strong><small>${f.size ? `${(f.size/1024).toLocaleString("ru",{maximumFractionDigits:1})} КБ · ` : ""}${esc(files[f.state] || f.state)}${f.error ? " · " + esc(f.error) : ""}</small></div>${f.path ? `<a class="button secondary" href="/api/chat-archive/chats/${m.chat_id}/files/${f.id}">Открыть</a>` : ""}${f.path || f.contents?.length ? `<button type="button" class="button quiet ca-file-delete" data-ca-remove-file="${f.id}" data-file-chat="${m.chat_id}" aria-label="Удалить сохранённый файл ${esc(f.name)}">${icon("trash")}</button>` : ""}<button type="button" class="button ${f.state === "saved" ? "quiet" : "secondary"}" data-ca-file="${f.id}" data-file-chat="${m.chat_id}"${["queued","running"].includes(f.state) ? " disabled" : ""}>${icon("download")}<span>${f.state === "saved" ? "Обновить файл" : "Скачать"}</span></button></div>`).join("");
+      const attachments = (m.files || []).map(f => renderAttachment(f, m.chat_id)).join("");
       const counters = m.reactions?.reactionCounters || {};
       const reactions = Object.keys(counters).length ? `<div class="ca-reactions">Реакции: ${Object.entries(counters).map(([type,count]) => `${esc(type)} · ${Number(count)}`).join(" · ")}</div>` : "";
       const body = `${links}<div class="ca-body">${m.html || esc(m.text).replace(/\n/g,"<br>")}</div>${attachments}${reactions}`;
@@ -91,7 +96,7 @@ window.ChatArchiveUI = {
       let day = "";
       $("#ca-messages").innerHTML = s.items.length ? [...s.items].reverse().map(m => { const current = m.date?.slice(0,10) || "Дата не предоставлена"; const separator = day !== current ? `<div class="ca-day">${esc(current)}</div>` : ""; day = current; return separator + renderMessage(m); }).join("") : '<div class="ca-empty"><h3>Сообщения не найдены</h3><p>Измените фильтры или дождитесь сохранения истории.</p></div>';
       $("#ca-message-count").textContent = `${s.items.length.toLocaleString("ru")} из ${s.total.toLocaleString("ru")} · Только просмотр`;
-
+      for (const m of s.items) for (const f of m.files || []) if (["queued","running"].includes(f.state)) trackAttachment(Number(m.chat_id),Number(f.id));
     }
     function updatePeopleOverflow() {
       const list=$("#ca-thread-people-list"), toggle=$("#ca-people-toggle"); if (!list || !toggle) return;
@@ -130,7 +135,7 @@ window.ChatArchiveUI = {
         populateSettings(); renderChats();
         const peopleKey=JSON.stringify([s.account,result.messages,s.chats.map(c=>[c.id,c.participants_at,c.participants?.length])]);
         if (load && (s.peopleKey!==peopleKey || Date.now()-(s.peopleAt || 0)>30000)) { await loadPeople(); s.peopleKey=peopleKey; s.peopleAt=Date.now(); }
-        const scroll=$("#ca-messages"), readingOlder=scroll.scrollHeight-scroll.scrollTop-scroll.clientHeight>100;
+        const scroll=$("#ca-messages"), readingOlder=scroll.scrollHeight-scroll.scrollTop-scroll.clientHeight>2;
         const keepView=s.items.length && (readingOlder || s.items.length>50 || scroll.querySelector("details[open]"));
         if (load && (s.chat || s.items.length || Object.values(values()).some(Boolean)) && (force || !keepView)) await loadMessages();
         else renderHeading();
@@ -185,11 +190,38 @@ window.ChatArchiveUI = {
     });
     $("#ca-delete-selected").onclick=e=>action(e.currentTarget,()=>openMaterialDelete([...s.selected],"chat"));
     $("#ca-delete-current").onclick=e=>action(e.currentTarget,()=>openMaterialDelete([s.chat],"chat"));
+    function trackAttachment(chat, id) {
+      const account=s.account, key=`${account}:${chat}:${id}`;
+      if (trackedFiles.has(key)) return;
+      trackedFiles.add(key);
+      async function update() {
+        if (account!==s.account || !document.querySelector(`[data-ca-attachment="${id}"][data-attachment-chat="${chat}"]`)) { trackedFiles.delete(key); return; }
+        try {
+          const item=await api(`/api/chat-archive/chats/${chat}/files/${id}/status`);
+          if (account!==s.account) { trackedFiles.delete(key); return; }
+          for (const m of s.items) if (m.chat_id===chat) for (const f of m.files || []) if (f.id===id) Object.assign(f,item);
+          const scroll=$("#ca-messages");
+          document.querySelectorAll(`[data-ca-attachment="${id}"][data-attachment-chat="${chat}"]`).forEach(node=>{
+            const above=node.getBoundingClientRect().bottom<=scroll.getBoundingClientRect().top, height=scroll.scrollHeight, top=scroll.scrollTop;
+            node.outerHTML=renderAttachment(item,chat);
+            if (above) scroll.scrollTop=top+scroll.scrollHeight-height;
+          });
+          if (["queued","running"].includes(item.state)) setTimeout(update,2000);
+          else trackedFiles.delete(key);
+        } catch(error) { trackedFiles.delete(key); showError(error.message); }
+      }
+      update();
+    }
+    $("#ca-image-close").onclick=()=>$("#ca-image-dialog").close();
+    $("#ca-image-dialog").addEventListener("close",()=>{ $("#ca-image-full").removeAttribute("src"); });
     $("#ca-messages").addEventListener("click", e=> {
       const file=e.target.closest("[data-ca-file]"), source=e.target.closest("[data-ca-source]"), chat=e.target.closest("[data-ca-chat]");
       const remove=e.target.closest("[data-ca-remove-file]");
       if(remove) action(remove,()=>openMaterialDelete([Number(remove.dataset.fileChat)],"chat",["attachments/file-"+remove.dataset.caRemoveFile]));
-      if(file) action(file,async()=>{ await api(`/api/chat-archive/chats/${file.dataset.fileChat}/files/${file.dataset.caFile}/download`,{method:"POST"}); notify("Вложение поставлено в очередь."); await loadMessages(); });
+      if(file) action(file,async()=>{ await api(`/api/chat-archive/chats/${file.dataset.fileChat}/files/${file.dataset.caFile}/download`,{method:"POST"}); notify("Вложение поставлено в очередь."); trackAttachment(Number(file.dataset.fileChat),Number(file.dataset.caFile)); });
+      const open=e.target.closest("[data-ca-open]"), preview=e.target.closest("[data-ca-preview]");
+      if(open) action(open,()=>api(`/api/chat-archive/chats/${open.dataset.fileChat}/files/${open.dataset.caOpen}/open`,{method:"POST"}));
+      if(preview) { const image=$("#ca-image-full"), thumb=preview.querySelector("img"); image.src=thumb.src; image.alt=thumb.alt; $("#ca-image-dialog").showModal(); }
       if(chat) { const owner=chat.closest("article"); const id=Number(owner?.id.split("-").pop()) || 0; resetForContext(); choose(chat.dataset.caChat,id).catch(e=>showError(e.message)); }
       if(source) action(source,async()=>{
         const sourceChat=Number(source.dataset.sourceChat), id=Number(source.dataset.caSource);

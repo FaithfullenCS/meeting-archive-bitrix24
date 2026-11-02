@@ -289,6 +289,45 @@ def seed(service, id=101):
     return store
 
 
+async def test_saved_chat_attachment_opens_locally_and_png_preview_is_restricted(chat_service, monkeypatch):
+    store = seed(chat_service)
+    store.save_page(101, {"messages": [message(1, fileIds=[77, 78])], "files": [
+        {"id": 77, "name": "image.png", "size": 8}, {"id": 78, "name": "document.html", "size": 8}]})
+    folder = store.chat_folder(101)
+    for id, name, content in [(77, "image.png", b"\x89PNG\r\n\x1a\nsynthetic"), (78, "document.html", b"<script>")]:
+        path = folder / "attachments" / f"file-{id}" / name
+        path.parent.mkdir(parents=True)
+        path.write_bytes(content)
+        data = json.loads(store.db.rows("SELECT data FROM ca_files WHERE account=? AND chat=? AND id=?", (store.account, 101, id))[0]["data"])
+        data["path"] = path.relative_to(folder).as_posix()
+        store.file_update(101, id, data=json.dumps(data), state="saved")
+    opened = []
+    monkeypatch.setattr("os.startfile", lambda path: opened.append(Path(path)))
+    app = create_app(chat_service, launch_token="synthetic-attachment", manage_lifecycle=False)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app, raise_app_exceptions=False), base_url="http://127.0.0.1:8765") as client:
+        await client.get("/?launch=synthetic-attachment")
+        csrf = (await client.get("/api/bootstrap")).json()["csrf"]
+        assert (await client.post("/api/chat-archive/chats/101/files/77/open")).status_code == 403
+        response = await client.post("/api/chat-archive/chats/101/files/77/open", headers={"X-CSRF-Token": csrf})
+        assert response.status_code == 200 and opened == [folder / "attachments/file-77/image.png"]
+        preview = await client.get("/api/chat-archive/chats/101/files/77/preview")
+        assert preview.status_code == 200 and preview.headers["content-type"] == "image/png"
+        assert preview.content.startswith(b"\x89PNG\r\n\x1a\n")
+        assert (await client.get("/api/chat-archive/chats/101/files/78/preview")).status_code == 400
+        image_path = folder / "attachments/file-77/image.png"
+        image_path.write_bytes(b"<script>not a PNG</script>")
+        assert (await client.get("/api/chat-archive/chats/101/files/77/preview")).status_code == 400
+        image_path.unlink()
+        assert (await client.post("/api/chat-archive/chats/101/files/77/open", headers={"X-CSRF-Token": csrf})).status_code == 400
+        assert len(opened) == 1
+        data = json.loads(store.db.rows("SELECT data FROM ca_files WHERE account=? AND chat=? AND id=?", (store.account, 101, 77))[0]["data"])
+        data["path"] = "../outside.txt"
+        (folder.parent / "outside.txt").write_text("outside", encoding="utf8")
+        store.file_update(101, 77, data=json.dumps(data))
+        assert (await client.post("/api/chat-archive/chats/101/files/77/open", headers={"X-CSRF-Token": csrf})).status_code == 400
+        assert len(opened) == 1
+
+
 def cleanup_seed(service):
     store = seed(service)
     service.settings.chat_download_documents = True
