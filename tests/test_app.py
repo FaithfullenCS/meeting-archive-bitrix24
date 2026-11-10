@@ -19,7 +19,7 @@ PORTAL = "synthetic.bitrix24.ru"
 
 @pytest.fixture
 def synthetic_relay(monkeypatch):
-    async def probe(base, portal):
+    async def probe(base, portal, loopback=None):
         assert base == RELAY
         assert portal == PORTAL
         return {"allowed_portals": [PORTAL]}

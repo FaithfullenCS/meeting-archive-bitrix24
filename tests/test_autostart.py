@@ -34,7 +34,8 @@ def test_windows_run_starts_only_tray_and_creates_window_on_request(tmp_path, mo
     monkeypatch.setattr(launcher, "single_instance", lambda _: (
         SimpleNamespace(CloseHandle=lambda _: None), 1, False))
     listener = SimpleNamespace(setsockopt=lambda *a: None, bind=lambda *a: None,
-                               listen=lambda *a: None, close=lambda: None)
+                               listen=lambda *a: None, getsockname=lambda: ("127.0.0.1", 8765),
+                               close=lambda: None)
     monkeypatch.setattr(launcher.socket, "socket", lambda *a: listener)
     monkeypatch.setattr(service, "Service", lambda _: SimpleNamespace(
         updates=SimpleNamespace(), notifications=SimpleNamespace()))
@@ -128,6 +129,7 @@ def test_failed_server_start_is_bounded_and_records_redacted_cause(tmp_path, mon
         SimpleNamespace(CloseHandle=lambda _: closed.append("mutex")), 1, False))
     monkeypatch.setattr(launcher.socket, "socket", lambda *a: SimpleNamespace(
         setsockopt=lambda *a: None, bind=lambda *a: None, listen=lambda *a: None,
+        getsockname=lambda: ("127.0.0.1", 8765),
         close=lambda: closed.append("socket")))
     monkeypatch.setattr(service, "Service", lambda _: SimpleNamespace(
         updates=SimpleNamespace(), notifications=SimpleNamespace(), vault=vault,
