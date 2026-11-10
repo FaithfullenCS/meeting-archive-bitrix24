@@ -50,10 +50,16 @@ def exercise(window, home, url, shutdown, tray, *, startup_checks=()):
         wait(lambda: not native.Visible and not window.closed.is_set(), "cross-hides-without-exit")
         import httpx
         from urllib.parse import parse_qs, urlsplit
-        token = parse_qs(urlsplit(url).query)["launch"][0]
+        parsed_url = urlsplit(url)
+        port = parsed_url.port
+        if parsed_url.scheme != "http" or parsed_url.hostname not in {"localhost", "127.0.0.1"} or not port:
+            raise AssertionError("Desktop smoke requires the local application address")
+        token = parse_qs(parsed_url.query)["launch"][0]
+        api_base = f"http://127.0.0.1:{port}"
+        browser_base = f"http://localhost:{port}"
         with httpx.Client(trust_env=False, follow_redirects=True) as client:
             for _ in range(5):
-                client.post("http://127.0.0.1:8765/api/desktop/open", headers={"x-desktop-token": token}).raise_for_status()
+                client.post(api_base + "/api/desktop/open", headers={"x-desktop-token": token}).raise_for_status()
             wait(lambda: native.Visible, "repeated-open-restores")
             native_count = window.window.evaluate_js("Boolean(window.pywebview)")
             assert native_count and int(native.Handle.ToInt64()) == handle
@@ -73,7 +79,7 @@ def exercise(window, home, url, shutdown, tray, *, startup_checks=()):
             wait(lambda: window.window.evaluate_js("!document.querySelector('#page-settings').hidden"), "notification-activation-settings")
             assert int(native.Handle.ToInt64()) == handle
             client.get(url).raise_for_status()
-            boot = client.get("http://localhost:8765/api/bootstrap").json()
+            boot = client.get(browser_base + "/api/bootstrap").json()
             assert "csrf" in boot
         report["ok"] = True
         time.sleep(5)  # Let an update helper independently observe GUI readiness.

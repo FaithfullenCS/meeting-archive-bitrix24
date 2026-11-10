@@ -27,6 +27,7 @@ class RelayConfig:
     public_host: str
     allowed_portals: frozenset[str]
     base_path: str = ""
+    loopback_port: int = 8765
 
     def __post_init__(self):
         if not HOST_PATTERN.fullmatch(self.public_host):
@@ -35,6 +36,8 @@ class RelayConfig:
             raise ValueError("ALLOWED_PORTALS must explicitly list supported cloud Bitrix24 hostnames")
         if not PATH_PATTERN.fullmatch(self.base_path):
             raise ValueError("RELAY_BASE_PATH must be empty or an absolute path without trailing slash")
+        if isinstance(self.loopback_port, bool) or not 1024 <= self.loopback_port <= 65535:
+            raise ValueError("LOCAL_CALLBACK_PORT must be between 1024 and 65535")
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None):
@@ -43,7 +46,12 @@ class RelayConfig:
             public_host=values.get("PUBLIC_HOST", "").strip(),
             allowed_portals=frozenset(p.strip() for p in values.get("ALLOWED_PORTALS", "").split(",") if p.strip()),
             base_path=values.get("RELAY_BASE_PATH", "").strip(),
+            loopback_port=int(values.get("LOCAL_CALLBACK_PORT", "8765").strip()),
         )
+
+    @property
+    def loopback(self):
+        return f"http://127.0.0.1:{self.loopback_port}/oauth/callback"
 
     def path(self, endpoint: str):
         return self.base_path + "/oauth/" + endpoint
@@ -94,7 +102,7 @@ def create_relay(config: RelayConfig):
         return JSONResponse({
             "protocol": PROTOCOL, "version": PROTOCOL_VERSION,
             "callback_path": config.path("callback"), "install_path": config.path("install"),
-            "loopback": LOOPBACK, "credentials": "desktop-only",
+            "loopback": config.loopback, "credentials": "desktop-only",
             "allowed_portals": sorted(config.allowed_portals),
         })
 
@@ -159,6 +167,6 @@ def create_relay(config: RelayConfig):
         # The desktop validates the exact one-use state, portal, scopes and the
         # token exchange result. This relay has no secret with which to redeem code.
         forwarded = {key: params[key] for key in ("code", "state", "domain", "member_id", "scope")}
-        return RedirectResponse(LOOPBACK + "?" + urlencode(forwarded), status_code=303)
+        return RedirectResponse(config.loopback + "?" + urlencode(forwarded), status_code=303)
 
     return app

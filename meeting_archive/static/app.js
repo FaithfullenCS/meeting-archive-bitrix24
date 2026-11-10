@@ -428,6 +428,8 @@
   function renderBootstrap(data) {
     $("#chat-filter-status").textContent = data.chat_warning || "";
     $("#chat-filter-status").hidden = !data.chat_warning;
+    if (data.oauth_local_callback) $("#oauth-local-callback").textContent = data.oauth_local_callback;
+    if (data.oauth_relay_loopback) $("#oauth-relay-loopback").textContent = data.oauth_relay_loopback;
     state.bootstrap = data; state.csrf = data.csrf || state.csrf;
     renderRecovery(data);
     updateDownloadButtons();
@@ -1262,7 +1264,7 @@
   }
   $("#oauth-tab").onclick = () => authTab("oauth"); $("#webhook-tab").onclick = () => authTab("webhook");
   [$("#oauth-tab"), $("#webhook-tab")].forEach(tab => tab.addEventListener("keydown", event => { if (["ArrowLeft", "ArrowRight"].includes(event.key)) { event.preventDefault(); const next = tab.id === "oauth-tab" ? $("#webhook-tab") : $("#oauth-tab"); next.click(); next.focus(); } }));
-  $("#copy-local-callback").onclick = event => action(event.currentTarget, async () => { await navigator.clipboard.writeText("http://localhost:8765/callback"); notify("Адрес скопирован."); });
+  $("#copy-local-callback").onclick = event => action(event.currentTarget, async () => { await navigator.clipboard.writeText($("#oauth-local-callback").textContent); notify("Адрес скопирован."); });
   ["callback", "install"].forEach(kind => { $(`#copy-${kind}`).onclick = event => action(event.currentTarget, async () => { const value = $(`#oauth-${kind}`).textContent; if (!value.startsWith("https://")) throw new Error("Сначала укажите свой HTTPS-обработчик."); await navigator.clipboard.writeText(value); notify("Адрес скопирован."); }); });
   ["input", "change"].forEach(type => $("#oauth-form").addEventListener(type, updateOauthFlow));
   $("#oauth-secret-replace").onclick = () => { state.secretEditing.client = true; renderSecrets(); $("#oauth-form").elements.client_secret.focus(); };

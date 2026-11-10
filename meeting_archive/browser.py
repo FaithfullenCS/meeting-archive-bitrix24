@@ -6,8 +6,9 @@ from urllib.parse import urlsplit
 
 
 class ArchiveWindow:
-    def __init__(self, home, *, on_ready=None, hide_on_close=True):
+    def __init__(self, home, *, port=8765, on_ready=None, hide_on_close=True):
         self.home = Path(home)
+        self.port = port
         self.window = None
         self.shown = threading.Event()
         self.loaded = False
@@ -35,7 +36,7 @@ class ArchiveWindow:
         try:
             page = urlsplit(self.window.get_current_url() or "")
             self.loaded = (page.scheme == "http" and page.hostname in {"localhost", "127.0.0.1"}
-                           and page.port == 8765 and page.path == "/"
+                           and page.port == self.port and page.path == "/"
                            and bool(self.window.evaluate_js("Boolean(document.getElementById('settings-form'))")))
         except Exception:
             self.loaded = False
@@ -56,7 +57,7 @@ class ArchiveWindow:
     def open(self, url=None):
         if url:
             parsed = urlsplit(url)
-            if parsed.scheme != "http" or parsed.hostname not in {"localhost", "127.0.0.1"} or parsed.port != 8765:
+            if parsed.scheme != "http" or parsed.hostname not in {"localhost", "127.0.0.1"} or parsed.port != self.port:
                 raise ValueError("Archive window requires its local application address")
         with self.lock:
             if self.stopping:

@@ -12,6 +12,6 @@ docker compose -f oauth_relay/compose.yaml up -d --build
 
 Сервис привязан к 127.0.0.1:8787. HTTPS-прокси должен направлять только согласованный префикс на этот адрес, устанавливать HTTPS forwarding headers, не логировать query, тело POST и Location. DNS, TLS-сертификат и конфигурацию прокси подбирает оператор площадки. Программа не публикует этот маршрут самостоятельно.
 
-Проверить базовый адрес с /oauth/health: protocol=meeting-archive-oauth-relay, version=1, credentials=desktop-only, свой портал в allowed_portals и правильные install/callback пути. Затем пройти реальную установку и вход по docs/bitrix24.md. Health сам по себе не доказывает OAuth. Desktop должен работать на том же компьютере, где браузер завершает вход, на 127.0.0.1:8765.
+Проверить базовый адрес с /oauth/health: protocol=meeting-archive-oauth-relay, version=1, credentials=desktop-only, свой портал в allowed_portals и правильные install/callback пути. Затем пройти реальную установку и вход по docs/bitrix24.md. Health сам по себе не доказывает OAuth. Desktop должен работать на том же компьютере, где браузер завершает вход. По умолчанию callback направляется на 127.0.0.1:8765; если Meeting Archive выбрал другой порт, задайте его через LOCAL_CALLBACK_PORT перед перезапуском relay. Текущее значение видно в мастере Meeting Archive.
 
 Откат: сохранить прежнюю конфигурацию прокси, удалить только добавленный маршрут, выполнить docker compose -f oauth_relay/compose.yaml down. Отзыв приложения/токенов выполняет владелец портала. Архив desktop остаётся на ПК.

@@ -47,7 +47,7 @@ def relay_base(value: str) -> str:
     return value.strip().rstrip("/")
 
 
-async def probe_relay(base: str, portal: str) -> dict:
+async def probe_relay(base: str, portal: str, loopback: str = CALLBACK) -> dict:
     async with httpx.AsyncClient(timeout=10, follow_redirects=False) as client:
         response = await client.get(base + "/oauth/health")
         response.raise_for_status()
@@ -55,7 +55,7 @@ async def probe_relay(base: str, portal: str) -> dict:
     path = urlsplit(base).path
     expected = {"protocol": "meeting-archive-oauth-relay", "version": 1,
                 "callback_path": path + "/oauth/callback", "install_path": path + "/oauth/install",
-                "loopback": CALLBACK, "credentials": "desktop-only"}
+                "loopback": loopback, "credentials": "desktop-only"}
     if not isinstance(data, dict) or any(data.get(key) != value for key, value in expected.items()):
         raise ValueError("HTTPS-адрес не является совместимым обработчиком Meeting Archive")
     if portal not in data.get("allowed_portals", []):
@@ -166,8 +166,15 @@ def picker(kind: str) -> list[str]:
         root.destroy()
 
 
-def create_app(service: Service, launch_token: str | None = None, *, manage_lifecycle=True, shutdown_callback=None) -> FastAPI:
+def create_app(service: Service, launch_token: str | None = None, *, manage_lifecycle=True,
+               shutdown_callback=None, port: int = 8765) -> FastAPI:
     launch_token = launch_token or secrets.token_urlsafe(32)
+    if not 1024 <= port <= 65535:
+        raise ValueError("Недопустимый локальный порт")
+    local_callback = f"http://localhost:{port}/callback"
+    relay_loopback = f"http://127.0.0.1:{port}/oauth/callback"
+    allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}", "testserver"}
+    allowed_origins = {f"http://127.0.0.1:{port}", f"http://localhost:{port}", "http://testserver"}
     # A surviving window can reconnect after an EXE restart without synthetic
     # navigation. The local session stays in the per-user DPAPI vault; deleting
     # the profile revokes it. CSRF and launch tokens remain per-run.
@@ -198,12 +205,14 @@ def create_app(service: Service, launch_token: str | None = None, *, manage_life
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.launch_token = launch_token
+    app.state.port = port
+    app.state.local_callback = local_callback
     app.state.startup_error = ""
 
     @app.middleware("http")
     async def security(request: Request, call_next):
         host = request.headers.get("host", "")
-        if host not in {"127.0.0.1:8765", "localhost:8765", "testserver"}:
+        if host not in allowed_hosts:
             return JSONResponse({"error": "Недопустимый адрес интерфейса"}, status_code=403)
         if request.url.path in {"/api/desktop/activate", "/api/desktop/open"} and request.method == "POST":
             if request.headers.get("origin") or not secrets.compare_digest(request.headers.get("x-desktop-token", ""), launch_token):
@@ -215,7 +224,7 @@ def create_app(service: Service, launch_token: str | None = None, *, manage_life
             return JSONResponse({"error": "Откройте интерфейс из трея Meeting Archive"}, status_code=401)
         if request.method not in {"GET", "HEAD"}:
             origin = request.headers.get("origin")
-            if not authenticated or not secrets.compare_digest(request.headers.get("x-csrf-token", ""), csrf) or (origin and origin not in {"http://127.0.0.1:8765", "http://localhost:8765", "http://testserver"}):
+            if not authenticated or not secrets.compare_digest(request.headers.get("x-csrf-token", ""), csrf) or (origin and origin not in allowed_origins):
                 return JSONResponse({"error": "Запрос не подтверждён локальным интерфейсом"}, status_code=403)
         response = await call_next(request)
         response.headers.update({"X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer",
@@ -277,6 +286,7 @@ def create_app(service: Service, launch_token: str | None = None, *, manage_life
                 "automation_windows": windows, "local_automation": models["local_automation"],
                 "automation_timing": service.automation_timing(),
                 "catalogue": {**service.catalogue, "total": service.db.rows("SELECT COUNT(*) AS total FROM meetings")[0]["total"]}, "auth_error": service.auth_error, "jobs": jobs,
+                "oauth_local_callback": local_callback, "oauth_relay_loopback": relay_loopback,
                 "module": models["module"], "watch_error": service.db.get_state("watch_error"),
                 "hf_verified": bool(service.db.get_state("hf_verified")), "model_test": service.db.get_state("model_test"),
                 "transcription": models["transcription"]}
@@ -289,7 +299,7 @@ def create_app(service: Service, launch_token: str | None = None, *, manage_life
     @app.post("/api/desktop/open")
     async def desktop_open():
         from .browser import open_browser
-        await asyncio.to_thread(open_browser, "http://localhost:8765/?launch=" + app.state.launch_token)
+        await asyncio.to_thread(open_browser, f"http://localhost:{port}/?launch=" + app.state.launch_token)
         return {"opened": True}
 
     @app.post("/api/desktop/activate")
@@ -500,14 +510,14 @@ def create_app(service: Service, launch_token: str | None = None, *, manage_life
             raise ValueError("Выберите вход на этом компьютере, HTTPS-обработчик или одноразовый код")
         base = relay_base(data.get("oauth_relay", "")) if flow == "relay" else ""
         if flow == "relay":
-            await probe_relay(base, portal)
+            await probe_relay(base, portal, relay_loopback)
         pending_oauth.clear()
         pending_oauth.update(portal=portal, client_id=client_id, client_secret=client_secret,
                              oauth_relay=base, flow=flow, state=secrets.token_urlsafe(32), created=time.time())
         parameters = {"client_id": client_id, "state": pending_oauth["state"]}
         if flow == "local":
             # Keep the same redirect URI as the local application's registered handler.
-            parameters["redirect_uri"] = LOCAL_CALLBACK
+            parameters["redirect_uri"] = local_callback
         return {"flow": flow, "attempt": pending_oauth["state"],
                 "url": "https://" + portal + "/oauth/authorize/?" + urlencode(parameters)}
 
@@ -517,7 +527,7 @@ def create_app(service: Service, launch_token: str | None = None, *, manage_life
         candidate.settings = replace(service.settings, portal=pending["portal"], user_id=0, auth_mode="oauth",
             oauth_relay=pending["oauth_relay"], oauth_flow=pending["flow"])
         if pending["flow"] == "local":
-            tokens = await candidate.exchange(code, pending["client_id"], pending["client_secret"], LOCAL_CALLBACK)
+            tokens = await candidate.exchange(code, pending["client_id"], pending["client_secret"], local_callback)
         else:
             tokens = await candidate.exchange(code, pending["client_id"], pending["client_secret"])
         old_member = service.settings.member_id if service.settings.portal == pending["portal"] else ""
@@ -570,7 +580,7 @@ def create_app(service: Service, launch_token: str | None = None, *, manage_life
         try:
             await complete_oauth(pending, code, params["member_id"])
             # Authorize the canonical host even when an old UI used 127.0.0.1.
-            response = RedirectResponse("http://localhost:8765/?launch=" + launch_token + "#connection", status_code=303)
+            response = RedirectResponse(f"http://localhost:{port}/?launch=" + launch_token + "#connection", status_code=303)
             response.set_cookie("meeting_session", session, httponly=True, samesite="lax", path="/")
             return response
         except Exception as exc:

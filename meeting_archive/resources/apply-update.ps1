@@ -67,7 +67,9 @@ try {
             if ($runtime.pid -eq $started.Id -and $runtime.version -eq $c.version -and ($c.headless -or $runtime.desktop_ready)) {
                 # Readiness does not need a UI cookie or a launch capability.
                 # Use IPv4 loopback directly and bypass system proxy discovery.
-                $probe = [Net.HttpWebRequest]::Create('http://127.0.0.1:8765/api/bootstrap')
+                $port = [int]$runtime.port
+                if ($port -lt 1024 -or $port -gt 65535) { throw 'Invalid local application port in runtime state' }
+                $probe = [Net.HttpWebRequest]::Create("http://127.0.0.1:$port/api/bootstrap")
                 $probe.Proxy = $null
                 $probe.Timeout = 2000
                 try { $reply = $probe.GetResponse(); $reply.Close() }
@@ -96,8 +98,11 @@ try {
             if ($runtime.pid -ne $started.Id) { throw 'Unexpected application process' }
             $session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
             Invoke-WebRequest -Uri $runtime.url -WebSession $session -UseBasicParsing -TimeoutSec 3 | Out-Null
-            $boot = Invoke-RestMethod -Uri 'http://localhost:8765/api/bootstrap' -WebSession $session -TimeoutSec 3
-            Invoke-WebRequest -Uri 'http://localhost:8765/api/shutdown' -Method POST -WebSession $session -Headers @{'x-csrf-token'=$boot.csrf} -UseBasicParsing -TimeoutSec 3 | Out-Null
+            $port = [int]$runtime.port
+            if ($port -lt 1024 -or $port -gt 65535) { throw 'Invalid local application port in runtime state' }
+            $base = "http://localhost:$port"
+            $boot = Invoke-RestMethod -Uri "$base/api/bootstrap" -WebSession $session -TimeoutSec 3
+            Invoke-WebRequest -Uri "$base/api/shutdown" -Method POST -WebSession $session -Headers @{'x-csrf-token'=$boot.csrf} -UseBasicParsing -TimeoutSec 3 | Out-Null
             $canRestore = $started.WaitForExit(30000)
         } catch { $canRestore = $false }
     }

@@ -93,6 +93,38 @@ def single_instance(home: Path):
     return kernel, handle, existing
 
 
+def bind_local_listener(home: Path) -> tuple[socket.socket, int]:
+    """Bind the remembered loopback port, or let the OS assign a free one."""
+    state_file = home / "listener.json"
+    preferred_port = 8765
+    try:
+        saved = json.loads(state_file.read_text("utf-8"))
+        candidate = saved.get("port") if isinstance(saved, dict) else None
+        if isinstance(candidate, int) and not isinstance(candidate, bool) and 1024 <= candidate <= 65535:
+            preferred_port = candidate
+    except (OSError, ValueError, TypeError):
+        pass
+
+    last_error = None
+    for requested_port in (preferred_port, 0):
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+        try:
+            if exclusive is not None:
+                listener.setsockopt(socket.SOL_SOCKET, exclusive, 1)
+            listener.bind(("127.0.0.1", requested_port))
+            listener.listen(128)
+            port = listener.getsockname()[1]
+            atomic_json(state_file, {"schemaVersion": 1, "port": port})
+            return listener, port
+        except OSError as exc:
+            last_error = exc
+            listener.close()
+            if requested_port == 0:
+                raise
+    raise last_error or OSError("Не удалось открыть локальный порт")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Meeting Archive")
     parser.add_argument("--self-test", action="store_true")
@@ -139,14 +171,18 @@ def main():
             try:
                 runtime = json.loads(runtime_file.read_text("utf-8"))
                 url = runtime.get("url", "")
-                if url.startswith(("http://127.0.0.1:8765/?launch=", "http://localhost:8765/?launch=")):
-                    token = parse_qs(urlsplit(url).query)["launch"][0]
+                parsed_url = urlsplit(url)
+                query = parse_qs(parsed_url.query)
+                if (parsed_url.scheme == "http" and parsed_url.hostname in {"127.0.0.1", "localhost"}
+                    and parsed_url.path == "/" and parsed_url.port and "launch" in query):
+                    token = query["launch"][0]
+                    api_base = f"http://127.0.0.1:{parsed_url.port}"
                     options = {"headers": {"x-desktop-token": token}, "timeout": 2, "trust_env": False}
                     if args.activate:
-                        httpx.post("http://127.0.0.1:8765/api/desktop/activate",
+                        httpx.post(api_base + "/api/desktop/activate",
                                    json={"uri": args.activate}, **options).raise_for_status()
                     if not args.no_browser:
-                        httpx.post("http://127.0.0.1:8765/api/desktop/open", json={}, **options).raise_for_status()
+                        httpx.post(api_base + "/api/desktop/open", json={}, **options).raise_for_status()
                     return
             except (OSError, ValueError, KeyError, httpx.TransportError):
                 pass  # Startup/shutdown may leave a missing/stale runtime briefly.
@@ -175,11 +211,8 @@ def main():
         from .app import create_app
         from .service import Service
         stage = "bind_local_port"
-        # Reserve the expected callback port; never take over another program's listener.
-        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-        listener.bind(("127.0.0.1", 8765))
-        listener.listen(128)
+        # Keep the selected loopback port reserved for the entire server lifetime.
+        listener, port = bind_local_listener(home)
         stage = "load_profile"
         service = Service(home)
         from .browser import configure_window, close_browser
@@ -191,10 +224,10 @@ def main():
             service.notifications.error = str(exc)
         if args.activate:
             service.notifications.activate(args.activate)
-        app = create_app(service)
-        url = "http://localhost:8765/?launch=" + app.state.launch_token
+        app = create_app(service, port=port)
+        url = f"http://localhost:{port}/?launch=" + app.state.launch_token
         from . import __version__
-        runtime = {"url": url, "pid": os.getpid(), "version": __version__,
+        runtime = {"url": url, "port": port, "pid": os.getpid(), "version": __version__,
                    "desktop_required": desktop_enabled, "desktop_ready": False}
         atomic_json(runtime_file, runtime)
         cleaned = threading.Event()
@@ -205,8 +238,8 @@ def main():
                 cleaned.set()
                 from .webview_runtime import cleanup_legacy_profile
                 threading.Thread(target=cleanup_legacy_profile, args=(home,), daemon=True).start()
-        window = configure_window(home, on_ready=window_ready, hide_on_close=not args.no_tray) if desktop_enabled else None
-        config = uvicorn.Config(app, host="127.0.0.1", port=8765, log_config=None, access_log=False, log_level="critical")
+        window = configure_window(home, port=port, on_ready=window_ready, hide_on_close=not args.no_tray) if desktop_enabled else None
+        config = uvicorn.Config(app, host="127.0.0.1", port=port, log_config=None, access_log=False, log_level="critical")
         server = uvicorn.Server(config)
         tray_icon = None
 
@@ -218,7 +251,7 @@ def main():
                 tray_icon.stop()
         service.updates.shutdown = exit_requested
         # A protected endpoint supports graceful headless QA; normal users exit through the tray.
-        app = create_app(service, app.state.launch_token, shutdown_callback=exit_requested)
+        app = create_app(service, app.state.launch_token, shutdown_callback=exit_requested, port=port)
         config.app = app
         server_errors = []
 
@@ -299,7 +332,7 @@ def main():
                         from .desktop_smoke import exercise
                         exercise(window, home, url, exit_requested, tray_icon, startup_checks=startup_checks)
                 if not server.should_exit and not window.stopping:
-                    window.run("http://localhost:8765/desktop-smoke-missing-page" if args.desktop_smoke_fail else url,
+                    window.run(f"http://localhost:{port}/desktop-smoke-missing-page" if args.desktop_smoke_fail else url,
                                started=started)
             elif not args.no_tray:
                 while thread.is_alive() and not server.should_exit:
